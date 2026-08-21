@@ -66,6 +66,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private readonly uint _rtcpSenderSsrc;
 
     private IceAgent? _ice;
+    private IDatagramTransport? _transport;
     private DtlsLowerTransport? _dtlsLower;
     private DtlsTransport? _dtls;
     private SctpAssociation? _sctp;
@@ -671,8 +672,15 @@ public sealed partial class PeerConnection : IAsyncDisposable
             OnLocalIceCandidate?.Invoke(this, new LocalIceCandidateEventArgs(candidate.ToAttributeString(), mid));
         ice.OnGatheringComplete += (_, _) => OnIceGatheringComplete?.Invoke(this, EventArgs.Empty);
         ice.OnStateChanged += (_, state) => HandleIceStateChanged(state);
-        ice.Transport.OnReceived += HandleTransportDatagram;
+        // PeerConnectionConfig.TransportInterceptor is the fault-injection / diagnostics seam: the
+        // connection sends on, and receives from, whatever it returns rather than the ICE transport
+        // itself. It sits below DTLS and SRTP, so a wrapper sees only protected datagrams.
+        var transport = _config.TransportInterceptor is { } intercept
+            ? intercept(ice.Transport) ?? ice.Transport
+            : ice.Transport;
+        transport.OnReceived += HandleTransportDatagram;
 
+        _transport = transport;
         _ice = ice;
         _dtlsLower = new DtlsLowerTransport(this);
 
@@ -1205,21 +1213,21 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     private sealed class DtlsLowerTransport(PeerConnection owner) : IDatagramTransport
     {
-        public int MaxDatagramSize => owner._ice?.Transport.MaxDatagramSize ?? 1200;
+        public int MaxDatagramSize => owner._transport?.MaxDatagramSize ?? 1200;
 
         public event DatagramReceivedHandler? OnReceived;
 
         public void Send(ReadOnlySpan<byte> datagram)
         {
-            var ice = owner._ice;
-            if (ice is null)
+            var transport = owner._transport;
+            if (transport is null)
             {
                 return;
             }
 
             try
             {
-                ice.Transport.Send(datagram);
+                transport.Send(datagram);
             }
             catch (InvalidOperationException)
             {

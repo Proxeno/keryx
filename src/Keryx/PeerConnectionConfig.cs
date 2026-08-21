@@ -132,6 +132,27 @@ public sealed class PeerConnectionConfig
     /// <summary>Rate and bandwidth limits applied to NACK-driven retransmission.</summary>
     public RtxRetransmitOptions Retransmission { get; } = new();
 
+    /// <summary>
+    /// A testing and diagnostics seam: called once with the ICE agent's datagram transport, and the
+    /// transport it returns is what the connection sends on and receives from. Null (the default)
+    /// uses the ICE transport directly.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The seam sits at the datagram level, <em>below</em> DTLS and SRTP: everything it observes is
+    /// already protected, and everything it hands back is decrypted by the peer, so a wrapper can
+    /// count, delay or drop datagrams without being able to forge one. That makes it the right place
+    /// to model a lossy link — which is exactly what the fault-injection tests do — and the wrong
+    /// place to try to modify media.
+    /// </para>
+    /// <para>
+    /// The factory runs while the connection is building its ICE agent, before gathering. The
+    /// returned transport must forward <see cref="IDatagramTransport.OnReceived"/> from the transport
+    /// it was given, or the DTLS handshake will never complete; the connection does not dispose it.
+    /// </para>
+    /// </remarks>
+    public Func<IDatagramTransport, IDatagramTransport>? TransportInterceptor { get; set; }
+
     /// <summary>The <c>a=mid</c> of the video m-section.</summary>
     public string VideoMid { get; set; } = "0";
 

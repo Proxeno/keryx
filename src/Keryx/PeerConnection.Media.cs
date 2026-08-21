@@ -412,7 +412,7 @@ public sealed partial class PeerConnection
 
     private void CreateTrackSenders(IceAgent ice, SrtpProfile profile)
     {
-        var datagram = Math.Min(_config.Mtu, ice.Transport.MaxDatagramSize);
+        var datagram = Math.Min(_config.Mtu, (_transport ?? ice.Transport).MaxDatagramSize);
         var maxPayload = datagram - RtpHeader.FixedLength - profile.RtpOverhead;
         if (maxPayload < 64)
         {
@@ -864,8 +864,8 @@ public sealed partial class PeerConnection
         lock (_sendLock)
         {
             var srtp = _srtp;
-            var ice = _ice;
-            if (srtp is null || ice is null)
+            var transport = _transport;
+            if (srtp is null || transport is null)
             {
                 return false;
             }
@@ -874,7 +874,7 @@ public sealed partial class PeerConnection
             {
                 var length = RtcpPacket.WriteCompound(packets, _rtcpTx);
                 var protectedLength = srtp.Outbound.ProtectRtcp(_rtcpTx.AsSpan(0, length), _rtcpTx);
-                ice.Transport.Send(_rtcpTx.AsSpan(0, protectedLength));
+                transport.Send(_rtcpTx.AsSpan(0, protectedLength));
                 return true;
             }
             catch (InvalidOperationException)
@@ -888,8 +888,8 @@ public sealed partial class PeerConnection
     private void SendProtectedRtp(byte[] buffer, int length)
     {
         var srtp = _srtp;
-        var ice = _ice;
-        if (srtp is null || ice is null)
+        var transport = _transport;
+        if (srtp is null || transport is null)
         {
             return;
         }
@@ -897,7 +897,7 @@ public sealed partial class PeerConnection
         var protectedLength = srtp.Outbound.ProtectRtp(buffer.AsSpan(0, length), buffer);
         try
         {
-            ice.Transport.Send(buffer.AsSpan(0, protectedLength));
+            transport.Send(buffer.AsSpan(0, protectedLength));
         }
         catch (InvalidOperationException)
         {
