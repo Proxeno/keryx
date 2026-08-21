@@ -222,6 +222,18 @@ public sealed partial class PeerConnection
             return;
         }
 
+        // Keryx.Dtls can negotiate use_srtp profiles that Keryx.Srtp has no transform for. Offering
+        // one means a DTLS handshake that succeeds and then throws while deriving SRTP keys, long
+        // after the point where the failure could be explained. Refuse up front instead.
+        foreach (var configured in _config.SrtpProfiles)
+        {
+            if (configured is not (DtlsSrtpProfile.Aes128CmHmacSha1Tag80 or DtlsSrtpProfile.AeadAes128Gcm))
+            {
+                Fail($"SrtpProfiles contains {configured}, which Keryx does not implement end to end.");
+                return;
+            }
+        }
+
         try
         {
             SetState(PeerConnectionState.Connecting);

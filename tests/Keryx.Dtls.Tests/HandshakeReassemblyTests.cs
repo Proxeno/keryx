@@ -207,4 +207,64 @@ public class HandshakeReassemblyTests
         writer.WriteBytes(body.AsSpan(offset, count));
         return buffer;
     }
+
+    /// <summary>
+    /// Tracking received bytes as disjoint intervals is quadratic in the number of intervals, and
+    /// nothing bounded that count. One-byte fragments at every other offset drive it to
+    /// <c>Length / 2</c> and burn the quadratic cost inside the transport lock — roughly a second of
+    /// CPU per 832 KiB of such input, blocking every other datagram and the retransmit timer.
+    /// A legitimate fragmenter never produces more than one or two intervals.
+    /// </summary>
+    [Fact]
+    public void Pathological_fragmentation_is_abandoned_rather_than_tracked_quadratically()
+    {
+        var reassembler = new HandshakeReassembler();
+        const int Length = 8192;
+        var body = new byte[Length];
+
+        // One-byte fragments at 0, 2, 4, ... — every one disjoint from the last.
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        for (var offset = 0; offset < Length; offset += 2)
+        {
+            var record = MakeFragment(HandshakeType.Certificate, 0, body, offset, 1);
+            reassembler.AddRecord(record, out _);
+        }
+
+        stopwatch.Stop();
+        stopwatch.Elapsed.Should().BeLessThan(
+            TimeSpan.FromSeconds(2),
+            "the interval count is capped, so this cannot become quadratic");
+
+        // Nothing is deliverable: the message is full of holes that are no longer being tracked.
+        reassembler.TryTakeNext(out _).Should().BeFalse();
+
+        // And exactly one buffer is held for it, not one per rejected fragment.
+        reassembler.HasPending(0).Should().BeTrue();
+    }
+
+    /// <summary>
+    /// The legitimate case must be untouched: a message fragmented into contiguous pieces, delivered
+    /// out of order, still reassembles.
+    /// </summary>
+    [Fact]
+    public void Contiguous_fragments_delivered_out_of_order_still_reassemble()
+    {
+        var reassembler = new HandshakeReassembler();
+        const int Length = 3000;
+        var body = new byte[Length];
+        for (var i = 0; i < Length; i++)
+        {
+            body[i] = (byte)(i * 31);
+        }
+
+        // Six contiguous 500-byte fragments, delivered back to front.
+        for (var offset = Length - 500; offset >= 0; offset -= 500)
+        {
+            var record = MakeFragment(HandshakeType.Certificate, 0, body, offset, 500);
+            reassembler.AddRecord(record, out _);
+        }
+
+        reassembler.TryTakeNext(out var message).Should().BeTrue();
+        message.Body.Should().Equal(body);
+    }
 }
