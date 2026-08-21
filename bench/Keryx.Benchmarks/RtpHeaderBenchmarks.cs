@@ -30,6 +30,20 @@ namespace Keryx.Benchmarks;
 /// between a <c>ref struct</c> view over caller-owned memory and a heap-allocated header class, not an
 /// artifact of how this benchmark is wired.
 /// </para>
+/// <para>
+/// <b>Is this apples to apples?</b> Verified against SIPSorcery 10.0.16 IL (decompiled). Its
+/// <c>GetBytes()</c> allocates <c>byte[Length]</c> and writes all four fixed words
+/// (V/P/X/CC+M/PT, sequence number, timestamp, SSRC) — it does not cache or reuse anything. Its
+/// <c>RTPHeader(byte[])</c> checks the length and eagerly reads all four words back, expanding them
+/// into seven separate <c>int</c> fields, and computes <c>PayloadSize</c>/<c>PaddingCount</c>. So both
+/// sides really do write and re-read a complete 12-byte header. Two asymmetries remain, and both run
+/// <i>against</i> Keryx: (1) the SIPSorcery header object is hoisted into <see cref="Setup"/> and only
+/// its sequence number is stored per invocation, while the Keryx <c>ref struct</c> is rebuilt from all
+/// its fields every invocation (measured at ~0.5 ns of the Keryx number); (2) Keryx validates the RTP
+/// version on parse and SIPSorcery does not. Nothing here favours Keryx. The one asymmetry that
+/// favours neither is unavoidable: SIPSorcery's public API has no serialize-into-a-caller-buffer
+/// overload, so <c>GetBytes()</c> must allocate — that <i>is</i> the API difference under test.
+/// </para>
 /// </remarks>
 [MemoryDiagnoser]
 public class RtpHeaderBenchmarks
