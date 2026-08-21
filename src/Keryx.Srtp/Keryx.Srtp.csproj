@@ -5,4 +5,7 @@
   <ItemGroup>
     <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Keryx.Srtp.Tests" />
+  </ItemGroup>
 </Project>
