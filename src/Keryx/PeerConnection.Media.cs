@@ -202,6 +202,26 @@ public sealed partial class PeerConnection
             return;
         }
 
+        // RFC 8827 §6.5: the certificate fingerprint carried in signalling is the *entire* trust
+        // anchor of the WebRTC security model — the peer's certificate is self-signed and worthless
+        // on its own. A remote description with no a=fingerprint therefore cannot be connected to:
+        // passing a null expected fingerprint down to DtlsConfig would leave the handshake pinning
+        // nothing and accept any certificate at all, which is exactly the downgrade an attacker who
+        // can strip one line from the signalling channel would want. Fail closed instead.
+        if (fingerprint is null)
+        {
+            Fail("The remote description carries no a=fingerprint, so the peer's certificate cannot be authenticated.");
+            return;
+        }
+
+        // Keryx computes SHA-256 fingerprints only. Any other algorithm would be compared against a
+        // SHA-256 digest and fail as a "mismatch", which is safe but tells the operator nothing.
+        if (!string.Equals(fingerprint.Algorithm, "sha-256", StringComparison.OrdinalIgnoreCase))
+        {
+            Fail($"The remote a=fingerprint uses {fingerprint.Algorithm}; Keryx requires sha-256 (RFC 8827 §6.5).");
+            return;
+        }
+
         try
         {
             SetState(PeerConnectionState.Connecting);
@@ -213,7 +233,7 @@ public sealed partial class PeerConnection
             {
                 Role = role,
                 Certificate = _certificate,
-                ExpectedRemoteFingerprintSha256 = fingerprint?.Value,
+                ExpectedRemoteFingerprintSha256 = fingerprint.Value,
                 SrtpProfiles = [.. _config.SrtpProfiles],
                 MaxDatagramSize = _config.Mtu,
                 Logger = _logger,
