@@ -115,24 +115,29 @@ Every claim is backed by a test in this repository.
 
 ## Benchmarks
 
-BenchmarkDotNet (short job) on Apple Silicon, .NET 10, vs **SIPSorcery 10.0.16** — referenced only
-inside the benchmark project as the comparison baseline. Read the caveats; benchmarks are honest
-or they are noise.
+BenchmarkDotNet 0.15.8 (default job), Apple M5 Max / macOS 26.6 / .NET 10.0.11 arm64, run
+2026-08-21, vs **SIPSorcery 10.0.16** — referenced only inside the benchmark project as the
+comparison baseline. Read the caveats; benchmarks are honest or they are noise.
 
 | Benchmark | Keryx | SIPSorcery | Allocated (Keryx / SIPSorcery) |
 | --- | ---: | ---: | ---: |
-| H.264 packetization, 25 KB access unit @ MTU 1200 | **6.7 μs** | 20.6 μs | 0 / 52,880 B |
-| RTP header write + parse (12-byte header) | 14.7 ns | **3.8 ns** | 0 / 40 B |
-| SDP: generate full offer | 1.9 μs | 1.7 μs | 19.4 / 20.8 KB |
-| SDP: parse Chrome answer (identical input) | 2.6 μs | 2.6 μs | 25.7 / 9.1 KB |
-| SRTP protect 1200-byte packet (AES-CM/SHA1-80) | **1.2 μs** | 6.9 μs | 0 / 88 B |
+| H.264 packetization, 25 KB access unit @ MTU 1200 | **0.85 μs** | 18.7 μs | 0 / 52,880 B |
+| RTP header write + parse (12-byte header) | **2.6 ns** | 3.8 ns | 0 / 40 B |
+| SDP: generate full offer | 1.9 μs | **1.7 μs** | 19.4 / 20.8 KB |
+| SDP: parse Chrome answer (identical input) | **2.6 μs** | 3.0 μs | 25.7 / 9.1 KB |
+| SRTP protect 1200-byte packet (AES-CM/SHA1-80) | **1.1 μs** | 5.7 μs | 0 / 88 B |
 
 Caveats (full details in the benchmark sources): the SIPSorcery H.264 side reproduces its real
 `SendH264Frame` logic through its public building blocks because that path isn't callable
-standalone — and it genuinely never STAP-A-aggregates, so it emits one more packet; SIPSorcery's
-RTP header serialization is faster than ours today (we validate on parse and stay
-allocation-free — an honest loss on this row); SDP offer generation builds *comparable*, not
-byte-identical, documents on each side; SRTP uses identical key material and inputs on both sides.
+standalone — and it genuinely never STAP-A-aggregates, so it emits one more packet; on the RTP
+header row both sides really do serialize and re-parse all four fixed header words (verified
+against SIPSorcery's decompiled IL), with two asymmetries that both run *against* Keryx — the
+SIPSorcery header object is hoisted out of the loop while the Keryx `ref struct` is rebuilt every
+iteration, and Keryx validates the RTP version on parse where SIPSorcery does not — while the
+40 B is simply SIPSorcery's `GetBytes()` having no write-into-caller-buffer overload; SDP offer
+generation builds *comparable*, not byte-identical, documents on each side, and Keryx still
+allocates ~2.8× more than SIPSorcery when parsing an answer (an honest loss on that column);
+SRTP uses identical key material and inputs on both sides.
 
 ## RFC coverage
 
