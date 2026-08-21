@@ -223,4 +223,200 @@ public class AdversarialHandshakeTests
         clientLower.Dispose();
         serverLower.Dispose();
     }
+
+    /// <summary>
+    /// RFC 6347 §4.1.2.6: "the window and window bits MUST NOT be updated until the packet is
+    /// authenticated". At epoch 0 nothing can be authenticated, so running the anti-replay window
+    /// there lets one forged record with a maximal sequence number anchor the window at 2^48-1 and
+    /// drop every genuine record that follows. Thirteen bytes, no body, and the handshake never
+    /// completes.
+    /// </summary>
+    [Fact]
+    public async Task A_forged_epoch_zero_record_cannot_wedge_the_replay_window()
+    {
+        using var serverCertificate = DtlsCertificate.GenerateSelfSigned("server");
+        using var clientCertificate = DtlsCertificate.GenerateSelfSigned("client");
+        var (serverLower, clientLower) = LoopbackDatagramTransport.CreatePair();
+
+        using var server = new DtlsTransport(serverLower, new DtlsConfig
+        {
+            Role = DtlsRole.Server,
+            Certificate = serverCertificate,
+            ExpectedRemoteFingerprintSha256 = clientCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        using var client = new DtlsTransport(clientLower, new DtlsConfig
+        {
+            Role = DtlsRole.Client,
+            Certificate = clientCertificate,
+            ExpectedRemoteFingerprintSha256 = serverCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        var serverTask = server.HandshakeAsync();
+
+        // handshake / DTLS 1.2 / epoch 0 / sequence_number 2^48-1 / zero-length body.
+        byte[] poison = [0x16, 0xFE, 0xFD, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00];
+        clientLower.Send(poison);
+        await Task.Delay(50);
+
+        var clientTask = client.HandshakeAsync();
+
+        await Task.WhenAll(serverTask, clientTask).WaitAsync(TimeSpan.FromSeconds(15));
+        server.State.Should().Be(DtlsTransportState.Connected);
+        client.State.Should().Be(DtlsTransportState.Connected);
+
+        clientLower.Dispose();
+        serverLower.Dispose();
+    }
+
+    /// <summary>
+    /// RFC 6347 §4.1.2.7 requires invalid records to be discarded. Filling the reassembler's
+    /// out-of-order slots with zero-length fragments for message_seq values that will never be
+    /// reached must not be able to abort the connection — a local buffering limit is not a protocol
+    /// error, and here it is reachable from wholly unauthenticated input.
+    /// </summary>
+    [Fact]
+    public async Task Filling_the_reassembly_slots_cannot_abort_the_handshake()
+    {
+        using var serverCertificate = DtlsCertificate.GenerateSelfSigned("server");
+        using var clientCertificate = DtlsCertificate.GenerateSelfSigned("client");
+        var (serverLower, clientLower) = LoopbackDatagramTransport.CreatePair();
+
+        using var server = new DtlsTransport(serverLower, new DtlsConfig
+        {
+            Role = DtlsRole.Server,
+            Certificate = serverCertificate,
+            ExpectedRemoteFingerprintSha256 = clientCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        using var client = new DtlsTransport(clientLower, new DtlsConfig
+        {
+            Role = DtlsRole.Client,
+            Certificate = clientCertificate,
+            ExpectedRemoteFingerprintSha256 = serverCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        var serverTask = server.HandshakeAsync();
+
+        // One record carrying 64 empty fragments, each for a distinct far-future message_seq.
+        const int Count = 64;
+        var body = new byte[Count * DtlsLimits.HandshakeHeaderLength];
+        for (var i = 0; i < Count; i++)
+        {
+            var at = i * DtlsLimits.HandshakeHeaderLength;
+            body[at] = (byte)HandshakeType.Certificate;
+            // length = 0, fragment_offset = 0, fragment_length = 0; only message_seq varies.
+            body[at + 4] = (byte)((100 + i) >> 8);
+            body[at + 5] = (byte)(100 + i);
+        }
+
+        var datagram = new byte[DtlsLimits.RecordHeaderLength + body.Length];
+        datagram[0] = (byte)ContentType.Handshake;
+        datagram[1] = 0xFE;
+        datagram[2] = 0xFD;
+        datagram[10] = 1; // record sequence_number
+        datagram[11] = (byte)(body.Length >> 8);
+        datagram[12] = (byte)body.Length;
+        body.CopyTo(datagram, DtlsLimits.RecordHeaderLength);
+        clientLower.Send(datagram);
+        await Task.Delay(50);
+
+        var clientTask = client.HandshakeAsync();
+
+        await Task.WhenAll(serverTask, clientTask).WaitAsync(TimeSpan.FromSeconds(15));
+        server.State.Should().Be(DtlsTransportState.Connected);
+        client.State.Should().Be(DtlsTransportState.Connected);
+
+        clientLower.Dispose();
+        serverLower.Dispose();
+    }
+
+    /// <summary>
+    /// A malformed handshake fragment header at epoch 0 is unauthenticated garbage and must be
+    /// discarded, not treated as a fatal protocol error (RFC 6347 §4.1.2.7).
+    /// </summary>
+    [Fact]
+    public async Task A_malformed_epoch_zero_handshake_fragment_is_discarded()
+    {
+        using var serverCertificate = DtlsCertificate.GenerateSelfSigned("server");
+        using var clientCertificate = DtlsCertificate.GenerateSelfSigned("client");
+        var (serverLower, clientLower) = LoopbackDatagramTransport.CreatePair();
+
+        using var server = new DtlsTransport(serverLower, new DtlsConfig
+        {
+            Role = DtlsRole.Server,
+            Certificate = serverCertificate,
+            ExpectedRemoteFingerprintSha256 = clientCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        using var client = new DtlsTransport(clientLower, new DtlsConfig
+        {
+            Role = DtlsRole.Client,
+            Certificate = clientCertificate,
+            ExpectedRemoteFingerprintSha256 = serverCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        var serverTask = server.HandshakeAsync();
+
+        // A handshake record whose body is three bytes: too short to be a fragment header at all.
+        byte[] malformed = [0x16, 0xFE, 0xFD, 0x00, 0x00, 0, 0, 0, 0, 0, 1, 0x00, 0x03, 0x0B, 0x00, 0x00];
+        clientLower.Send(malformed);
+        await Task.Delay(50);
+
+        var clientTask = client.HandshakeAsync();
+
+        await Task.WhenAll(serverTask, clientTask).WaitAsync(TimeSpan.FromSeconds(15));
+        server.State.Should().Be(DtlsTransportState.Connected);
+        client.State.Should().Be(DtlsTransportState.Connected);
+
+        clientLower.Dispose();
+        serverLower.Dispose();
+    }
+
+    /// <summary>
+    /// A blank expected fingerprint must not be silently treated as "no pinning". It used to be:
+    /// the certificate check short-circuited on <c>IsNullOrWhiteSpace</c> while the two
+    /// certificate-required checks tested only for null, so the transport demanded a peer
+    /// certificate, published its fingerprint and completed the handshake having compared nothing.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void A_blank_expected_fingerprint_is_refused_rather_than_treated_as_no_pinning(string blank)
+    {
+        using var certificate = DtlsCertificate.GenerateSelfSigned("local");
+        var (left, right) = LoopbackDatagramTransport.CreatePair();
+
+        try
+        {
+            var construct = () => new DtlsTransport(left, new DtlsConfig
+            {
+                Role = DtlsRole.Server,
+                Certificate = certificate,
+                ExpectedRemoteFingerprintSha256 = blank,
+                Logger = NullLogger.Instance,
+            });
+
+            construct.Should().Throw<ArgumentException>()
+                .WithMessage("*blank string is not a pin*");
+        }
+        finally
+        {
+            left.Dispose();
+            right.Dispose();
+        }
+    }
 }

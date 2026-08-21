@@ -128,6 +128,19 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(config.Certificate);
 
+        // A blank expected fingerprint used to be treated as "no pin" by the certificate check while
+        // still counting as "pinning requested" everywhere else, so the transport demanded a peer
+        // certificate, reported its fingerprint, and completed the handshake without ever comparing
+        // anything — every observable signal said authenticated and nothing was. Config binders that
+        // materialise an absent key as "" make that a very ordinary mistake, so it is refused here
+        // rather than silently honoured. Null still means "no pinning", which is documented.
+        if (config.ExpectedRemoteFingerprintSha256 is { } pin && string.IsNullOrWhiteSpace(pin))
+        {
+            throw new ArgumentException(
+                "ExpectedRemoteFingerprintSha256 must be either null (no pinning) or a real digest; a blank string is not a pin.",
+                nameof(config));
+        }
+
         _lower = lower;
         _config = config;
         _log = config.Logger;
@@ -459,16 +472,22 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             return;
         }
 
-        if (_replayWindow.IsReplay(record.SequenceNumber))
-        {
-            return;
-        }
-
         var cipher = _readEpoch == 0 ? null : _readCipher;
         if (cipher is null)
         {
-            _replayWindow.Accept(record.SequenceNumber);
+            // Epoch 0 is unauthenticated, so there is nothing the anti-replay window may legitimately
+            // be updated from: RFC 6347 §4.1.2.6 requires the window not to advance until a record is
+            // authenticated. Running it here anyway let one forged 13-byte record with sequence
+            // number 2^48-1 anchor the window at the top of the space and silently drop every genuine
+            // record that followed, wedging the handshake until it timed out. Duplicate suppression at
+            // epoch 0 does not need the window: the reassembler already discards fragments for an
+            // already-consumed message_seq and merges duplicate fragments idempotently.
             DispatchPlaintextLocked(record.Type, record.Fragment);
+            return;
+        }
+
+        if (_replayWindow.IsReplay(record.SequenceNumber))
+        {
             return;
         }
 
@@ -567,9 +586,12 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
         if (_pendingReadCipher is null)
         {
-            throw new DtlsException(
-                "Received ChangeCipherSpec before the session keys were established.",
-                DtlsAlertDescription.UnexpectedMessage);
+            // Either the peer retransmitted its flight (RFC 6347 §4.2.4 requires that to be
+            // tolerated, and with no anti-replay at epoch 0 the duplicate now reaches us) or this is
+            // injected garbage. Both are discards: acting on it would advance the read epoch a second
+            // time with no cipher behind it.
+            _log.Log(KeryxLogLevel.Debug, "Discarding a ChangeCipherSpec with no pending read cipher.");
+            return;
         }
 
         _readCipher?.Dispose();
@@ -618,7 +640,26 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleHandshakeRecordLocked(ReadOnlySpan<byte> plaintext)
     {
-        var progressed = _reassembler.AddRecord(plaintext, out var sawRetransmission);
+        bool progressed;
+        bool sawRetransmission;
+        try
+        {
+            progressed = _reassembler.AddRecord(plaintext, out sawRetransmission);
+        }
+        catch (DtlsException) when (_readEpoch == 0)
+        {
+            // RFC 6347 §4.1.2.7: an invalid record that arrived with no authentication behind it is
+            // discarded, not escalated. Anyone able to put a datagram on the wire could otherwise end
+            // a handshake in progress with a single malformed fragment header.
+            _log.Log(KeryxLogLevel.Warning, "Discarding a malformed unauthenticated DTLS handshake record.");
+            return;
+        }
+        catch (ByteBufferException) when (_readEpoch == 0)
+        {
+            _log.Log(KeryxLogLevel.Warning, "Discarding a truncated unauthenticated DTLS handshake record.");
+            return;
+        }
+
         if (sawRetransmission && !progressed)
         {
             RetransmitFlightIfDueLocked();
@@ -1097,7 +1138,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         // The WebRTC trust decision: the certificate itself is untrusted (self-signed by design);
         // what must match is the fingerprint carried in the signalling channel.
         var expected = _config.ExpectedRemoteFingerprintSha256;
-        if (!string.IsNullOrWhiteSpace(expected) && !DtlsCertificate.FingerprintsEqual(expected, RemoteFingerprint))
+        if (expected is not null && !DtlsCertificate.FingerprintsEqual(expected, RemoteFingerprint))
         {
             throw new DtlsException(
                 $"The peer certificate fingerprint {RemoteFingerprint} does not match the expected {expected}.",

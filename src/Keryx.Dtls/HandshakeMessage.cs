@@ -134,11 +134,16 @@ internal sealed class HandshakeReassembler
 
             if (!_pending.TryGetValue(messageSeq, out var partial))
             {
-                if (_pending.Count >= _maxBufferedMessages)
+                // Never abort on a local buffering limit: it is reachable from wholly unauthenticated
+                // input, so one datagram of empty fragments carrying distinct far-future message_seq
+                // values could otherwise make the next genuine message fatal (RFC 6347 §4.1.2.7 asks
+                // for a discard). Evicting the partial furthest ahead of NextReceiveSeq — rather than
+                // dropping the arrival — is what keeps that flood from starving the in-order message
+                // the handshake is actually waiting on. Anything evicted is recovered by flight
+                // retransmission.
+                if (_pending.Count >= _maxBufferedMessages && !TryEvictFurthestAhead(messageSeq))
                 {
-                    throw new DtlsException(
-                        "Too many out-of-order DTLS handshake messages buffered.",
-                        DtlsAlertDescription.InternalError);
+                    continue;
                 }
 
                 partial = new Partial(type, length);
@@ -173,6 +178,40 @@ internal sealed class HandshakeReassembler
 
     /// <summary>True when a fragment for <paramref name="messageSeq"/> has been seen.</summary>
     public bool HasPending(ushort messageSeq) => _pending.ContainsKey(messageSeq);
+
+    /// <summary>
+    /// Frees a slot for <paramref name="arriving"/> by discarding the buffered message furthest ahead
+    /// of <see cref="NextReceiveSeq"/>. Returns false when <paramref name="arriving"/> is itself the
+    /// furthest ahead, in which case it is the one that should be dropped.
+    /// </summary>
+    private bool TryEvictFurthestAhead(ushort arriving)
+    {
+        var furthestSeq = arriving;
+        var furthestDistance = Distance(arriving);
+        var found = false;
+
+        foreach (var seq in _pending.Keys)
+        {
+            var distance = Distance(seq);
+            if (distance > furthestDistance)
+            {
+                furthestDistance = distance;
+                furthestSeq = seq;
+                found = true;
+            }
+        }
+
+        if (!found)
+        {
+            return false;
+        }
+
+        _pending.Remove(furthestSeq);
+        return true;
+    }
+
+    /// <summary>How far ahead of <see cref="NextReceiveSeq"/> a message_seq sits, wrapping at 2^16.</summary>
+    private ushort Distance(ushort messageSeq) => unchecked((ushort)(messageSeq - NextReceiveSeq));
 
     private static bool IsBefore(ushort candidate, ushort reference)
     {
