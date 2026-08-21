@@ -1,0 +1,116 @@
+<!doctype html>
+<!--
+  Keryx Chrome interop client. Served by the integration test host; drives a real
+  RTCPeerConnection against a Keryx peer over HTTP signaling:
+    GET  /offer   -> { type: "offer", sdp }        (Keryx is always the offerer)
+    POST /answer  <- { type: "answer", sdp }       (sent once ICE gathering completes)
+    POST /report  <- periodic JSON status snapshots the test asserts on
+  Data channels are opened by Keryx ("controller", "telemetry"); every received
+  message "ping:N" is echoed back as "echo:N".
+-->
+<html>
+<head><meta charset="utf-8"><title>keryx interop</title></head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<script>
+"use strict";
+const state = {
+  phase: "boot",
+  error: null,
+  connectionState: "new",
+  iceConnectionState: "new",
+  signalingState: "stable",
+  track: { audio: false, video: false },
+  channels: {},           // label -> { readyState, received, echoed }
+  stats: { framesDecoded: 0, framesReceived: 0, bytesReceived: 0, audioBytesReceived: 0,
+           frameWidth: 0, frameHeight: 0, packetsReceived: 0, packetsLost: 0,
+           pliCount: 0, nackCount: 0, keyFramesDecoded: 0, decoderImplementation: "" },
+  videoElement: { width: 0, height: 0, readyState: 0 },
+};
+
+async function report() {
+  try {
+    await fetch("/report", { method: "POST", headers: { "content-type": "application/json" },
+                             body: JSON.stringify(state) });
+  } catch { /* test host may be shutting down */ }
+}
+
+function wireChannel(dc) {
+  const entry = { readyState: dc.readyState, received: 0, echoed: 0 };
+  state.channels[dc.label] = entry;
+  dc.onopen = () => { entry.readyState = dc.readyState; };
+  dc.onclose = () => { entry.readyState = dc.readyState; };
+  dc.onmessage = (e) => {
+    entry.received += 1;
+    if (typeof e.data === "string" && e.data.startsWith("ping:")) {
+      dc.send("echo:" + e.data.slice(5));
+      entry.echoed += 1;
+    }
+  };
+}
+
+async function pollStats(pc) {
+  const reports = await pc.getStats();
+  for (const r of reports.values()) {
+    if (r.type === "inbound-rtp" && r.kind === "video") {
+      state.stats.framesDecoded = r.framesDecoded ?? 0;
+      state.stats.framesReceived = r.framesReceived ?? 0;
+      state.stats.bytesReceived = r.bytesReceived ?? 0;
+      state.stats.frameWidth = r.frameWidth ?? 0;
+      state.stats.frameHeight = r.frameHeight ?? 0;
+      state.stats.packetsReceived = r.packetsReceived ?? 0;
+      state.stats.packetsLost = r.packetsLost ?? 0;
+      state.stats.pliCount = r.pliCount ?? 0;
+      state.stats.nackCount = r.nackCount ?? 0;
+      state.stats.keyFramesDecoded = r.keyFramesDecoded ?? 0;
+      state.stats.decoderImplementation = r.decoderImplementation ?? "";
+    }
+    if (r.type === "inbound-rtp" && r.kind === "audio") {
+      state.stats.audioBytesReceived = r.bytesReceived ?? 0;
+    }
+  }
+  const v = document.getElementById("v");
+  state.videoElement = { width: v.videoWidth, height: v.videoHeight, readyState: v.readyState };
+}
+
+async function main() {
+  const pc = new RTCPeerConnection();
+  pc.onconnectionstatechange = () => { state.connectionState = pc.connectionState; };
+  pc.oniceconnectionstatechange = () => { state.iceConnectionState = pc.iceConnectionState; };
+  pc.onsignalingstatechange = () => { state.signalingState = pc.signalingState; };
+  pc.ondatachannel = (e) => wireChannel(e.channel);
+  pc.ontrack = (e) => {
+    state.track[e.track.kind] = true;
+    if (e.track.kind === "video") {
+      document.getElementById("v").srcObject = new MediaStream([e.track]);
+    }
+  };
+
+  state.phase = "fetching-offer";
+  const offer = await (await fetch("/offer")).json();
+  state.phase = "have-offer";
+  await pc.setRemoteDescription(offer);
+  state.phase = "set-remote";
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  state.phase = "gathering";
+  if (pc.iceGatheringState !== "complete") {
+    await new Promise((resolve) => {
+      const check = () => { if (pc.iceGatheringState === "complete") { resolve(); } };
+      pc.onicegatheringstatechange = check;
+      setTimeout(resolve, 3000); // localhost gathering is fast; don't hang forever
+      check();
+    });
+  }
+  state.phase = "posting-answer";
+  await fetch("/answer", { method: "POST", headers: { "content-type": "application/json" },
+                           body: JSON.stringify({ type: "answer", sdp: pc.localDescription.sdp }) });
+  state.phase = "negotiated";
+  setInterval(() => pollStats(pc).catch(() => {}), 250);
+  setInterval(report, 400);
+}
+
+main().catch((e) => { state.phase = "failed"; state.error = String(e && e.stack || e); report(); });
+</script>
+</body>
+</html>
