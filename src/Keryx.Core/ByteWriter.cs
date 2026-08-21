@@ -115,7 +115,7 @@ public ref struct ByteWriter
     /// <summary>Returns the <paramref name="count"/>-byte window at <paramref name="offset"/> for back-patching.</summary>
     public readonly Span<byte> Patch(int offset, int count)
     {
-        if (offset < 0 || count < 0 || offset + count > _position)
+        if (offset < 0 || count < 0 || (long)offset + count > _position)
         {
             throw new ByteBufferException(
                 $"Patch window [{offset}, {offset + count}) is outside the written range [0, {_position}).");
