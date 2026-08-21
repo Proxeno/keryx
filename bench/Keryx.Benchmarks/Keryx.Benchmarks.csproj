@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- SIPSorcery is referenced here ONLY as the benchmark comparison baseline; no shipping Keryx library depends on it. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+    <PackageReference Include="SIPSorcery" />
+    <ProjectReference Include="../../src/Keryx/Keryx.csproj" />
+  </ItemGroup>
+</Project>

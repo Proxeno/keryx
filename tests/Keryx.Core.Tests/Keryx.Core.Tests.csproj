@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../../src/Keryx.Core/Keryx.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Keryx core primitives: binary readers/writers, transport and logging abstractions shared by every Keryx layer.</Description>
+  </PropertyGroup>
+</Project>

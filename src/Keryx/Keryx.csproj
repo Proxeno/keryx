@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Keryx: a from-scratch WebRTC stack for .NET. This package is the composition root - an RTCPeerConnection-style API over the Keryx STUN/ICE/SDP/DTLS/SRTP/RTP/SCTP layers.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../Keryx.Stun/Keryx.Stun.csproj" />
+    <ProjectReference Include="../Keryx.Sdp/Keryx.Sdp.csproj" />
+    <ProjectReference Include="../Keryx.Rtp/Keryx.Rtp.csproj" />
+    <ProjectReference Include="../Keryx.Dtls/Keryx.Dtls.csproj" />
+    <ProjectReference Include="../Keryx.Srtp/Keryx.Srtp.csproj" />
+    <ProjectReference Include="../Keryx.Ice/Keryx.Ice.csproj" />
+    <ProjectReference Include="../Keryx.Sctp/Keryx.Sctp.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>STUN (RFC 5389) message encoding, decoding and a lightweight client, from the Keryx WebRTC stack.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+  </ItemGroup>
+</Project>

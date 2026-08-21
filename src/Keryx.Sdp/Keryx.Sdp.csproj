@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>SDP parsing and generation (JSEP offer/answer subset) from the Keryx WebRTC stack.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+  </ItemGroup>
+</Project>
