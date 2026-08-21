@@ -109,6 +109,41 @@ public sealed class StunClient
                ?? throw new StunFormatException("The STUN Binding success response carried no mapped address.");
     }
 
+    /// <summary>
+    /// Runs an arbitrary STUN request transaction against <paramref name="server"/> with the
+    /// RFC 5389 section 7.2.1 retransmission schedule, and returns the response as received.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="BindingRequestAsync"/> this does not throw on an error response: TURN's
+    /// long-term authentication is driven by 401 and 438 error responses, so the caller must be
+    /// able to see them (RFC 8656 sections 7.2 and 9.2).
+    /// </remarks>
+    /// <param name="request">The request to send; its transaction id must not already be in flight.</param>
+    /// <param name="server">The server's transport address.</param>
+    /// <param name="integrityKey">
+    /// The HMAC-SHA1 key to sign the request with, or null to send it unauthenticated.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the transaction.</param>
+    /// <returns>The success or error response.</returns>
+    /// <exception cref="StunTimeoutException">No response arrived within the retransmission budget.</exception>
+    public async Task<StunMessage> RequestAsync(
+        StunMessage request,
+        IPEndPoint server,
+        byte[]? integrityKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(server);
+
+        if (_options.Software is { } software && !request.HasAttribute(StunAttributeType.Software))
+        {
+            request.Add(new StunSoftwareAttribute(software));
+        }
+
+        var encoded = request.Encode(integrityKey, appendFingerprint: _options.AddFingerprint);
+        return await TransactAsync(request.TransactionId, encoded, server, cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task<StunMessage> TransactAsync(
         StunTransactionId transactionId, byte[] encoded, IPEndPoint server, CancellationToken cancellationToken)
     {
@@ -123,7 +158,7 @@ public sealed class StunClient
             var rto = _options.InitialRetransmissionTimeout;
             for (var attempt = 0; attempt < _options.MaxTransmissions; attempt++)
             {
-                _logger.Log(KeryxLogLevel.Trace, $"STUN Binding request {transactionId} to {server}, attempt {attempt + 1}.");
+                _logger.Log(KeryxLogLevel.Trace, $"STUN request {transactionId} to {server}, attempt {attempt + 1}.");
                 _sender(encoded, server);
 
                 // RFC 5389 section 7.2.1 measures the post-final wait as Ti = Rm * RTO against the

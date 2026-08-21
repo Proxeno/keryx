@@ -18,14 +18,41 @@ public sealed class StunErrorCodeAttribute : StunAttribute
     /// <summary>420 Unknown Attribute (RFC 5389 section 15.6).</summary>
     public const int UnknownAttribute = 420;
 
-    /// <summary>438 Stale Nonce (RFC 5389 section 15.6).</summary>
+    /// <summary>403 Forbidden: the request is valid but the server refuses it (RFC 8656 section 17.2.1).</summary>
+    public const int Forbidden = 403;
+
+    /// <summary>
+    /// 437 Allocation Mismatch: the five-tuple already has (or no longer has) an allocation
+    /// (RFC 8656 section 17.2.1).
+    /// </summary>
+    public const int AllocationMismatch = 437;
+
+    /// <summary>438 Stale Nonce (RFC 5389 section 15.6); retry once with the NONCE just returned.</summary>
     public const int StaleNonce = 438;
+
+    /// <summary>440 Address Family not Supported (RFC 8656 section 17.2.1).</summary>
+    public const int AddressFamilyNotSupported = 440;
+
+    /// <summary>441 Wrong Credentials: the credentials do not match the allocation (RFC 8656 section 17.2.1).</summary>
+    public const int WrongCredentials = 441;
+
+    /// <summary>442 Unsupported Transport Protocol (RFC 8656 section 17.2.1).</summary>
+    public const int UnsupportedTransportProtocol = 442;
+
+    /// <summary>443 Peer Address Family Mismatch (RFC 8656 section 17.2.1).</summary>
+    public const int PeerAddressFamilyMismatch = 443;
+
+    /// <summary>486 Allocation Quota Reached (RFC 8656 section 17.2.1).</summary>
+    public const int AllocationQuotaReached = 486;
 
     /// <summary>487 Role Conflict (RFC 8445 section 7.3.1.1).</summary>
     public const int RoleConflict = 487;
 
     /// <summary>500 Server Error (RFC 5389 section 15.6).</summary>
     public const int ServerError = 500;
+
+    /// <summary>508 Insufficient Capacity: the server cannot serve the allocation (RFC 8656 section 17.2.1).</summary>
+    public const int InsufficientCapacity = 508;
 
     /// <summary>Creates the attribute.</summary>
     /// <param name="code">The error code; must be in the range 300-699.</param>

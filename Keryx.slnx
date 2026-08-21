@@ -11,6 +11,7 @@
     <Project Path="src/Keryx.Sdp/Keryx.Sdp.csproj" />
     <Project Path="src/Keryx.Srtp/Keryx.Srtp.csproj" />
     <Project Path="src/Keryx.Stun/Keryx.Stun.csproj" />
+    <Project Path="src/Keryx.Turn/Keryx.Turn.csproj" />
     <Project Path="src/Keryx/Keryx.csproj" />
   </Folder>
   <Folder Name="/tests/">
@@ -23,5 +24,6 @@
     <Project Path="tests/Keryx.Sdp.Tests/Keryx.Sdp.Tests.csproj" />
     <Project Path="tests/Keryx.Srtp.Tests/Keryx.Srtp.Tests.csproj" />
     <Project Path="tests/Keryx.Stun.Tests/Keryx.Stun.Tests.csproj" />
+    <Project Path="tests/Keryx.Turn.Tests/Keryx.Turn.Tests.csproj" />
   </Folder>
 </Solution>

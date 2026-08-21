@@ -160,8 +160,20 @@ public sealed class StunMessage
         => GetAttribute<StunXorMappedAddressAttribute>()?.EndPoint
            ?? GetAttribute<StunMappedAddressAttribute>()?.EndPoint;
 
+    /// <summary>
+    /// The relayed transport address from XOR-RELAYED-ADDRESS, or null when the message carries
+    /// none (RFC 8656 section 18.5).
+    /// </summary>
+    public IPEndPoint? RelayedAddress => GetAttribute<StunXorRelayedAddressAttribute>()?.EndPoint;
+
     /// <summary>The USERNAME attribute's value, or null.</summary>
     public string? Username => GetAttribute<StunUsernameAttribute>()?.Value;
+
+    /// <summary>The REALM attribute's value, or null.</summary>
+    public string? Realm => GetAttribute<StunRealmAttribute>()?.Value;
+
+    /// <summary>The NONCE attribute's value, or null.</summary>
+    public string? Nonce => GetAttribute<StunNonceAttribute>()?.Value;
 
     /// <summary>The ERROR-CODE attribute's code, or null.</summary>
     public int? ErrorCode => GetAttribute<StunErrorCodeAttribute>()?.Code;
@@ -504,6 +516,21 @@ public sealed class StunMessage
             StunAttributeType.UseCandidate => new StunUseCandidateAttribute(),
             StunAttributeType.IceControlled => new StunIceControlledAttribute(ReadU64(value)),
             StunAttributeType.IceControlling => new StunIceControllingAttribute(ReadU64(value)),
+
+            // RFC 8656 TURN attributes.
+            StunAttributeType.ChannelNumber => StunChannelNumberAttribute.ReadValue(value),
+            StunAttributeType.Lifetime => StunLifetimeAttribute.ReadValue(value),
+            StunAttributeType.XorPeerAddress =>
+                new StunXorPeerAddressAttribute(StunAddressAttribute.ReadValue(value, xored: true, transactionId)),
+            StunAttributeType.Data => new StunDataAttribute(value),
+            StunAttributeType.XorRelayedAddress =>
+                new StunXorRelayedAddressAttribute(StunAddressAttribute.ReadValue(value, xored: true, transactionId)),
+            StunAttributeType.RequestedAddressFamily => StunRequestedAddressFamilyAttribute.ReadValue(value),
+            StunAttributeType.EvenPort => StunEvenPortAttribute.ReadValue(value),
+            StunAttributeType.RequestedTransport => StunRequestedTransportAttribute.ReadValue(value),
+            StunAttributeType.DontFragment => new StunDontFragmentAttribute(),
+            StunAttributeType.ReservationToken => StunReservationTokenAttribute.ReadValue(value),
+
             _ => new StunRawAttribute((StunAttributeType)type, value),
         };
 

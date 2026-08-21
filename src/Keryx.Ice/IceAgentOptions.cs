@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Cryptography;
 using Keryx.Core;
 using Keryx.Stun;
+using Keryx.Turn;
 
 namespace Keryx.Ice;
 
@@ -57,6 +58,13 @@ public sealed class IceAgentOptions
     public IList<IPEndPoint> StunServers { get; } = [];
 
     /// <summary>
+    /// TURN servers to allocate a relayed candidate on. Each entry is allocated over the agent's
+    /// own socket, so the relayed candidate's base is that socket and RFC 8445 section 5.1.1.2's
+    /// <c>raddr</c>/<c>rport</c> come out right. Failures are logged and skipped.
+    /// </summary>
+    public IList<TurnServerOptions> TurnServers { get; } = [];
+
+    /// <summary>
     /// The address to bind. Null binds <see cref="IPAddress.Any"/> and gathers a host candidate
     /// for every up, non-loopback IPv4 unicast address. Set it to gather exactly one address -
     /// including <see cref="IPAddress.Loopback"/>, which interface enumeration deliberately skips.
@@ -99,6 +107,13 @@ public sealed class IceAgentOptions
     /// <summary>Retransmission settings for the STUN queries used to gather srflx candidates.</summary>
     public StunClientOptions? StunClientOptions { get; set; }
 
+    /// <summary>
+    /// Lifetime, refresh and data-path settings for the TURN allocations in
+    /// <see cref="TurnServers"/>. The agent's <see cref="Logger"/> is used when the entry carries
+    /// none of its own.
+    /// </summary>
+    public TurnClientOptions? TurnClientOptions { get; set; }
+
     internal IceAgentOptions Validate()
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(CheckInterval, TimeSpan.Zero);
@@ -109,6 +124,11 @@ public sealed class IceAgentOptions
         if (MinPort > 0 && MaxPort < MinPort)
         {
             throw new ArgumentException("MaxPort must be greater than or equal to MinPort.", nameof(MaxPort));
+        }
+
+        foreach (var turnServer in TurnServers)
+        {
+            turnServer.Validate();
         }
 
         return this;
