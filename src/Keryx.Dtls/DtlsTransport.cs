@@ -81,6 +81,21 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
     private bool _certificateRequested;
     private byte[]? _serverKeyExchangePoint;
 
+    // "Have we already handled one of these?" flags. DTLS carries no per-message state machine of
+    // its own — message_seq only orders messages, it does not constrain their type — so every
+    // handshake message that mutates negotiated state has to police its own arity. Without this a
+    // peer (or an injector, for the unencrypted part of the handshake) can re-send a message with a
+    // fresh message_seq and rewrite state that has already been agreed. See RFC 6347 §4.2.4.
+    private bool _sawClientHello;
+    private bool _sawServerHello;
+    private bool _sawPeerCertificate;
+    private bool _sawServerKeyExchange;
+    private bool _sawCertificateRequest;
+    private bool _sawServerHelloDone;
+    private bool _sawClientKeyExchange;
+    private bool _sawCertificateVerify;
+    private bool _sawPeerFinished;
+
     // Record layer state.
     private ushort _writeEpoch;
     private ulong _writeSequenceEpoch0;
@@ -680,6 +695,12 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 break;
 
             case HandshakeType.ServerHelloDone when _role == DtlsRole.Client:
+                if (_sawServerHelloDone)
+                {
+                    throw new DtlsException("A second ServerHelloDone arrived.", DtlsAlertDescription.UnexpectedMessage);
+                }
+
+                _sawServerHelloDone = true;
                 SendClientFlightLocked();
                 break;
 
@@ -734,6 +755,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleServerHelloLocked(byte[] body)
     {
+        if (_sawServerHello)
+        {
+            throw new DtlsException(
+                "A second ServerHello arrived; Keryx does not support renegotiation.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawServerHello = true;
         var hello = HandshakeCodec.ParseServerHello(body);
         if (hello.Version != ProtocolVersions.Dtls12)
         {
@@ -778,6 +807,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleServerKeyExchangeLocked(byte[] body)
     {
+        if (_sawServerKeyExchange)
+        {
+            throw new DtlsException(
+                "A second ServerKeyExchange arrived.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawServerKeyExchange = true;
         var ske = HandshakeCodec.ParseServerKeyExchange(body);
         if (ske.NamedCurve != NamedGroups.Secp256r1)
         {
@@ -808,6 +845,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleCertificateRequestLocked(byte[] body)
     {
+        if (_sawCertificateRequest)
+        {
+            throw new DtlsException(
+                "A second CertificateRequest arrived.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawCertificateRequest = true;
         var request = HandshakeCodec.ParseCertificateRequest(body);
         _certificateRequested = true;
         _localSignatureAlgorithm = ChooseLocalSignatureAlgorithm(request.SignatureAlgorithms);
@@ -870,18 +915,42 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleClientHelloLocked(byte[] body)
     {
+        // RFC 6347 §4.2.4: once the server has committed to a handshake by sending its ServerHello,
+        // a further ClientHello is a renegotiation attempt, which Keryx does not implement. Honouring
+        // it would let anyone who can place a datagram on the ICE-validated path destroy the
+        // in-progress session (fresh server_random and a fresh ECDHE key) and would turn one small
+        // ClientHello into a full certificate flight — a reflected amplification vector. A genuine
+        // retransmission of the client's first flight reuses message_seq 0 and is absorbed by the
+        // reassembler before it ever reaches here, so anything arriving at this point is hostile.
+        if (_sawClientHello)
+        {
+            throw new DtlsException(
+                "A second ClientHello arrived; Keryx does not support renegotiation.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
         if (_state == DtlsTransportState.New)
         {
             SetStateLocked(DtlsTransportState.Connecting);
         }
 
         var hello = HandshakeCodec.ParseClientHello(body);
-        if (hello.Version is not (ProtocolVersions.Dtls12 or ProtocolVersions.Dtls10))
+
+        // DTLS versions are ordered by descending numeric value (DTLS 1.0 = 0xFEFF, 1.2 = 0xFEFD,
+        // 1.3 = 0xFEFC), so "at least DTLS 1.2" is "numerically <= 0xFEFD". RFC 5246 §7.4.1.2 and
+        // RFC 6347 §4.2.1 require a server whose lowest supported version exceeds the offered
+        // client_version to abort with protocol_version rather than answer anyway. Keryx implements
+        // DTLS 1.2 only, so a 1.0 ClientHello is refused here instead of being silently answered
+        // with a 1.2 ServerHello. A client offering a *newer* version negotiates down to 1.2, which
+        // is the behaviour the RFC prescribes.
+        if (hello.Version > ProtocolVersions.Dtls12)
         {
             throw new DtlsException(
-                $"ClientHello offered unsupported version 0x{hello.Version:X4}.",
+                $"ClientHello offered version 0x{hello.Version:X4}; Keryx requires DTLS 1.2 (0x{ProtocolVersions.Dtls12:X4}) or newer.",
                 DtlsAlertDescription.ProtocolVersion);
         }
+
+        _sawClientHello = true;
 
         if (Array.IndexOf(hello.CompressionMethods, (byte)0) < 0)
         {
@@ -967,6 +1036,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             throw new DtlsException("ClientKeyExchange arrived before ServerHello.", DtlsAlertDescription.UnexpectedMessage);
         }
 
+        // A second ClientKeyExchange would re-run the key schedule and swap the pending ciphers out
+        // from under an already-agreed session.
+        if (_sawClientKeyExchange)
+        {
+            throw new DtlsException("A second ClientKeyExchange arrived.", DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawClientKeyExchange = true;
         var point = HandshakeCodec.ParseClientKeyExchange(body);
         var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, point);
         DeriveKeysLocked(preMasterSecret);
@@ -976,6 +1053,20 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandlePeerCertificateLocked(byte[] body)
     {
+        // A second Certificate message would replace RemoteCertificate/RemoteFingerprint while
+        // _peerCertificateVerified still records the *first* certificate's CertificateVerify, so a
+        // peer could complete the handshake proving possession of one key and then have Keryx report
+        // a different certificate to the application. Fingerprint pinning independently blocks that,
+        // but callers that read RemoteFingerprint to make their own trust decision must not be
+        // exposed to it either.
+        if (_sawPeerCertificate)
+        {
+            throw new DtlsException(
+                "A second Certificate message arrived.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawPeerCertificate = true;
         var chain = HandshakeCodec.ParseCertificate(body);
         if (chain.Count == 0)
         {
@@ -1028,6 +1119,13 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
+        if (_sawCertificateVerify)
+        {
+            throw new DtlsException("A second CertificateVerify arrived.", DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawCertificateVerify = true;
+
         var certificate = _peerCertificate
                           ?? throw new DtlsException(
                               "CertificateVerify arrived without a peer certificate.",
@@ -1047,6 +1145,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleFinishedLocked(byte[] body, byte[] transcriptHash)
     {
+        // A second Finished would drive the server through AppendChangeCipherSpecAndFinishedLocked
+        // a second time, advancing the write epoch with no pending cipher behind it and tearing down
+        // an established connection.
+        if (_sawPeerFinished)
+        {
+            throw new DtlsException("A second Finished arrived.", DtlsAlertDescription.UnexpectedMessage);
+        }
+
         if (_masterSecret is null)
         {
             throw new DtlsException("Finished arrived before the master secret was established.", DtlsAlertDescription.UnexpectedMessage);
@@ -1073,6 +1179,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
+        _sawPeerFinished = true;
         var label = _role == DtlsRole.Server ? TlsPrf.ClientFinishedLabel : TlsPrf.ServerFinishedLabel;
         var expected = TlsPrf.VerifyData(_masterSecret, label, transcriptHash);
         if (body.Length != expected.Length || !CryptographicOperations.FixedTimeEquals(body, expected))

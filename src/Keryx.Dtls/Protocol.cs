@@ -28,7 +28,12 @@ internal enum HandshakeType : byte
 
 internal static class ProtocolVersions
 {
-    /// <summary>DTLS 1.0 — {254, 255}. Accepted on an initial ClientHello only.</summary>
+    /// <summary>
+    /// DTLS 1.0 — {254, 255}. Accepted as a <em>record-layer</em> version only, because RFC 6347
+    /// §4.1 lets an initial ClientHello record carry it. It is never acceptable as a negotiated
+    /// version: a ClientHello whose <c>client_version</c> is DTLS 1.0 is refused with
+    /// <c>protocol_version</c>.
+    /// </summary>
     public const ushort Dtls10 = 0xFEFF;
 
     /// <summary>DTLS 1.2 — {254, 253}.</summary>
