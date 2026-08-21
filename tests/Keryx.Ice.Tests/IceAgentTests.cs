@@ -1,0 +1,391 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using FluentAssertions;
+using Keryx.Stun;
+using Xunit;
+
+namespace Keryx.Ice.Tests;
+
+/// <summary>
+/// End-to-end tests for <see cref="IceAgent"/>: gathering, RFC 8445 connectivity checks between
+/// two agents on the loopback interface, role-conflict resolution, and the RFC 7983
+/// demultiplexing rule that hands every non-STUN datagram to the exposed transport.
+/// </summary>
+public sealed class IceAgentTests
+{
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(8);
+    private static readonly int ReceiveTimeoutMs = 5000;
+
+    private static CancellationToken Timeout(int seconds = 30)
+        => new CancellationTokenSource(TimeSpan.FromSeconds(seconds)).Token;
+
+    private static IceAgentOptions LoopbackOptions(IceRole role, ulong? tieBreaker = null) => new()
+    {
+        Role = role,
+        BindAddress = IPAddress.Loopback,
+        TieBreaker = tieBreaker,
+        CheckInterval = TimeSpan.FromMilliseconds(20),
+        CheckRetransmissionTimeout = TimeSpan.FromMilliseconds(150),
+        KeepaliveInterval = TimeSpan.FromMilliseconds(500),
+    };
+
+    private static BlockingCollection<byte[]> Capture(IceAgent agent)
+    {
+        var queue = new BlockingCollection<byte[]>();
+        agent.Transport.OnReceived += datagram => queue.Add(datagram.ToArray());
+        return queue;
+    }
+
+    private static void Trickle(IceAgent from, IceAgent to)
+        => from.OnLocalCandidate += (_, candidate) => to.AddRemoteCandidate(candidate.ToSdpLine());
+
+    [Fact]
+    public async Task TwoLoopbackAgents_ConnectAndCarryDatagramsBothWays()
+    {
+        var cancellationToken = Timeout();
+        using var offerer = new IceAgent(LoopbackOptions(IceRole.Controlling));
+        using var answerer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        var offererInbox = Capture(offerer);
+        var answererInbox = Capture(answerer);
+
+        var offererStates = new List<IceAgentState>();
+        offerer.OnStateChanged += (_, state) =>
+        {
+            lock (offererStates)
+            {
+                offererStates.Add(state);
+            }
+        };
+
+        // Trickle candidates through SDP attribute syntax, the way signalling would.
+        Trickle(offerer, answerer);
+        Trickle(answerer, offerer);
+
+        offerer.SetRemoteCredentials(answerer.LocalUfrag, answerer.LocalPassword);
+        answerer.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+
+        await offerer.StartGatheringAsync(cancellationToken);
+        await answerer.StartGatheringAsync(cancellationToken);
+
+        (await offerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+        (await answerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+
+        offerer.State.Should().Be(IceAgentState.Connected);
+        answerer.State.Should().Be(IceAgentState.Connected);
+
+        // Aggressive nomination: the first pair to succeed is already nominated.
+        offerer.SelectedPair.Should().NotBeNull();
+        offerer.SelectedPair!.Nominated.Should().BeTrue();
+        offerer.SelectedPair.State.Should().Be(IceCandidatePairState.Succeeded);
+        offerer.SelectedPair.RemoteEndPoint.Should().Be(answerer.LocalEndPoint);
+        answerer.SelectedPair.Should().NotBeNull();
+        answerer.SelectedPair!.RemoteEndPoint.Should().Be(offerer.LocalEndPoint);
+
+        // A DTLS-shaped record (first byte 20-63) and an RTP-shaped packet (128-191) must both
+        // reach the far side's transport untouched.
+        var dtls = new byte[] { 22, 0xFE, 0xFD, 0x00, 0x00, 0x01, 0x02, 0x03 };
+        var rtp = new byte[] { 128, 0x60, 0x00, 0x2A, 0xDE, 0xAD, 0xBE, 0xEF };
+
+        offerer.Transport.Send(dtls);
+        answerer.Transport.Send(rtp);
+
+        answererInbox.TryTake(out var atAnswerer, ReceiveTimeoutMs).Should().BeTrue();
+        atAnswerer.Should().Equal(dtls);
+
+        offererInbox.TryTake(out var atOfferer, ReceiveTimeoutMs).Should().BeTrue();
+        atOfferer.Should().Equal(rtp);
+
+        offerer.Transport.MaxDatagramSize.Should().Be(1472);
+
+        lock (offererStates)
+        {
+            offererStates.Should().ContainInOrder(
+                IceAgentState.Gathering, IceAgentState.Checking, IceAgentState.Connected);
+        }
+    }
+
+    [Fact]
+    public async Task LosingThePeerMovesTheAgentThroughDisconnectedToFailed()
+    {
+        var cancellationToken = Timeout();
+        var options = LoopbackOptions(IceRole.Controlling);
+        options.KeepaliveInterval = TimeSpan.FromMilliseconds(100);
+        options.DisconnectedTimeout = TimeSpan.FromMilliseconds(400);
+        options.ConsentTimeout = TimeSpan.FromMilliseconds(900);
+
+        using var survivor = new IceAgent(options);
+        var peer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        var seen = new List<IceAgentState>();
+        var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        survivor.OnStateChanged += (_, state) =>
+        {
+            lock (seen)
+            {
+                seen.Add(state);
+            }
+
+            if (state == IceAgentState.Failed)
+            {
+                failed.TrySetResult();
+            }
+        };
+
+        Trickle(survivor, peer);
+        Trickle(peer, survivor);
+        survivor.SetRemoteCredentials(peer.LocalUfrag, peer.LocalPassword);
+        peer.SetRemoteCredentials(survivor.LocalUfrag, survivor.LocalPassword);
+
+        await survivor.StartGatheringAsync(cancellationToken);
+        await peer.StartGatheringAsync(cancellationToken);
+        (await survivor.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+
+        peer.Dispose();
+
+        await failed.Task.WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+
+        lock (seen)
+        {
+            seen.Should().ContainInOrder(
+                IceAgentState.Connected, IceAgentState.Disconnected, IceAgentState.Failed);
+        }
+    }
+
+    [Theory]
+    [InlineData(1000ul, 2000ul)]
+    [InlineData(2000ul, 1000ul)]
+    public async Task TwoControllingAgents_ResolveTheRoleConflictAndStillConnect(ulong firstTieBreaker, ulong secondTieBreaker)
+    {
+        var cancellationToken = Timeout();
+        using var first = new IceAgent(LoopbackOptions(IceRole.Controlling, firstTieBreaker));
+        using var second = new IceAgent(LoopbackOptions(IceRole.Controlling, secondTieBreaker));
+
+        Trickle(first, second);
+        Trickle(second, first);
+
+        first.SetRemoteCredentials(second.LocalUfrag, second.LocalPassword);
+        second.SetRemoteCredentials(first.LocalUfrag, first.LocalPassword);
+
+        await first.StartGatheringAsync(cancellationToken);
+        await second.StartGatheringAsync(cancellationToken);
+
+        (await first.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+        (await second.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+
+        // RFC 8445 section 7.3.1.1: exactly one agent keeps the controlling role, and the agent
+        // with the larger tie-breaker is the one that keeps it.
+        first.Role.Should().NotBe(second.Role);
+        var controlling = first.Role == IceRole.Controlling ? first : second;
+        var controlled = ReferenceEquals(controlling, first) ? second : first;
+        controlling.TieBreaker.Should().BeGreaterThan(controlled.TieBreaker);
+    }
+
+    [Fact]
+    public async Task NonStunDatagramsAreSurfacedBeforeAnyPairIsSelected()
+    {
+        var cancellationToken = Timeout();
+        using var agent = new IceAgent(new IceAgentOptions { BindAddress = IPAddress.Loopback });
+        var inbox = Capture(agent);
+
+        await agent.StartGatheringAsync(cancellationToken);
+        var target = agent.LocalEndPoint!;
+        agent.State.Should().Be(IceAgentState.Gathering);
+
+        using var raw = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        raw.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+
+        // DTLS can arrive immediately after the peer's first successful check, so nothing may be
+        // buffered waiting for nomination.
+        var dtls = new byte[] { 22, 0xFE, 0xFD, 0x09, 0x09 };
+        raw.SendTo(dtls, target);
+
+        inbox.TryTake(out var received, ReceiveTimeoutMs).Should().BeTrue();
+        received.Should().Equal(dtls);
+        agent.State.Should().Be(IceAgentState.Gathering);
+    }
+
+    [Fact]
+    public async Task StunDatagramsAreConsumedInternallyAndNeverReachTheTransport()
+    {
+        var cancellationToken = Timeout();
+        using var agent = new IceAgent(new IceAgentOptions { BindAddress = IPAddress.Loopback });
+        var inbox = Capture(agent);
+
+        await agent.StartGatheringAsync(cancellationToken);
+        var target = agent.LocalEndPoint!;
+
+        using var raw = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        raw.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+
+        // An unauthenticated STUN Binding request: the agent must swallow it.
+        raw.SendTo(StunMessage.CreateBindingRequest().Encode(appendFingerprint: true), target);
+
+        // A trailing RTP-shaped packet proves the STUN datagram was skipped rather than delayed.
+        var rtp = new byte[] { 128, 0x60, 0x00, 0x07 };
+        raw.SendTo(rtp, target);
+
+        inbox.TryTake(out var received, ReceiveTimeoutMs).Should().BeTrue();
+        received.Should().Equal(rtp);
+        inbox.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task StartGathering_ReportsHostCandidatesThenCompletion()
+    {
+        var cancellationToken = Timeout();
+        var states = new List<IceAgentState>();
+        var candidates = new List<IceCandidate>();
+        var gatheringComplete = 0;
+
+        using var agent = new IceAgent(new IceAgentOptions { BindAddress = IPAddress.Loopback });
+        agent.OnStateChanged += (_, state) => states.Add(state);
+        agent.OnLocalCandidate += (_, candidate) => candidates.Add(candidate);
+        agent.OnGatheringComplete += (_, _) => Interlocked.Increment(ref gatheringComplete);
+
+        agent.State.Should().Be(IceAgentState.New);
+        await agent.StartGatheringAsync(cancellationToken);
+
+        states.Should().StartWith(new[] { IceAgentState.Gathering });
+        gatheringComplete.Should().Be(1);
+        candidates.Should().ContainSingle();
+
+        var candidate = candidates[0];
+        candidate.Type.Should().Be(IceCandidateType.Host);
+        candidate.Component.Should().Be(1);
+        candidate.Transport.Should().Be("udp");
+        candidate.Address.Should().Be(IPAddress.Loopback);
+        candidate.Port.Should().Be(agent.LocalEndPoint!.Port);
+        candidate.Priority.Should().Be(IcePriority.Compute(IceCandidateType.Host));
+
+        // The gathered candidate must survive an SDP round trip.
+        IceCandidate.Parse(candidate.ToSdpLine()).Should().Be(candidate);
+        agent.LocalCandidates.Should().Equal(new[] { candidate });
+    }
+
+    [Fact]
+    public async Task StartGathering_HonoursTheConfiguredPortRange()
+    {
+        var cancellationToken = Timeout();
+        using var agent = new IceAgent(new IceAgentOptions
+        {
+            BindAddress = IPAddress.Loopback,
+            MinPort = 7900,
+            MaxPort = 7999,
+        });
+
+        await agent.StartGatheringAsync(cancellationToken);
+
+        agent.LocalEndPoint!.Port.Should().BeInRange(7900, 7999);
+        agent.LocalCandidates.Should().ContainSingle().Which.Port.Should().Be(agent.LocalEndPoint.Port);
+    }
+
+    [Fact]
+    public async Task StartGathering_CannotBeCalledTwice()
+    {
+        var cancellationToken = Timeout();
+        using var agent = new IceAgent(new IceAgentOptions { BindAddress = IPAddress.Loopback });
+        await agent.StartGatheringAsync(cancellationToken);
+
+        var act = async () => await agent.StartGatheringAsync(cancellationToken);
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+    }
+
+    [Fact]
+    public void Transport_ThrowsUntilAPairHasSucceeded()
+    {
+        using var agent = new IceAgent(new IceAgentOptions { BindAddress = IPAddress.Loopback });
+
+        var act = () => agent.Transport.Send(new byte[] { 1, 2, 3 });
+
+        act.Should().Throw<InvalidOperationException>();
+    }
+
+    [Fact]
+    public void Credentials_AreGeneratedWhenNotSupplied()
+    {
+        using var supplied = new IceAgent(new IceAgentOptions
+        {
+            LocalUfrag = "abcd",
+            LocalPassword = "0123456789012345678901",
+            TieBreaker = 42,
+        });
+        using var generated = new IceAgent();
+
+        supplied.LocalUfrag.Should().Be("abcd");
+        supplied.LocalPassword.Should().Be("0123456789012345678901");
+        supplied.TieBreaker.Should().Be(42ul);
+
+        generated.LocalUfrag.Length.Should().BeGreaterThanOrEqualTo(4);
+        generated.LocalPassword.Length.Should().BeGreaterThanOrEqualTo(22);
+        generated.Role.Should().Be(IceRole.Controlling);
+        generated.State.Should().Be(IceAgentState.New);
+        generated.SelectedPair.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task StartGathering_AddsAServerReflexiveCandidateFromTheConfiguredStunServer()
+    {
+        var cancellationToken = Timeout();
+        var reflexive = new IPEndPoint(IPAddress.Parse("203.0.113.77"), 51234);
+
+        using var stunServer = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        stunServer.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var stunEndPoint = (IPEndPoint)stunServer.LocalEndPoint!;
+
+        var responder = Task.Run(async () =>
+        {
+            var buffer = new byte[1500];
+            EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+            var received = await stunServer.ReceiveFromAsync(buffer, SocketFlags.None, from, cancellationToken);
+            var request = StunMessage.Decode(buffer.AsSpan(0, received.ReceivedBytes));
+            var response = StunMessage.CreateSuccessResponse(request)
+                .Add(new StunXorMappedAddressAttribute(reflexive));
+            stunServer.SendTo(response.Encode(appendFingerprint: true), received.RemoteEndPoint);
+        }, cancellationToken);
+
+        var options = new IceAgentOptions
+        {
+            BindAddress = IPAddress.Loopback,
+            StunClientOptions = new StunClientOptions
+            {
+                InitialRetransmissionTimeout = TimeSpan.FromMilliseconds(100),
+                MaxTransmissions = 5,
+                FinalWaitMultiplier = 4,
+            },
+        };
+        options.StunServers.Add(stunEndPoint);
+
+        using var agent = new IceAgent(options);
+        await agent.StartGatheringAsync(cancellationToken);
+        await responder;
+
+        // The srflx query runs over the agent's own socket, not a throwaway one.
+        var srflx = agent.LocalCandidates.Single(c => c.Type == IceCandidateType.ServerReflexive);
+        srflx.EndPoint.Should().Be(reflexive);
+        srflx.RelatedAddress.Should().Be(IPAddress.Loopback);
+        srflx.RelatedPort.Should().Be(agent.LocalEndPoint!.Port);
+        srflx.Priority.Should().Be(IcePriority.Compute(IceCandidateType.ServerReflexive));
+        srflx.ToAttributeString().Should().Contain("typ srflx raddr 127.0.0.1 rport ");
+        agent.LocalCandidates.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task AddRemoteCandidate_AcceptsTrickledSdpAndRejectsGarbage()
+    {
+        var cancellationToken = Timeout();
+        using var agent = new IceAgent(LoopbackOptions(IceRole.Controlling));
+        await agent.StartGatheringAsync(cancellationToken);
+
+        agent.AddRemoteCandidate("a=candidate:1 1 udp 2130706431 127.0.0.1 7999 typ host generation 0")
+            .Should().BeTrue();
+        agent.AddRemoteCandidate("nonsense").Should().BeFalse();
+
+        agent.RemoteCandidates.Should().ContainSingle();
+        agent.CheckList.Should().ContainSingle()
+            .Which.Priority.Should().Be(
+                IcePriority.ComputePair(agent.LocalCandidates[0].Priority, 2130706431u));
+    }
+}
