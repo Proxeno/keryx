@@ -23,8 +23,15 @@ commit, and it turns the workarounds we carried in production into first-class A
 - **Typed RTCP feedback.** PLI, FIR, NACK and transport-cc arrive as dedicated events
   (`OnPictureLossIndication`, …), and `a=rtcp-fb` lines are emitted natively per configured codec —
   no SDP string-splicing between `createOffer` and `setLocalDescription`, no parsing raw RTCP
-  compound packets in application code. H.264 offers `nack pli` and `ccm fir` by default and never
-  bare `nack` (which would promise RTX that isn't implemented).
+  compound packets in application code. H.264 offers `nack`, `nack pli` and `ccm fir` by default.
+- **NACK-driven retransmission that actually retransmits.** Bare `a=rtcp-fb nack` is backed by a
+  real RFC 4588 repair stream: an `rtx` codec, a dedicated SSRC published as `a=ssrc-group:FID`,
+  and a ring of recently sent packets that inbound NACKs are served from — under a per-packet
+  resend rate limit and a bandwidth budget, with counters on `GetStats()`. If the answer drops the
+  `rtx` codec, retransmission is switched off rather than promised and not delivered.
+- **Sender-side link quality.** Reception report blocks the browser sends are folded into
+  `GetStats()` per track: fraction lost, cumulative loss, interarrival jitter and LSR/DLSR
+  round-trip time — the signal a rate controller needs, without parsing RTCP yourself.
 - **A codec-agnostic packetizer seam.** H.264 (packetization-mode=1, STAP-A/FU-A) and Opus ship
   in-box; community codecs implement one interface (`IRtpPayloadizer`) plus one `SdpCodec` entry.
 - **Strict layering.** Each protocol layer is its own package with no upward dependencies,
@@ -52,6 +59,12 @@ await pc.WaitForConnectedAsync(TimeSpan.FromSeconds(15), ct);
 pc.SendVideoFrame(annexBAccessUnit, rtpTimestamp90k);   // one H.264 access unit per call
 pc.SendAudioFrame(opusPacket, rtpTimestamp48k);
 (await controller).OnMessage += (isBinary, payload) => HandleInput(payload);
+
+// Inbound NACKs are served from the send history as RTX automatically; read the link back:
+var video = pc.GetStats().Video;
+var lost = video?.Quality?.FractionLost;              // 0..1, from the peer's reception reports
+var rtt = video?.Quality?.RoundTripTime;              // RFC 3550 LSR/DLSR arithmetic
+var resent = video?.Retransmission?.PacketsRetransmitted;
 ```
 
 That is the whole surface a sendonly media server needs: ICE gathering, DTLS with fingerprint
@@ -103,7 +116,8 @@ Every claim is backed by a test in this repository.
       SCTP: CRC32c check vectors · RTP: header edge-case matrix, RFC 6184 golden packets.
 - [x] **Loopback integration** — two `PeerConnection`s over real UDP sockets: ICE connects, DTLS
       completes with mutual fingerprint pinning, 30 real H.264 access units arrive byte-identical,
-      data channels round-trip (including 64 KB binary), PLI/FIR arrive as typed events.
+      data channels round-trip (including 64 KB binary), PLI/FIR arrive as typed events, and a
+      Generic NACK is answered with RFC 4588 RTX packets on the repair SSRC.
 - [x] **Chrome interop** — headless Chrome (tested with 151) answers a Keryx offer over HTTP
       signaling: ICE connects, DTLS completes (Keryx as server, `SRTP_AES128_CM_HMAC_SHA1_80`),
       **Chrome decodes and renders the H.264 Keryx sends** (60+ frames, 640×360, keyframes
@@ -111,7 +125,7 @@ Every claim is backed by a test in this repository.
       `dotnet test tests/Keryx.IntegrationTests --filter "Category=ChromeInterop"`.
 - [x] **Benchmarks vs SIPSorcery** — below.
 
-829 tests across ten projects (`dotnet test Keryx.slnx`; the Chrome interop test needs Chrome installed).
+874 tests across ten projects (`dotnet test Keryx.slnx`; the Chrome interop test needs Chrome installed).
 
 ## Benchmarks
 
@@ -145,6 +159,7 @@ byte-identical, documents on each side; SRTP uses identical key material and inp
 | 4585 / 5104 | PLI, FIR, GenericNack (PID/BLP), REMB parse | `Keryx.Rtp.Tests` |
 | draft-holmer-rmcat-transport-wide-cc-01 | transport-cc feedback parse/build | `Keryx.Rtp.Tests` |
 | 6184 / 7587 / 8285 | H.264 STAP-A/FU-A, Opus, header extensions | `Keryx.Rtp.Tests` |
+| 4588 / 5576 | RTX packet format (OSN, own seq space), `apt`, `ssrc-group:FID` | `Keryx.Rtp.Tests`, `Keryx.Sdp.Tests`, `Keryx.IntegrationTests` |
 | 3711 (B.2, B.3) / 7714 (§16, §17) | SRTP/SRTCP AES-CM + GCM, ROC, replay | `Keryx.Srtp.Tests` |
 | 5764 §4.2 | DTLS-SRTP key split, use_srtp | `Keryx.Srtp.Tests`, `Keryx.Dtls.Tests` |
 | 6347 / 5246 / 5288 / 7627 / 5705 | DTLS 1.2 records, PRF vectors, AES-GCM, EMS, exporter | `Keryx.Dtls.Tests` |
@@ -156,10 +171,10 @@ byte-identical, documents on each side; SRTP uses identical key material and inp
 **Implemented:** the offerer-side media server path end to end — sendonly H.264 + Opus with
 BUNDLE/rtcp-mux, trickle ICE (in and out), DTLS 1.2 both roles with fingerprint pinning, SRTP
 AES-CM and AES-GCM, bidirectional data channels with partial reliability, typed RTCP feedback
-in both directions, a minimal recvonly answerer, and a raw RTP receive surface.
+in both directions, RFC 4588 RTX retransmission driven by inbound NACKs, sender-side loss/jitter/RTT
+statistics from reception reports, a minimal recvonly answerer, and a raw RTP receive surface.
 
-**Not implemented (yet, honestly):** RTX/NACK retransmission (NACKs are surfaced, nothing is
-resent — and bare `nack` is deliberately never offered), bandwidth estimation / pacing / REMB
+**Not implemented (yet, honestly):** ULPFEC and RED, bandwidth estimation / pacing / REMB
 generation / `a=extmap` (no outbound TWCC sequence numbers), TURN and IPv6 candidate pairing,
 regular (non-aggressive) nomination, renegotiation and ICE restart, simulcast, SCTP stream reset
 (RE-CONFIG), jitter buffering on the receive surface, audio receive processing. Per-layer

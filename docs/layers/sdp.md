@@ -10,8 +10,11 @@ A lossless SDP model with typed accessors and JSEP helpers on top.
   rather than shadowing it, so nothing is ever dropped by parsing.
 - **`a=rtcp-fb` is a first-class citizen** (`RtcpFeedback`, per-pt and wildcard) because the
   inability to emit `nack pli`/`ccm fir` natively is a founding reason this stack exists.
-  H.264 defaults emit `nack pli`, `ccm fir`, `transport-cc` — and never bare `nack`, which
-  promises generic retransmission we do not implement; bare `nack` is opt-in.
+  H.264 defaults emit `nack`, `nack pli`, `ccm fir`, `transport-cc`, in Chrome's order. Bare `nack`
+  promises generic retransmission, so it travels with an RFC 4588 `rtx` entry: `SdpCodec.Rtx`
+  renders `a=rtpmap:<pt> rtx/<clock>` plus `a=fmtp:<pt> apt=<media pt>`, and `SsrcGroup.FidSemantics`
+  binds the repair SSRC to the media SSRC (RFC 5576 §4.2). A caller assembling its own m-section
+  keeps the two in step, or drops bare `nack` from the feedback list.
 - **`SdpOfferBuilder`** produces the exact Chrome-conventional offer shape (BUNDLE, rtcp-mux,
   `setup:actpass`, per-section ICE/fingerprint, `m=application` with `sctp-port`). Codec entries
   (`SdpCodec`) are fully caller-configurable — community codecs slot in without touching this
@@ -19,7 +22,10 @@ A lossless SDP model with typed accessors and JSEP helpers on top.
 - **`SdpNegotiator`** validates a JSEP answer against the offer (m-line count/order/protocol/mid)
   and reports per-mid negotiated state (intersected codecs in offer order, directions from the
   offerer's point of view, remote credentials/fingerprint/setup, sctp parameters). It reports;
-  the PeerConnection layer decides.
+  the PeerConnection layer decides. `NegotiatedCodec.IsRtx` / `GetAssociatedPayloadType()` and
+  `NegotiatedMedia.FindRtxCodec(pt)` express the RFC 4588 §8.1 `apt` binding, and fmtp strings —
+  Opus `useinbandfec=1` and `minptime`, H.264 `packetization-mode` — pass through both directions
+  untouched, falling back to the offer's when the answer omits them.
 - Candidate lines are carried as raw strings — `Keryx.Ice` owns candidate syntax.
 
 ## Simplifications

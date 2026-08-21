@@ -39,11 +39,47 @@ receive thread.
 The founding feature: inbound SRTCP compound packets dispatch to `OnPictureLossIndication`,
 `OnFullIntraRequest`, `OnNack` (bitmask pre-expanded), `OnTransportCcFeedback` and
 `OnReceiverReport` (with LSR/DLSR round-trip arithmetic). `a=rtcp-fb` lines are emitted natively
-from the codec configuration — `nack pli` and `ccm fir` by default for H.264, never bare `nack`.
+from the codec configuration — `nack`, `nack pli` and `ccm fir` by default for H.264.
+`SendPictureLossIndication`, `SendFullIntraRequest` and `SendNack` cover the other direction.
+
+## Retransmission (RFC 4588)
+
+Video is offered with bare `nack` and, per video codec, a generated `rtx` entry on the next free
+dynamic payload type; a second SSRC is published through `a=ssrc-group:FID` under the same cname.
+The configured `SdpCodec` list is copied, never mutated, so building an offer twice is idempotent.
+
+RTX is treated as negotiated **only** when the answer keeps an `rtx` codec whose `apt` names the
+media codec that was chosen. An answer that echoes bare `nack` but drops `rtx` disables
+retransmission: resending on the media SSRC would corrupt its sequence numbering, so Keryx does
+nothing rather than something wrong.
+
+Once negotiated, each video packet is captured into an `RtpSendHistory` *before*
+`ProtectRtp` encrypts the same buffer in place. An inbound Generic NACK is expanded entry by entry
+on the ICE receive loop and served under the send lock — the same lock `SendVideoFrame` takes, which
+is what serialises the repair stream's sequence numbering and the SRTP context both streams share.
+The history has its own lock, so a NACK never tears a slab a frame is being written into. The media
+stream gives back the two bytes the OSN costs, so a repair packet still fits the negotiated MTU.
+
+Defaults: a 512-packet / 1 s / 1 MB history, a 50 ms minimum interval between two resends of the
+same sequence number, and a 250 kB/s retransmission budget with a 64 kB burst — all on
+`PeerConnectionConfig`. `GetStats().Video.Retransmission` reports NACKs received, packets requested,
+packets and bytes retransmitted, history misses and suppressed requests.
+
+Audio is deliberately excluded: browsers do not negotiate RTX for Opus, whose in-band FEC repairs
+isolated loss without a round trip. Keryx's offer and its negotiator both preserve
+`useinbandfec=1`.
+
+## Sender-side link quality
+
+Reception report blocks naming this endpoint's own SSRCs are folded into
+`GetStats().Video.Quality` / `.Audio.Quality` as an `OutboundStreamQuality`: fraction lost as a
+0–1 double, signed cumulative loss, extended highest sequence number, interarrival jitter (raw and
+converted with the negotiated clock rate), and RFC 3550 §6.4.1 LSR/DLSR round-trip time. Blocks
+about any other source are ignored. The raw `OnReceiverReport` event still fires alongside.
 
 ## Honest limitations (current)
 
-- No RTX/NACK retransmission (NACKs surface as events only — hence no bare `nack` offered).
+- No ULPFEC or RED, and no retransmission for audio.
 - No bandwidth estimation, pacing, REMB generation, or `a=extmap` support (no outbound TWCC
   sequence numbers).
 - The answerer role is minimal and recvonly — it exists to prove the stack against itself; the
