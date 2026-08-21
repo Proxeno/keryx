@@ -85,14 +85,18 @@ public sealed class SrtpDecryptContext : IDisposable
             return false;
         }
 
-        var stream = GetOrCreateStream(ssrc);
+        // State for an unseen SSRC is not created until the packet authenticates. The SSRC is read
+        // straight off the wire, so allocating on first sight let anyone who can reach this socket
+        // pin a SrtpStreamState plus a dictionary entry per forged SSRC — 2^32 of them, never
+        // evicted, for the price of a 22-byte datagram each.
+        var known = _rtpStreams.TryGetValue(ssrc, out var stream);
 
         // RFC 3711 Section 3.3 processing order: estimate the index, consult the replay list,
         // verify the tag, decrypt, and only then commit ROC / s_l / replay state.
-        var candidate = stream.EstimateRolloverCounter(sequenceNumber);
+        var candidate = known ? stream!.EstimateRolloverCounter(sequenceNumber) : 0;
         var index = SrtpPacketIndex.Compose(candidate, sequenceNumber);
 
-        if (!stream.Replay.IsAcceptable(index))
+        if (known && !stream!.Replay.IsAcceptable(index))
         {
             Debug($"SRTP: dropping replayed packet, SSRC 0x{ssrc:x8} index {index}.");
             return false;
@@ -105,7 +109,17 @@ public sealed class SrtpDecryptContext : IDisposable
             return false;
         }
 
-        stream.Commit(candidate, sequenceNumber);
+        if (!known)
+        {
+            stream = new SrtpStreamState(ssrc);
+            _rtpStreams[ssrc] = stream;
+            if (_logger.IsEnabled(KeryxLogLevel.Debug))
+            {
+                _logger.Log(KeryxLogLevel.Debug, $"SRTP: new inbound stream for SSRC 0x{ssrc:x8}.");
+            }
+        }
+
+        stream!.Commit(candidate, sequenceNumber);
         stream.Replay.Commit(index);
         return true;
     }
@@ -154,7 +168,10 @@ public sealed class SrtpDecryptContext : IDisposable
         var index = SrtcpIndexWord.Index(word);
         var encrypted = SrtcpIndexWord.IsEncrypted(word);
 
-        ref var replay = ref CollectionsMarshal.GetValueRefOrAddDefault(_rtcpReplay, ssrc, out _);
+        // As on the SRTP path, the replay entry for an unseen SSRC is not created until the packet
+        // authenticates. A default window accepts any first index, so the check below behaves
+        // identically for a genuine first packet.
+        _rtcpReplay.TryGetValue(ssrc, out var replay);
         if (!replay.IsAcceptable(index))
         {
             Debug($"SRTCP: dropping replayed packet, SSRC 0x{ssrc:x8} index {index}.");
@@ -169,23 +186,15 @@ public sealed class SrtpDecryptContext : IDisposable
         }
 
         replay.Commit(index);
+        _rtcpReplay[ssrc] = replay;
         return true;
     }
 
-    private SrtpStreamState GetOrCreateStream(uint ssrc)
-    {
-        ref var stream = ref CollectionsMarshal.GetValueRefOrAddDefault(_rtpStreams, ssrc, out var existed);
-        if (!existed)
-        {
-            stream = new SrtpStreamState(ssrc);
-            if (_logger.IsEnabled(KeryxLogLevel.Debug))
-            {
-                _logger.Log(KeryxLogLevel.Debug, $"SRTP: new inbound stream for SSRC 0x{ssrc:x8}.");
-            }
-        }
-
-        return stream!;
-    }
+    /// <summary>
+    /// Number of SSRCs this context holds cryptographic state for. Entries are created only once a
+    /// packet from that SSRC has authenticated, so forged traffic cannot grow it.
+    /// </summary>
+    internal int TrackedStreamCount => _rtpStreams.Count + _rtcpReplay.Count;
 
     private void Debug(string message)
     {

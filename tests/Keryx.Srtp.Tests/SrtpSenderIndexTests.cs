@@ -188,4 +188,59 @@ public class SrtpSenderIndexTests
                 TestPackets.Rtp(Ssrc, seq, seq * 960u, payload));
         }
     }
+
+    /// <summary>
+    /// The SSRC is read straight off the wire before anything is authenticated. Creating per-SSRC
+    /// cryptographic state at that point lets anyone who can reach the media socket pin one
+    /// SrtpStreamState plus a dictionary entry per forged SSRC — never evicted, across a 2^32 space —
+    /// for the price of one small datagram each. State must not exist until a packet authenticates.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Profiles))]
+    public void Forged_packets_do_not_create_per_ssrc_state(SrtpProtectionProfileKind kind)
+    {
+        var profile = SrtpProtectionProfile.ForKind(kind);
+        var keys = DtlsSrtpKeyMaterial.Split(profile, TestPackets.KeyingMaterial(1, profile), DtlsSrtpRole.Client);
+        using var receiver = new SrtpDecryptContext(profile, keys.Local);
+
+        receiver.TrackedStreamCount.Should().Be(0);
+
+        var payload = new byte[32];
+        for (uint ssrc = 0x1000_0000; ssrc < 0x1000_0400; ssrc++)
+        {
+            var rtp = TestPackets.Rtp(ssrc, 7, 700, payload);
+            var forgedRtp = new byte[rtp.Length + profile.RtpOverhead];
+            rtp.CopyTo(forgedRtp, 0); // garbage where the tag belongs: cannot authenticate
+            var rtpOut = new byte[forgedRtp.Length];
+            receiver.TryUnprotectRtp(forgedRtp, rtpOut, out _).Should().BeFalse();
+
+            var rtcp = TestPackets.Rtcp(ssrc, [1, 2, 3, 4]);
+            var forgedRtcp = new byte[rtcp.Length + profile.RtcpOverhead];
+            rtcp.CopyTo(forgedRtcp, 0);
+            var rtcpOut = new byte[forgedRtcp.Length];
+            receiver.TryUnprotectRtcp(forgedRtcp, rtcpOut, out _).Should().BeFalse();
+        }
+
+        receiver.TrackedStreamCount.Should().Be(
+            0,
+            "1024 distinct forged SSRCs must leave no cryptographic state behind");
+    }
+
+    /// <summary>The counterpart: a packet that authenticates does create state, so the guard above
+    /// is not simply disabling stream tracking.</summary>
+    [Theory]
+    [MemberData(nameof(Profiles))]
+    public void An_authenticated_packet_does_create_per_ssrc_state(SrtpProtectionProfileKind kind)
+    {
+        var profile = SrtpProtectionProfile.ForKind(kind);
+        var keys = DtlsSrtpKeyMaterial.Split(profile, TestPackets.KeyingMaterial(1, profile), DtlsSrtpRole.Client);
+        using var sender = new SrtpEncryptContext(profile, keys.Local);
+        using var receiver = new SrtpDecryptContext(profile, keys.Local);
+
+        var good = Protect(sender, 0x0BADF00D, 7, new byte[32]);
+        var output = new byte[good.Length];
+        receiver.TryUnprotectRtp(good, output, out _).Should().BeTrue();
+
+        receiver.TrackedStreamCount.Should().Be(1);
+    }
 }
