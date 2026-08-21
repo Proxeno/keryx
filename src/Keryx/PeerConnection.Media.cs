@@ -139,6 +139,33 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>
+    /// Asks the peer to retransmit RTP packets it failed to deliver, as a compound
+    /// <c>RR + Generic NACK</c> over SRTCP (RFC 4585 §6.2.1).
+    /// </summary>
+    /// <param name="mediaSsrc">The SSRC of the inbound stream the packets are missing from.</param>
+    /// <param name="sequenceNumbers">
+    /// The missing sequence numbers. They are sorted and packed greedily into PID/BLP entries, each of
+    /// which covers a packet identifier and the sixteen sequence numbers that follow it.
+    /// </param>
+    /// <returns>
+    /// True when the feedback was protected and sent; false when the transport is not ready or the
+    /// list is empty.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="sequenceNumbers"/> is null.</exception>
+    public bool SendNack(uint mediaSsrc, IEnumerable<ushort> sequenceNumbers)
+    {
+        ArgumentNullException.ThrowIfNull(sequenceNumbers);
+        var nack = new RtcpGenericNack(_rtcpSenderSsrc, mediaSsrc, sequenceNumbers);
+        if (nack.Entries.Count == 0)
+        {
+            return false;
+        }
+
+        var report = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
+        return SendRtcpCompound([report, nack]);
+    }
+
+    /// <summary>
     /// Sends a Full Intra Request for one inbound stream, as a compound <c>RR + FIR</c> over SRTCP.
     /// </summary>
     /// <param name="mediaSsrc">The SSRC of the stream that must emit an intra frame.</param>
@@ -562,7 +589,12 @@ public sealed partial class PeerConnection
         }
     }
 
-    private void DispatchRtcp(RtcpPacket packet, DateTimeOffset receivedAt)
+    /// <summary>
+    /// Routes one parsed RTCP packet to its counters, its typed event, and — for NACK and reception
+    /// reports — to the retransmission and link-quality paths. Internal so tests can drive the
+    /// feedback path without standing up a transport.
+    /// </summary>
+    internal void DispatchRtcp(RtcpPacket packet, DateTimeOffset receivedAt)
     {
         switch (packet)
         {

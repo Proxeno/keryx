@@ -378,6 +378,89 @@ public class SdpNegotiatorTests
     }
 
     [Fact]
+    public void Negotiate_KeepsTheRtxCodecAndBindsItToTheCodecItRepairs()
+    {
+        // The Chrome fixture answers video with 102 (H.264) plus 103 (rtx, apt=102).
+        var video = Negotiate().GetByMid("1")!;
+
+        var rtx = video.FindRtxCodec(102);
+        rtx.Should().NotBeNull();
+        rtx!.PayloadType.Should().Be(103);
+        rtx.IsRtx.Should().BeTrue();
+        rtx.EncodingName.Should().Be("rtx");
+        rtx.ClockRate.Should().Be(90000);
+        rtx.GetAssociatedPayloadType().Should().Be(102);
+
+        // RFC 4588 §8.1 binds one repair codec to one original payload type, so an rtx entry for a
+        // payload type the answer dropped must not be found.
+        video.FindRtxCodec(96).Should().BeNull();
+        video.FindCodec("H264")!.IsRtx.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Negotiate_ReportsNoRtxWhenTheAnswerDropsTheRepairCodec()
+    {
+        var answer = Answer();
+        var video = answer.MediaDescriptions[1];
+        video.Formats.Remove("103");
+        video.RemoveAttributes(SdpAttributeNames.RtpMap);
+        video.RemoveAttributes(SdpAttributeNames.Fmtp);
+        video.SetRtpMap(new RtpMap(102, "H264", 90000));
+        video.SetFmtp(102, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
+
+        var negotiated = SdpNegotiator.Negotiate(Offer(), answer).GetByMid("1")!;
+
+        negotiated.Codecs.Should().ContainSingle().Which.PayloadType.Should().Be(102);
+        negotiated.FindRtxCodec(102).Should().BeNull();
+
+        // The answer still advertises bare nack; that alone must not be read as retransmission
+        // support, because without a repair stream there is nowhere to send the resends.
+        negotiated.Codecs[0].SupportsFeedback(RtcpFeedback.Nack).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Negotiate_PreservesOpusInbandFecAndMinptimeInBothDirections()
+    {
+        // RFC 7587 §7.1: useinbandfec is an fmtp parameter, and an answerer that means to use in-band
+        // FEC echoes it. Neither direction of the negotiator may drop or reorder it.
+        var audio = Negotiate().GetByMid("0")!;
+        var opus = audio.FindCodec("opus")!;
+
+        opus.Fmtp.Should().Be("minptime=10;useinbandfec=1");
+        opus.HasFmtp("useinbandfec", "1").Should().BeTrue();
+        opus.HasFmtp("minptime", "10").Should().BeTrue();
+        opus.GetFmtpParameters().Should().ContainKey("useinbandfec").WhoseValue.Should().Be("1");
+
+        // And the offer that produced it carried the same parameters.
+        Offer().MediaDescriptions[0].GetFmtp(111).Should().Be("minptime=10;useinbandfec=1");
+    }
+
+    [Fact]
+    public void Negotiate_KeepsOpusInbandFecWhenOnlyTheOfferCarriesIt()
+    {
+        var answer = Answer();
+        answer.MediaDescriptions[0].RemoveAttributes(SdpAttributeNames.Fmtp);
+
+        var opus = SdpNegotiator.Negotiate(Offer(), answer).GetByMid("0")!.FindCodec("opus")!;
+
+        opus.Fmtp.Should().Be("minptime=10;useinbandfec=1");
+    }
+
+    [Fact]
+    public void Negotiate_KeepsAnAnswerersOwnOpusFmtpParameters()
+    {
+        var answer = Answer();
+        answer.MediaDescriptions[0].RemoveAttributes(SdpAttributeNames.Fmtp);
+        answer.MediaDescriptions[0].SetFmtp(111, "minptime=20;useinbandfec=1;stereo=1");
+
+        var opus = SdpNegotiator.Negotiate(Offer(), answer).GetByMid("0")!.FindCodec("opus")!;
+
+        opus.Fmtp.Should().Be("minptime=20;useinbandfec=1;stereo=1");
+        opus.HasFmtp("useinbandfec", "1").Should().BeTrue();
+        opus.HasFmtp("stereo", "1").Should().BeTrue();
+    }
+
+    [Fact]
     public void Validate_NullArgumentsThrow()
     {
         var withNullOffer = () => SdpNegotiator.Validate(null!, Answer());
