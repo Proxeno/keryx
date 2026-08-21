@@ -13,8 +13,10 @@ namespace Keryx.Sdp;
 /// </param>
 /// <remarks>
 /// Bare <c>nack</c> and <c>nack pli</c> are distinct capabilities. A sender that advertises bare
-/// <c>nack</c> is claiming generic NACK retransmission support; advertise it only when the RTP layer
-/// actually implements RTX, otherwise remote peers will request retransmissions that never arrive.
+/// <c>nack</c> is claiming generic NACK retransmission support, which means pairing the codec with an
+/// RFC 4588 <c>rtx</c> entry and an <c>a=ssrc-group:FID</c> repair stream. Keryx does that for video
+/// by default; a caller assembling its own m-section must keep the two in step, or remote peers will
+/// request retransmissions that never arrive.
 /// </remarks>
 public sealed record RtcpFeedback(string Type, string? Parameter = null)
 {
