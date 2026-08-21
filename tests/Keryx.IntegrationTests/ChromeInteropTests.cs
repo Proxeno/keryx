@@ -29,25 +29,11 @@ public sealed class ChromeInteropTests
     /// <param name="output">Where progress and the final report land.</param>
     public ChromeInteropTests(ITestOutputHelper output) => _output = output;
 
-    private static string? FindChrome()
-    {
-        var overridePath = Environment.GetEnvironmentVariable("KERYX_CHROME_PATH");
-        string[] candidates =
-        [
-            overridePath ?? string.Empty,
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
-        ];
-        return candidates.FirstOrDefault(p => p.Length > 0 && File.Exists(p));
-    }
-
     [Fact]
     [Trait("Category", "ChromeInterop")]
     public async Task ChromeDecodesKeryxVideoAndDataChannelsRoundTrip()
     {
-        var chromePath = FindChrome();
+        var chromePath = ChromeBrowser.Find();
         if (chromePath is null)
         {
             _output.WriteLine("SKIPPED: Google Chrome not found (set KERYX_CHROME_PATH to enable).");
