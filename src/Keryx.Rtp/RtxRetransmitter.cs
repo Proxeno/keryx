@@ -223,9 +223,14 @@ public sealed class RtxRetransmitter
 
         if (!TryConsumeBudget(rtxLength))
         {
+            // The packet stays exactly as eligible as it was: a repair the budget refused was never
+            // sent, so it must not start the packet's minimum-resend interval.
             Interlocked.Increment(ref _suppressed);
             return RtxRetransmitResult.BandwidthLimited;
         }
+
+        // From here the repair is certain to be produced, so the rate limit starts now.
+        History.MarkRetransmitted(originalSequenceNumber);
 
         // Build the RTX payload where the RTP header will end, so the sender's payload copy becomes a
         // no-op self-copy and the packet is assembled without a second buffer.

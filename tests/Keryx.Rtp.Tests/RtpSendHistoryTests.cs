@@ -163,6 +163,7 @@ public class RtpSendHistoryTests
         clock.Advance(TimeSpan.FromMilliseconds(1));
         history.TryCopy(5, TimeSpan.FromMilliseconds(50), new byte[1200], out _)
             .Should().Be(RtpSendHistoryResult.Found);
+        history.MarkRetransmitted(5).Should().BeTrue();
 
         clock.Advance(TimeSpan.FromMilliseconds(20));
         history.TryCopy(5, TimeSpan.FromMilliseconds(50), new byte[1200], out _)
@@ -171,6 +172,33 @@ public class RtpSendHistoryTests
         clock.Advance(TimeSpan.FromMilliseconds(40));
         history.TryCopy(5, TimeSpan.FromMilliseconds(50), new byte[1200], out _)
             .Should().Be(RtpSendHistoryResult.Found);
+    }
+
+    [Fact]
+    public void A_copy_that_is_never_retransmitted_does_not_spend_the_resend_interval()
+    {
+        var clock = new TestTimeProvider();
+        var history = new RtpSendHistory(1200, new RtpSendHistoryOptions { Capacity = 8 }, clock);
+        history.Store(5, Packet(5));
+
+        // A caller that copies a packet and then abandons it — because a bandwidth budget refused the
+        // repair, say — has sent the peer nothing, so the packet must stay as eligible as it was.
+        history.TryCopy(5, TimeSpan.FromMilliseconds(50), new byte[1200], out _)
+            .Should().Be(RtpSendHistoryResult.Found);
+
+        clock.Advance(TimeSpan.FromMilliseconds(1));
+        history.TryCopy(5, TimeSpan.FromMilliseconds(50), new byte[1200], out _)
+            .Should().Be(RtpSendHistoryResult.Found);
+    }
+
+    [Fact]
+    public void Marking_a_packet_that_is_no_longer_retained_reports_it()
+    {
+        var history = new RtpSendHistory(1200, new RtpSendHistoryOptions { Capacity = 4 });
+        history.Store(1, Packet(1));
+
+        history.MarkRetransmitted(1).Should().BeTrue();
+        history.MarkRetransmitted(2).Should().BeFalse();
     }
 
     [Fact]

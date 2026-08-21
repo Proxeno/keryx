@@ -226,6 +226,13 @@ public sealed class RtpSendHistory
     /// <param name="destination">Buffer receiving the stored packet.</param>
     /// <param name="length">On <see cref="RtpSendHistoryResult.Found"/>, the packet's length.</param>
     /// <returns>Whether the packet was copied, is unavailable, or is rate limited.</returns>
+    /// <remarks>
+    /// Copying does not itself start the packet's rate-limit interval: the caller must call
+    /// <see cref="MarkRetransmitted"/> once the repair has actually been produced. A caller that
+    /// gives up after copying — because a bandwidth budget refused the packet, say — would otherwise
+    /// spend a resend that never happened, and the next NACK for a packet the peer has still never
+    /// seen would be suppressed.
+    /// </remarks>
     /// <exception cref="ByteBufferException">The destination is smaller than the stored packet.</exception>
     public RtpSendHistoryResult TryCopy(
         ushort sequenceNumber,
@@ -264,9 +271,32 @@ public sealed class RtpSendHistory
 
             _arena.AsSpan(index * _slotSize, slot.Length).CopyTo(destination);
             length = slot.Length;
-            slot.LastResendAt = now;
-            slot.Resends++;
             return RtpSendHistoryResult.Found;
+        }
+    }
+
+    /// <summary>
+    /// Records that a packet copied by <see cref="TryCopy"/> was in fact retransmitted, which starts
+    /// its rate-limit interval.
+    /// </summary>
+    /// <param name="sequenceNumber">The sequence number that was retransmitted.</param>
+    /// <returns>
+    /// <see langword="true"/> when the packet was still retained; <see langword="false"/> when it had
+    /// already been evicted, in which case there is nothing left to rate limit.
+    /// </returns>
+    public bool MarkRetransmitted(ushort sequenceNumber)
+    {
+        lock (_gate)
+        {
+            ref var slot = ref _slots[sequenceNumber & _mask];
+            if (!slot.Occupied || slot.SequenceNumber != sequenceNumber)
+            {
+                return false;
+            }
+
+            slot.LastResendAt = _time.GetTimestamp();
+            slot.Resends++;
+            return true;
         }
     }
 

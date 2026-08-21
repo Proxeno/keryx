@@ -265,6 +265,36 @@ public class RtxTests
     }
 
     [Fact]
+    public void A_repair_the_budget_refused_does_not_spend_the_packets_first_resend()
+    {
+        // A 40-byte burst allowance covers one 34-byte RTX packet and not two, so the second request
+        // is refused by the budget rather than by the interval.
+        var (rtx, history, clock) = NewSender(
+            new RtxRetransmitOptions
+            {
+                MinimumResendInterval = TimeSpan.FromMilliseconds(50),
+                MaxBytesPerSecond = 3_400,
+                MaxBurstBytes = 40,
+            });
+        history.Store(9, Original(9));
+        history.Store(10, Original(10));
+        var destination = new byte[1500];
+
+        rtx.TryRetransmit(9, destination, out _).Should().Be(RtxRetransmitResult.Retransmitted);
+        rtx.TryRetransmit(10, destination, out _).Should().Be(RtxRetransmitResult.BandwidthLimited);
+
+        // Packet 10 was never sent, so the peer has still never seen it. Ten milliseconds later — well
+        // inside the fifty-millisecond resend interval — the budget has refilled, and the next NACK
+        // must be served rather than rate limited for a resend that never happened.
+        clock.Advance(TimeSpan.FromMilliseconds(10));
+        rtx.TryRetransmit(10, destination, out _).Should().Be(RtxRetransmitResult.Retransmitted);
+
+        var stats = rtx.GetStats();
+        stats.PacketsRetransmitted.Should().Be(2);
+        stats.Suppressed.Should().Be(1);
+    }
+
+    [Fact]
     public void An_unlimited_budget_serves_every_request()
     {
         var (rtx, history, _) = NewSender(
