@@ -126,8 +126,14 @@ public sealed class StunClient
                 _logger.Log(KeryxLogLevel.Trace, $"STUN Binding request {transactionId} to {server}, attempt {attempt + 1}.");
                 _sender(encoded, server);
 
+                // RFC 5389 section 7.2.1 measures the post-final wait as Ti = Rm * RTO against the
+                // *initial* RTO, not the doubled value this loop is carrying. Multiplying the
+                // doubled one turned the documented 39.5 s default budget into 543 s, which reads
+                // as a hang to anything waiting on gathering.
                 var isFinal = attempt == _options.MaxTransmissions - 1;
-                var wait = isFinal ? rto * _options.FinalWaitMultiplier : rto;
+                var wait = isFinal
+                    ? _options.InitialRetransmissionTimeout * _options.FinalWaitMultiplier
+                    : rto;
                 try
                 {
                     return await pending.Task.WaitAsync(wait, cancellationToken).ConfigureAwait(false);
