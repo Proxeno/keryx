@@ -6,6 +6,9 @@
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" />
     <PackageReference Include="SIPSorcery" />
-    <ProjectReference Include="../../src/Keryx/Keryx.csproj" />
+    <ProjectReference Include="../../src/Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../../src/Keryx.Rtp/Keryx.Rtp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Srtp/Keryx.Srtp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Sdp/Keryx.Sdp.csproj" />
   </ItemGroup>
 </Project>
