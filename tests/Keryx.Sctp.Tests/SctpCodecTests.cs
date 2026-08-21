@@ -258,24 +258,26 @@ public class SctpCodecTests
     }
 
     [Fact]
-    public void FinalChunkParsesWithOrWithoutTrailingPadding()
+    public void FinalChunkIsPaddedOnSendAndParsesWithOrWithoutTrailingPadding()
     {
         var packet = new SctpPacket(5000, 5000, 0x99);
         packet.Chunks.Add(new SctpDataChunk(1, 0, 0, SctpPpid.String, "hi"u8.ToArray()));
 
-        var withoutPadding = packet.ToArray();
-        withoutPadding.Length.Should().Be(12 + 18);
-        SctpPacket.Parse(withoutPadding).Chunks.Should().ContainSingle();
-
-        // Same packet with the (legal but optional) trailing padding present.
-        var withPadding = new byte[withoutPadding.Length + 2];
-        withoutPadding.CopyTo(withPadding, 0);
-        var checksum = SctpPacket.ComputeChecksum(withPadding);
-        BinaryPrimitives.WriteUInt32LittleEndian(withPadding.AsSpan(8, 4), checksum);
-
+        // RFC 9260 §3.2: the sender MUST pad every chunk to a four-byte boundary, the final one
+        // included — Chrome's dcsctp discards packets whose length is not a multiple of four.
+        var withPadding = packet.ToArray();
+        withPadding.Length.Should().Be(12 + 20);
         var parsed = SctpPacket.Parse(withPadding);
         parsed.Chunks.Should().ContainSingle();
         ((SctpDataChunk)parsed.Chunks[0]).Payload.Should().Equal("hi"u8.ToArray());
+
+        // A robust receiver still accepts a peer that omitted the final padding.
+        var withoutPadding = withPadding[..(12 + 18)];
+        var checksum = SctpPacket.ComputeChecksum(withoutPadding);
+        BinaryPrimitives.WriteUInt32LittleEndian(withoutPadding.AsSpan(8, 4), checksum);
+        var lenient = SctpPacket.Parse(withoutPadding);
+        lenient.Chunks.Should().ContainSingle();
+        ((SctpDataChunk)lenient.Chunks[0]).Payload.Should().Equal("hi"u8.ToArray());
     }
 
     [Fact]

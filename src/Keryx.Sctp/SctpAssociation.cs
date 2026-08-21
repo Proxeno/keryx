@@ -452,6 +452,11 @@ public sealed class SctpAssociation : IDisposable
                 return;
             }
 
+            if (_log.IsEnabled(KeryxLogLevel.Trace))
+            {
+                _log.Log(KeryxLogLevel.Trace, $"SCTP in tag=0x{packet.VerificationTag:X8} [{string.Join(",", packet.Chunks.Select(c => c.Type))}] len={datagram.Length}");
+            }
+
             foreach (var chunk in packet.Chunks)
             {
                 ProcessChunk(chunk, packet);
@@ -1235,6 +1240,11 @@ public sealed class SctpAssociation : IDisposable
         packet.Chunks.AddRange(chunks);
         var buffer = new byte[packet.Length];
         var written = packet.WriteTo(buffer);
+        if (_log.IsEnabled(KeryxLogLevel.Trace))
+        {
+            _log.Log(KeryxLogLevel.Trace, $"SCTP out tag=0x{verificationTag:X8} [{string.Join(",", chunks.Select(c => c.Type))}] len={written}");
+        }
+
         try
         {
             _lower.Send(buffer.AsSpan(0, written));

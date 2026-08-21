@@ -44,8 +44,10 @@ public sealed class SctpPacket
     public List<SctpChunk> Chunks { get; } = new();
 
     /// <summary>
-    /// Total encoded length in bytes. Every chunk but the last is padded to a four-byte boundary;
-    /// padding after the final chunk is omitted, which RFC 9260 §3.2 permits.
+    /// Total encoded length in bytes. Every chunk — including the final one — is padded to a
+    /// four-byte boundary. RFC 9260 §3.2 requires senders to pad each chunk (receivers merely
+    /// tolerate an absent final pad), and Chrome's dcsctp silently discards packets whose length
+    /// is not a multiple of four.
     /// </summary>
     public int Length
     {
@@ -54,7 +56,7 @@ public sealed class SctpPacket
             var length = CommonHeaderLength;
             for (var i = 0; i < Chunks.Count; i++)
             {
-                length += i == Chunks.Count - 1 ? Chunks[i].Length : Chunks[i].PaddedLength;
+                length += Chunks[i].PaddedLength;
             }
 
             return length;
@@ -73,7 +75,7 @@ public sealed class SctpPacket
         writer.WriteU32(0);
         for (var i = 0; i < Chunks.Count; i++)
         {
-            Chunks[i].WriteTo(ref writer, includePadding: i != Chunks.Count - 1);
+            Chunks[i].WriteTo(ref writer, includePadding: true);
         }
 
         var written = writer.Written;
