@@ -21,7 +21,7 @@ public sealed class SrtpEncryptContext : IDisposable
 {
     private readonly ISrtpTransform _transform;
     private readonly IKeryxLogger _logger;
-    private readonly Dictionary<uint, SrtpStreamState> _rtpStreams = [];
+    private readonly Dictionary<uint, SrtpSendStreamState> _rtpStreams = [];
     private readonly Dictionary<uint, uint> _rtcpIndices = [];
     private bool _disposed;
 
@@ -74,11 +74,13 @@ public sealed class SrtpEncryptContext : IDisposable
                 nameof(output));
         }
 
+        // The rollover counter is maintained by counting wraps, never by the RFC 3711 Appendix A
+        // estimator: that is a receiver-side heuristic and using it here can rewind the packet index
+        // into an already-used range. NextRolloverCounter also refuses an index that has already been
+        // emitted, which turns what would be a silent keystream/nonce reuse into a loud failure.
         var stream = GetOrCreateStream(ssrc);
-        var candidate = stream.EstimateRolloverCounter(sequenceNumber);
-        var written = _transform.ProtectRtp(rtpPacket, headerLength, ssrc, candidate, sequenceNumber, output);
-        stream.Commit(candidate, sequenceNumber);
-        return written;
+        var rolloverCounter = stream.NextRolloverCounter(sequenceNumber, ssrc);
+        return _transform.ProtectRtp(rtpPacket, headerLength, ssrc, rolloverCounter, sequenceNumber, output);
     }
 
     /// <summary>
@@ -114,10 +116,7 @@ public sealed class SrtpEncryptContext : IDisposable
                 nameof(output));
         }
 
-        ref var index = ref CollectionsMarshal.GetValueRefOrAddDefault(_rtcpIndices, ssrc, out _);
-        var current = index;
-        index = (current + 1) & SrtcpIndexWord.IndexMask;
-
+        var current = NextSrtcpIndex(ssrc);
         return _transform.ProtectRtcp(rtcpPacket, ssrc, current, encrypt: true, output);
     }
 
@@ -140,19 +139,43 @@ public sealed class SrtpEncryptContext : IDisposable
             throw new ArgumentException("The buffer does not contain a well-formed RTCP packet.", nameof(rtcpPacket));
         }
 
-        ref var index = ref CollectionsMarshal.GetValueRefOrAddDefault(_rtcpIndices, ssrc, out _);
-        var current = index;
-        index = (current + 1) & SrtcpIndexWord.IndexMask;
-
+        var current = NextSrtcpIndex(ssrc);
         return _transform.ProtectRtcp(rtcpPacket, ssrc, current, encrypt: false, output);
     }
 
-    private SrtpStreamState GetOrCreateStream(uint ssrc)
+    /// <summary>
+    /// Returns the SRTCP index to protect the next packet for <paramref name="ssrc"/> with, and
+    /// advances the counter.
+    /// </summary>
+    /// <remarks>
+    /// RFC 3711 Section 9.2 caps one master key at 2^31 SRTCP packets, which is exactly the size of
+    /// the 31-bit index field. Wrapping past it would restart the index at 0 and repeat every AES-CM
+    /// IV and RFC 7714 Section 9.1 GCM nonce the session has already used, so the sender stops
+    /// instead. Reaching this requires 2^31 RTCP packets under one DTLS handshake — decades at any
+    /// realistic RTCP interval — but the limit is a MUST, and silently wrapping is the one outcome
+    /// that must not happen.
+    /// </remarks>
+    private uint NextSrtcpIndex(uint ssrc)
+    {
+        ref var index = ref CollectionsMarshal.GetValueRefOrAddDefault(_rtcpIndices, ssrc, out _);
+        var current = index;
+        if (current > SrtcpIndexWord.IndexMask)
+        {
+            throw new InvalidOperationException(
+                $"The SRTCP index for SSRC 0x{ssrc:x8} has reached the RFC 3711 Section 9.2 limit of 2^31 packets "
+                + "for one master key. The session must be rekeyed; continuing would repeat an SRTCP nonce.");
+        }
+
+        index = current + 1;
+        return current;
+    }
+
+    private SrtpSendStreamState GetOrCreateStream(uint ssrc)
     {
         ref var stream = ref CollectionsMarshal.GetValueRefOrAddDefault(_rtpStreams, ssrc, out var existed);
         if (!existed)
         {
-            stream = new SrtpStreamState(ssrc);
+            stream = new SrtpSendStreamState();
             if (_logger.IsEnabled(KeryxLogLevel.Debug))
             {
                 _logger.Log(KeryxLogLevel.Debug, $"SRTP: new outbound stream for SSRC 0x{ssrc:x8}.");
