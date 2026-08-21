@@ -118,14 +118,27 @@ Every claim is backed by a test in this repository.
       completes with mutual fingerprint pinning, 30 real H.264 access units arrive byte-identical,
       data channels round-trip (including 64 KB binary), PLI/FIR arrive as typed events, and a
       Generic NACK is answered with RFC 4588 RTX packets on the repair SSRC.
+- [x] **Loss sweeps** — a seeded fault injector splices in under the sender's SRTP through
+      `PeerConnectionConfig.TransportInterceptor` and drops, duplicates, reorders and delays media
+      datagrams while STUN, DTLS and RTCP pass through untouched. At 1%, 5% and 15% uniform loss,
+      and under ten-packet bursts, **every packet the receiver could detect as missing comes back**;
+      with retransmission switched off at the same seeds, exactly those packets stay lost
+      (2098-packet stream: 19 / 113 / 314 permanent holes).
 - [x] **Chrome interop** — headless Chrome (tested with 151) answers a Keryx offer over HTTP
       signaling: ICE connects, DTLS completes (Keryx as server, `SRTP_AES128_CM_HMAC_SHA1_80`),
       **Chrome decodes and renders the H.264 Keryx sends** (60+ frames, 640×360, keyframes
-      counted, video element playing) and both data channels echo. Run it locally with
-      `dotnet test tests/Keryx.IntegrationTests --filter "Category=ChromeInterop"`.
+      counted, video element playing) and both data channels echo. A second session runs the same
+      fifteen seconds twice across a 5% lossy link: with RFC 4588 retransmission Chrome NACKs,
+      accepts 79 of 80 destroyed packets back as repairs and decodes **433 frames at 29 fps with no
+      freezes**; without it, the same seed leaves 51 frames at 15 fps and five freezes. Run them
+      locally with `dotnet test tests/Keryx.IntegrationTests --filter "Category=ChromeInterop"`.
+- [x] **Soak** — five minutes of 30 fps video across a 5% lossy, reordering link: 31,815 packets,
+      1,564 repaired, zero holes, zero history misses, and a managed heap that ends 0.9% *below*
+      where it started (`--filter "Category=Soak"`).
 - [x] **Benchmarks vs SIPSorcery** — below.
 
-874 tests across ten projects (`dotnet test Keryx.slnx`; the Chrome interop test needs Chrome installed).
+885 tests across ten projects (`dotnet test Keryx.slnx`), plus the trait-gated Chrome interop and
+soak suites.
 
 ## Benchmarks
 
