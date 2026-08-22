@@ -37,8 +37,10 @@ namespace Keryx.Ice;
 /// <see cref="IDatagramTransport.OnReceived"/> without DTLS or SRTP knowing a relay is involved.</para>
 /// <para><b>Simplifications in this version.</b> Aggressive nomination: a controlling agent sets
 /// USE-CANDIDATE on every check, so the first pair to succeed is the selected one; this is
-/// permitted by RFC 8445 section 8.1.1.2 and keeps setup to a single round trip. Only IPv4 pairs
-/// are formed. Because a single bundled socket sends every check, the check list holds one pair
+/// permitted by RFC 8445 section 8.1.1.2 and keeps setup to a single round trip. Host and
+/// server-reflexive candidates of both address families are gathered over one dual-stack socket and
+/// only ever paired with a remote candidate of the same family. Because a single bundled socket
+/// sends every check, the check list holds one pair
 /// per remote candidate formed against the highest-priority non-relayed local candidate, plus one
 /// per remote candidate for each TURN allocation; pair priorities still follow RFC 8445
 /// section 6.1.2.3, so relayed pairs (type preference 0) are only reached when the direct ones
@@ -241,7 +243,7 @@ public sealed class IceAgent : IDisposable
 
         DrainEvents();
 
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        var socket = CreateSocket();
         try
         {
             Bind(socket);
@@ -261,7 +263,7 @@ public sealed class IceAgent : IDisposable
         _receiveLoop = Task.Run(() => ReceiveLoopAsync(socket, _cts.Token), CancellationToken.None);
         _checkLoop = Task.Run(() => CheckLoopAsync(_cts.Token), CancellationToken.None);
 
-        var addresses = LocalAddresses();
+        var addresses = LocalAddresses(socket);
         for (var i = 0; i < addresses.Count; i++)
         {
             var localPreference = Math.Max(0, IcePriority.MaxLocalPreference - i);
@@ -497,9 +499,30 @@ public sealed class IceAgent : IDisposable
 
     // ---------------------------------------------------------------- gathering
 
+    // The agent keeps its single bundled socket but upgrades it to dual-stack IPv6 when it is
+    // gathering on every interface (no explicit BindAddress) and the OS has an IPv6 stack: that one
+    // socket then sends and receives both families, so IPv6 host and server-reflexive candidates are
+    // gathered and paired without giving up the single-socket design. An explicit BindAddress pins
+    // the family to that address, so an IPv4 bind stays on a pure IPv4 socket.
+    private Socket CreateSocket()
+    {
+        var family = _options.BindAddress?.AddressFamily
+            ?? (Socket.OSSupportsIPv6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork);
+        var socket = new Socket(family, SocketType.Dgram, ProtocolType.Udp);
+        if (family == AddressFamily.InterNetworkV6 && _options.BindAddress is null)
+        {
+            // DualMode lets the one v6 socket carry IPv4 too, as v4-mapped addresses that SendRaw and
+            // the receive loop normalise back to native IPv4.
+            socket.DualMode = true;
+        }
+
+        return socket;
+    }
+
     private void Bind(Socket socket)
     {
-        var address = _options.BindAddress ?? IPAddress.Any;
+        var address = _options.BindAddress
+            ?? (socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any);
         if (_options.MinPort <= 0)
         {
             socket.Bind(new IPEndPoint(address, 0));
@@ -526,12 +549,20 @@ public sealed class IceAgent : IDisposable
             $"No free UDP port in the range {_options.MinPort}-{_options.MaxPort} on {address}.");
     }
 
-    private List<IPAddress> LocalAddresses()
+    private List<IPAddress> LocalAddresses(Socket socket)
     {
-        if (_options.BindAddress is { } bindAddress && !bindAddress.Equals(IPAddress.Any))
+        if (_options.BindAddress is { } bindAddress
+            && !bindAddress.Equals(IPAddress.Any)
+            && !bindAddress.Equals(IPAddress.IPv6Any))
         {
             return [bindAddress];
         }
+
+        // A v6 socket is dual-stack here (BindAddress is null), so it gathers both families; a v4
+        // socket - the fallback when the OS has no IPv6 - gathers IPv4 only.
+        var v6 = socket.AddressFamily == AddressFamily.InterNetworkV6;
+        var includeV4 = !v6 || socket.DualMode;
+        var includeV6 = v6;
 
         var addresses = new List<IPAddress>();
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
@@ -545,16 +576,49 @@ public sealed class IceAgent : IDisposable
             foreach (var unicast in nic.GetIPProperties().UnicastAddresses)
             {
                 var address = unicast.Address;
-                if (address.AddressFamily == AddressFamily.InterNetwork
-                    && !IPAddress.IsLoopback(address)
-                    && !addresses.Contains(address))
+                if (IPAddress.IsLoopback(address) || addresses.Contains(address))
                 {
-                    addresses.Add(address);
+                    continue;
+                }
+
+                // Link-local IPv6 (fe80::/10) is skipped: it only works with a scope id ICE has no
+                // way to carry, and every network that offers IPv6 also offers a routable address.
+                switch (address.AddressFamily)
+                {
+                    case AddressFamily.InterNetwork when includeV4:
+                    case AddressFamily.InterNetworkV6 when includeV6 && !address.IsIPv6LinkLocal:
+                        addresses.Add(address);
+                        break;
+                    default:
+                        break;
                 }
             }
         }
 
+        // IPv4 first so it keeps the higher local preference where both families are present; a
+        // dual-stack peer then prefers IPv4 exactly as it does today, while an IPv6-only peer still
+        // has usable candidates instead of none.
+        addresses.Sort(static (a, b) =>
+            (a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+                .CompareTo(b.AddressFamily == AddressFamily.InterNetwork ? 0 : 1));
         return addresses;
+    }
+
+    /// <summary>The highest-priority host candidate of <paramref name="family"/>, or null when none was gathered.</summary>
+    private IceCandidate? HostCandidateForFamily(AddressFamily family)
+    {
+        lock (_lock)
+        {
+            foreach (var candidate in _localCandidates)
+            {
+                if (candidate.Type == IceCandidateType.Host && candidate.Address.AddressFamily == family)
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
     }
 
     private async Task GatherServerReflexiveAsync(int boundPort, CancellationToken cancellationToken)
@@ -564,15 +628,12 @@ public sealed class IceAgent : IDisposable
             return;
         }
 
-        IceCandidate? baseCandidate;
         lock (_lock)
         {
-            baseCandidate = _localCandidates.Count > 0 ? _localCandidates[0] : null;
-        }
-
-        if (baseCandidate is null)
-        {
-            return;
+            if (_localCandidates.Count == 0)
+            {
+                return;
+            }
         }
 
         var client = new StunClient(SendRaw, _options.StunClientOptions, _logger);
@@ -585,7 +646,11 @@ public sealed class IceAgent : IDisposable
                 try
                 {
                     var mapped = await client.BindingRequestAsync(server, linked.Token).ConfigureAwait(false);
-                    if (mapped.AddressFamily != AddressFamily.InterNetwork)
+
+                    // The base is the host candidate of the same family as the mapped address, so an
+                    // IPv4 srflx keeps an IPv4 raddr and an IPv6 srflx an IPv6 one (RFC 8445 5.1.1.2).
+                    var baseCandidate = HostCandidateForFamily(mapped.AddressFamily);
+                    if (baseCandidate is null)
                     {
                         continue;
                     }
@@ -625,15 +690,12 @@ public sealed class IceAgent : IDisposable
             return;
         }
 
-        IceCandidate? baseCandidate;
         lock (_lock)
         {
-            baseCandidate = _localCandidates.Count > 0 ? _localCandidates[0] : null;
-        }
-
-        if (baseCandidate is null)
-        {
-            return;
+            if (_localCandidates.Count == 0)
+            {
+                return;
+            }
         }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
@@ -658,6 +720,15 @@ public sealed class IceAgent : IDisposable
                 }
 
                 var relayed = await client.AllocateAsync(linked.Token).ConfigureAwait(false);
+
+                // The base is the host candidate of the relayed family (Keryx relays over IPv4), so
+                // the relayed candidate's raddr/foundation stay family-consistent.
+                var baseCandidate = HostCandidateForFamily(relayed.AddressFamily);
+                if (baseCandidate is null)
+                {
+                    throw new InvalidOperationException(
+                        $"No host candidate of the relayed address family {relayed.AddressFamily} to base the relay on.");
+                }
 
                 // RFC 8445 section 5.1.1.2: the relayed candidate's base is the relayed address
                 // itself, and its raddr/rport are the server-reflexive address the TURN server saw,
@@ -684,7 +755,7 @@ public sealed class IceAgent : IDisposable
 
                 // RFC 8445 section 5.1.1.2 again: an Allocate response also reveals a
                 // server-reflexive candidate, for free, on the same socket.
-                if (reflexive is { AddressFamily: AddressFamily.InterNetwork })
+                if (reflexive is not null && reflexive.AddressFamily == relayed.AddressFamily)
                 {
                     AddLocalCandidate(new IceCandidate(
                         Foundation(IceCandidateType.ServerReflexive, baseCandidate.Address, endPoint),
@@ -779,7 +850,18 @@ public sealed class IceAgent : IDisposable
 
     private void PermitPeer(RelayAllocation allocation, IPEndPoint peer)
     {
-        if (peer.AddressFamily != AddressFamily.InterNetwork || !allocation.MarkPermissionRequested(peer))
+        // RFC 8656 section 9: a permission's address family must match the relayed family, so a peer
+        // is only permitted on an allocation whose relayed candidate shares its family. Keryx relays
+        // over IPv4 today, so an IPv6 peer is simply not permitted on a relay yet.
+        IceCandidate? relay;
+        lock (_lock)
+        {
+            relay = allocation.Candidate;
+        }
+
+        if (relay is null
+            || peer.AddressFamily != relay.Address.AddressFamily
+            || !allocation.MarkPermissionRequested(peer))
         {
             return;
         }
@@ -870,7 +952,8 @@ public sealed class IceAgent : IDisposable
     private async Task ReceiveLoopAsync(Socket socket, CancellationToken cancellationToken)
     {
         var buffer = new byte[ReceiveBufferSize];
-        EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+        EndPoint any = new IPEndPoint(
+            socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -899,6 +982,7 @@ public sealed class IceAgent : IDisposable
                 continue;
             }
 
+            from = Normalize(from);
             var datagram = buffer.AsSpan(0, result.ReceivedBytes);
 
             // Anything from a TURN server is offered to that allocation first: it may be a response
@@ -1388,11 +1472,6 @@ public sealed class IceAgent : IDisposable
             }
         }
 
-        if (from.AddressFamily != AddressFamily.InterNetwork)
-        {
-            return null;
-        }
-
         // RFC 8445 section 7.3.1.3: a valid check from an unknown address reveals a peer-reflexive
         // candidate. Its priority comes from the PRIORITY attribute the peer sent.
         var discovered = new IceCandidate(
@@ -1616,6 +1695,13 @@ public sealed class IceAgent : IDisposable
         }
     }
 
+    // A dual-stack socket reports IPv4 senders as v4-mapped IPv6 (::ffff:a.b.c.d); everything above
+    // the socket works in native families, so an inbound address is unmapped here at the boundary.
+    private static IPEndPoint Normalize(IPEndPoint endPoint)
+        => endPoint.Address.IsIPv4MappedToIPv6
+            ? new IPEndPoint(endPoint.Address.MapToIPv4(), endPoint.Port)
+            : endPoint;
+
     private void SendRaw(ReadOnlySpan<byte> datagram, IPEndPoint destination)
     {
         Socket? socket;
@@ -1627,6 +1713,14 @@ public sealed class IceAgent : IDisposable
         if (socket is null)
         {
             return;
+        }
+
+        // The mirror of Normalize on the way out: a v6 (dual-stack) socket cannot send to a native
+        // IPv4 endpoint, so an IPv4 destination is mapped to v4-mapped v6 first.
+        if (socket.AddressFamily == AddressFamily.InterNetworkV6
+            && destination.AddressFamily == AddressFamily.InterNetwork)
+        {
+            destination = new IPEndPoint(destination.Address.MapToIPv6(), destination.Port);
         }
 
         try

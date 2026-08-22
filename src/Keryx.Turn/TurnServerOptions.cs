@@ -81,8 +81,8 @@ public sealed class TurnServerOptions
     /// <see cref="Host"/> was supplied.
     /// </summary>
     /// <param name="cancellationToken">Cancels the lookup.</param>
-    /// <returns>The first IPv4 address the host resolves to, with <see cref="Port"/>.</returns>
-    /// <exception cref="InvalidOperationException">The entry names no host and no endpoint, or the host does not resolve to IPv4.</exception>
+    /// <returns>The first IPv4 address the host resolves to, or the first IPv6 address when it resolves to no IPv4, with <see cref="Port"/>.</returns>
+    /// <exception cref="InvalidOperationException">The entry names no host and no endpoint, or the host does not resolve to an IP address.</exception>
     public async Task<IPEndPoint> ResolveAsync(CancellationToken cancellationToken = default)
     {
         Validate();
@@ -96,16 +96,29 @@ public sealed class TurnServerOptions
             return new IPEndPoint(literal, Port);
         }
 
+        // IPv4 is preferred - Keryx allocates an IPv4 relay - but an IPv6-only TURN host still
+        // resolves rather than failing gathering outright.
         var addresses = await Dns.GetHostAddressesAsync(Host!, cancellationToken).ConfigureAwait(false);
+        IPAddress? ipv6 = null;
         foreach (var address in addresses)
         {
             if (address.AddressFamily == AddressFamily.InterNetwork)
             {
                 return new IPEndPoint(address, Port);
             }
+
+            if (address.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                ipv6 ??= address;
+            }
         }
 
-        throw new InvalidOperationException($"The TURN server host '{Host}' did not resolve to an IPv4 address.");
+        if (ipv6 is not null)
+        {
+            return new IPEndPoint(ipv6, Port);
+        }
+
+        throw new InvalidOperationException($"The TURN server host '{Host}' did not resolve to an IP address.");
     }
 
     /// <summary>Throws when the entry is not usable.</summary>
