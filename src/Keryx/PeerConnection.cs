@@ -663,6 +663,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
             options.StunServers.Add(server);
         }
 
+        foreach (var turnServer in _config.TurnServers)
+        {
+            options.TurnServers.Add(turnServer);
+        }
+
         var ice = new IceAgent(options);
         var mid = _config.VideoCodecs.Count > 0
             ? _config.VideoMid
