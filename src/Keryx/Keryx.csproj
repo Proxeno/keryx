@@ -5,6 +5,7 @@
   <ItemGroup>
     <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
     <ProjectReference Include="../Keryx.Stun/Keryx.Stun.csproj" />
+    <ProjectReference Include="../Keryx.Turn/Keryx.Turn.csproj" />
     <ProjectReference Include="../Keryx.Sdp/Keryx.Sdp.csproj" />
     <ProjectReference Include="../Keryx.Rtp/Keryx.Rtp.csproj" />
     <ProjectReference Include="../Keryx.Dtls/Keryx.Dtls.csproj" />

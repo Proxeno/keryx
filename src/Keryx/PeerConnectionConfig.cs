@@ -3,6 +3,7 @@ using Keryx.Core;
 using Keryx.Dtls;
 using Keryx.Rtp;
 using Keryx.Sdp;
+using Keryx.Turn;
 
 namespace Keryx;
 
@@ -30,6 +31,14 @@ public sealed class PeerConnectionConfig
     /// which gathers host candidates only — the right choice on a public-facing server.
     /// </summary>
     public IList<IPEndPoint> StunServers { get; } = [];
+
+    /// <summary>
+    /// TURN servers to allocate a relayed candidate on during gathering, each with its long-term
+    /// credentials. Empty by default. A relayed candidate is the fallback that lets a session cross
+    /// a symmetric NAT, where a server-reflexive candidate alone cannot: it is gathered over the
+    /// same socket as the host candidate, so DTLS and SRTP above are oblivious to the relay.
+    /// </summary>
+    public IList<TurnServerOptions> TurnServers { get; } = [];
 
     /// <summary>
     /// The local address to bind. Null binds every up, non-loopback IPv4 interface; set it to

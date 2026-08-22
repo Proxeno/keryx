@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../../src/Keryx.Turn/Keryx.Turn.csproj" />
+    <ProjectReference Include="../../src/Keryx.Ice/Keryx.Ice.csproj" />
+  </ItemGroup>
+</Project>

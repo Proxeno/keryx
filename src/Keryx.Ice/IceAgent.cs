@@ -6,13 +6,15 @@ using System.Security.Cryptography;
 using System.Text;
 using Keryx.Core;
 using Keryx.Stun;
+using Keryx.Turn;
 
 namespace Keryx.Ice;
 
 /// <summary>
-/// A full ICE agent for a single-BUNDLE, rtcp-muxed WebRTC session: it gathers candidates, runs
-/// RFC 8445 connectivity checks over one UDP socket, and exposes the selected pair as an
-/// <see cref="IDatagramTransport"/> that DTLS and RTP ride on.
+/// A full ICE agent for a single-BUNDLE, rtcp-muxed WebRTC session: it gathers host,
+/// server-reflexive and TURN-relayed candidates, runs RFC 8445 connectivity checks over one UDP
+/// socket, and exposes the selected pair as an <see cref="IDatagramTransport"/> that DTLS and RTP
+/// ride on.
 /// </summary>
 /// <remarks>
 /// <para><b>Threading.</b> One receive-loop task reads the socket and one check-loop task paces
@@ -26,12 +28,21 @@ namespace Keryx.Ice;
 /// <see cref="IDatagramTransport.OnReceived"/> on <see cref="Transport"/>, from the very first
 /// packet - nothing is buffered until a pair is nominated, because DTLS can arrive immediately
 /// after the peer's first successful check.</para>
+/// <para><b>Relayed candidates.</b> Each configured TURN server gets an allocation made over this
+/// same socket, so the relayed candidate's base is the socket and its <c>raddr</c>/<c>rport</c> are
+/// the reflexive address the TURN server observed (RFC 8445 section 5.1.1.2). Checks and media on a
+/// pair whose local candidate is relayed travel through the allocation as ChannelData, and inbound
+/// relayed datagrams are unwrapped and fed back through exactly the same demultiplexing path as
+/// direct ones - so a relayed ICE check is handled like any other check, and relayed media reaches
+/// <see cref="IDatagramTransport.OnReceived"/> without DTLS or SRTP knowing a relay is involved.</para>
 /// <para><b>Simplifications in this version.</b> Aggressive nomination: a controlling agent sets
 /// USE-CANDIDATE on every check, so the first pair to succeed is the selected one; this is
 /// permitted by RFC 8445 section 8.1.1.2 and keeps setup to a single round trip. Only IPv4 pairs
 /// are formed. Because a single bundled socket sends every check, the check list holds one pair
-/// per remote candidate, formed against the highest-priority local candidate; pair priorities
-/// still follow RFC 8445 section 6.1.2.3. Candidate pairs are never frozen - with one component
+/// per remote candidate formed against the highest-priority non-relayed local candidate, plus one
+/// per remote candidate for each TURN allocation; pair priorities still follow RFC 8445
+/// section 6.1.2.3, so relayed pairs (type preference 0) are only reached when the direct ones
+/// fail. Candidate pairs are never frozen - with one component
 /// and one stream every pair starts in <see cref="IceCandidatePairState.Waiting"/>.</para>
 /// </remarks>
 public sealed class IceAgent : IDisposable
@@ -49,6 +60,7 @@ public sealed class IceAgent : IDisposable
     private readonly List<IceCandidatePair> _pairs = [];
     private readonly Dictionary<StunTransactionId, OutstandingCheck> _checks = [];
     private readonly Queue<IceCandidatePair> _triggered = new();
+    private readonly List<RelayAllocation> _allocations = [];
     private readonly CancellationTokenSource _cts = new();
     private readonly byte[] _localKey;
 
@@ -209,11 +221,11 @@ public sealed class IceAgent : IDisposable
     public IDatagramTransport Transport => _transport;
 
     /// <summary>
-    /// Binds the socket, gathers host candidates and, when STUN servers are configured, a
-    /// server-reflexive candidate, raising <see cref="OnLocalCandidate"/> for each and
-    /// <see cref="OnGatheringComplete"/> at the end.
+    /// Binds the socket, gathers host candidates, a server-reflexive candidate for each configured
+    /// STUN server and a relayed candidate for each configured TURN server, raising
+    /// <see cref="OnLocalCandidate"/> for each and <see cref="OnGatheringComplete"/> at the end.
     /// </summary>
-    /// <param name="cancellationToken">Cancels the STUN queries; host candidates are already reported.</param>
+    /// <param name="cancellationToken">Cancels the STUN and TURN transactions; host candidates are already reported.</param>
     public async Task StartGatheringAsync(CancellationToken cancellationToken = default)
     {
         lock (_lock)
@@ -269,6 +281,7 @@ public sealed class IceAgent : IDisposable
         }
 
         await GatherServerReflexiveAsync(boundPort, cancellationToken).ConfigureAwait(false);
+        await GatherRelayedAsync(boundPort, cancellationToken).ConfigureAwait(false);
 
         _events.Enqueue(() => OnGatheringComplete?.Invoke(this, EventArgs.Empty));
         DrainEvents();
@@ -315,6 +328,9 @@ public sealed class IceAgent : IDisposable
             }
         }
 
+        // RFC 8656 section 9: the relay drops anything from an address it has no permission for,
+        // so every remote candidate must be permitted on every allocation as it arrives.
+        PermitRemoteOnAllocations(candidate.EndPoint);
         DrainEvents();
     }
 
@@ -389,6 +405,7 @@ public sealed class IceAgent : IDisposable
     public void Close()
     {
         Socket? socket;
+        List<RelayAllocation> allocations;
         lock (_lock)
         {
             if (_state == IceAgentState.Closed)
@@ -398,11 +415,32 @@ public sealed class IceAgent : IDisposable
 
             SetStateLocked(IceAgentState.Closed);
             socket = _socket;
+            allocations = [.. _allocations];
+            _allocations.Clear();
+        }
+
+        // RFC 8656 section 7.5: a Refresh with LIFETIME 0 frees the allocation immediately instead
+        // of leaving the server holding a relayed port for up to ten minutes. It goes out before
+        // the socket is dropped - the release travels over that socket - and is not waited on, as a
+        // lost release only costs the server a timeout.
+        foreach (var allocation in allocations)
+        {
+            allocation.Client.SendRelease();
+        }
+
+        lock (_lock)
+        {
             _socket = null;
         }
 
         _cts.Cancel();
         socket?.Close();
+
+        foreach (var allocation in allocations)
+        {
+            allocation.Client.Dispose();
+        }
+
         DrainEvents();
     }
 
@@ -442,19 +480,19 @@ public sealed class IceAgent : IDisposable
         }
 
         Socket? socket;
-        IPEndPoint? destination;
+        IceCandidatePair? pair;
         lock (_lock)
         {
             socket = _socket;
-            destination = (_selected ?? BestUsablePairLocked())?.RemoteEndPoint;
+            pair = _selected ?? BestUsablePairLocked();
         }
 
-        if (socket is null || destination is null)
+        if (socket is null || pair is null)
         {
             throw new InvalidOperationException("No candidate pair has succeeded yet; the ICE transport is not usable.");
         }
 
-        socket.SendTo(datagram, SocketFlags.None, destination);
+        SendForPair(pair, datagram);
     }
 
     // ---------------------------------------------------------------- gathering
@@ -580,6 +618,219 @@ public sealed class IceAgent : IDisposable
         }
     }
 
+    private async Task GatherRelayedAsync(int boundPort, CancellationToken cancellationToken)
+    {
+        if (_options.TurnServers.Count == 0)
+        {
+            return;
+        }
+
+        IceCandidate? baseCandidate;
+        lock (_lock)
+        {
+            baseCandidate = _localCandidates.Count > 0 ? _localCandidates[0] : null;
+        }
+
+        if (baseCandidate is null)
+        {
+            return;
+        }
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
+        foreach (var server in _options.TurnServers)
+        {
+            RelayAllocation? allocation = null;
+            try
+            {
+                var endPoint = await server.ResolveAsync(linked.Token).ConfigureAwait(false);
+                var client = new TurnClient(endPoint, server.Username, server.Credential, SendRaw, TurnOptions());
+
+                // Registered before the Allocate goes out, not after: the response comes back on
+                // this same socket, and the receive loop can only route it to the right allocation
+                // if the allocation is already in the list. The candidate is filled in once the
+                // server has told us what the relayed address is.
+                allocation = new RelayAllocation(client, endPoint);
+                client.OnRelayedData += allocation.Handle;
+                allocation.Received += HandleRelayedDatagram;
+                lock (_lock)
+                {
+                    _allocations.Add(allocation);
+                }
+
+                var relayed = await client.AllocateAsync(linked.Token).ConfigureAwait(false);
+
+                // RFC 8445 section 5.1.1.2: the relayed candidate's base is the relayed address
+                // itself, and its raddr/rport are the server-reflexive address the TURN server saw,
+                // which the Allocate response hands back as XOR-MAPPED-ADDRESS.
+                var reflexive = client.MappedEndPoint;
+                var relayCandidate = new IceCandidate(
+                    Foundation(IceCandidateType.Relayed, baseCandidate.Address, endPoint),
+                    component: 1,
+                    IceCandidate.UdpTransport,
+                    IcePriority.Compute(IceCandidateType.Relayed, baseCandidate.LocalPreference),
+                    relayed.Address,
+                    relayed.Port,
+                    IceCandidateType.Relayed,
+                    reflexive?.Address ?? baseCandidate.Address,
+                    reflexive?.Port ?? boundPort)
+                {
+                    LocalPreference = baseCandidate.LocalPreference,
+                };
+
+                lock (_lock)
+                {
+                    allocation.Candidate = relayCandidate;
+                }
+
+                // RFC 8445 section 5.1.1.2 again: an Allocate response also reveals a
+                // server-reflexive candidate, for free, on the same socket.
+                if (reflexive is { AddressFamily: AddressFamily.InterNetwork })
+                {
+                    AddLocalCandidate(new IceCandidate(
+                        Foundation(IceCandidateType.ServerReflexive, baseCandidate.Address, endPoint),
+                        component: 1,
+                        IceCandidate.UdpTransport,
+                        IcePriority.Compute(IceCandidateType.ServerReflexive, baseCandidate.LocalPreference),
+                        reflexive.Address,
+                        reflexive.Port,
+                        IceCandidateType.ServerReflexive,
+                        baseCandidate.Address,
+                        boundPort)
+                    {
+                        LocalPreference = baseCandidate.LocalPreference,
+                    });
+                }
+
+                AddLocalCandidate(relayCandidate);
+                PermitKnownRemotesOn(allocation);
+            }
+            catch (Exception ex) when (ex is StunTimeoutException or StunErrorResponseException or StunFormatException or SocketException or InvalidOperationException or OperationCanceledException)
+            {
+                _logger.Log(KeryxLogLevel.Warning, $"TURN server {server} produced no relayed candidate.", ex);
+                if (allocation is not null)
+                {
+                    lock (_lock)
+                    {
+                        _allocations.Remove(allocation);
+                    }
+
+                    allocation.Client.Dispose();
+                }
+            }
+        }
+    }
+
+    private TurnClientOptions TurnOptions()
+    {
+        var options = _options.TurnClientOptions ?? new TurnClientOptions();
+        options.Logger ??= _logger;
+        return options;
+    }
+
+    private RelayAllocation? FindAllocation(IceCandidate local)
+    {
+        lock (_lock)
+        {
+            foreach (var allocation in _allocations)
+            {
+                if (local.Equals(allocation.Candidate))
+                {
+                    return allocation;
+                }
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Opens the allocation to every remote candidate already known. RFC 8656 section 9 makes a
+    /// permission a precondition for the relay accepting anything from that address, so this runs
+    /// as soon as an allocation exists and again from
+    /// <see cref="AddRemoteCandidate(IceCandidate)"/> as candidates trickle in.
+    /// </summary>
+    private void PermitKnownRemotesOn(RelayAllocation allocation)
+    {
+        List<IPEndPoint> peers;
+        lock (_lock)
+        {
+            peers = [.. _remoteCandidates.Select(static c => c.EndPoint)];
+        }
+
+        foreach (var peer in peers)
+        {
+            PermitPeer(allocation, peer);
+        }
+    }
+
+    private void PermitRemoteOnAllocations(IPEndPoint peer)
+    {
+        List<RelayAllocation> allocations;
+        lock (_lock)
+        {
+            allocations = [.. _allocations];
+        }
+
+        foreach (var allocation in allocations)
+        {
+            PermitPeer(allocation, peer);
+        }
+    }
+
+    private void PermitPeer(RelayAllocation allocation, IPEndPoint peer)
+    {
+        if (peer.AddressFamily != AddressFamily.InterNetwork || !allocation.MarkPermissionRequested(peer))
+        {
+            return;
+        }
+
+        _ = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    // The permission first, because it is what lets the peer's packets in at all;
+                    // then the channel, which is only an efficiency win on the way out.
+                    await allocation.Client.CreatePermissionAsync(peer, _cts.Token).ConfigureAwait(false);
+                    if (TurnOptions().UseChannelData)
+                    {
+                        await allocation.Client.BindChannelAsync(peer, _cts.Token).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex) when (ex is StunTimeoutException or StunErrorResponseException or StunFormatException or SocketException or InvalidOperationException or ObjectDisposedException or OperationCanceledException)
+                {
+                    allocation.ClearPermissionRequest(peer);
+                    _logger.Log(KeryxLogLevel.Warning, $"Could not permit {peer} on the TURN allocation at {allocation.Server}.", ex);
+                }
+            },
+            CancellationToken.None);
+    }
+
+    private void HandleRelayedDatagram(RelayAllocation allocation, ReadOnlySpan<byte> datagram, IPEndPoint peer)
+    {
+        IceCandidate? candidate;
+        lock (_lock)
+        {
+            candidate = allocation.Candidate;
+        }
+
+        if (candidate is null)
+        {
+            return;
+        }
+
+        // Unwrapped relayed traffic re-enters the agent exactly where a direct datagram would, so a
+        // relayed ICE check is just an ICE check and relayed media is just media (RFC 7983).
+        if (StunMessage.LooksLikeStun(datagram))
+        {
+            HandleStun(datagram, peer, candidate);
+        }
+        else
+        {
+            _transport.Raise(datagram);
+        }
+    }
+
     private void AddLocalCandidate(IceCandidate candidate)
     {
         lock (_lock)
@@ -649,9 +900,20 @@ public sealed class IceAgent : IDisposable
             }
 
             var datagram = buffer.AsSpan(0, result.ReceivedBytes);
+
+            // Anything from a TURN server is offered to that allocation first: it may be a response
+            // to one of our TURN transactions, or relayed traffic (ChannelData or a Data
+            // indication) that must be unwrapped before the RFC 7983 demultiplex below can classify
+            // what is inside.
+            if (TryHandleTurn(datagram, from))
+            {
+                DrainEvents();
+                continue;
+            }
+
             if (StunMessage.LooksLikeStun(datagram))
             {
-                HandleStun(datagram, from);
+                HandleStun(datagram, from, viaRelay: null);
             }
             else
             {
@@ -664,7 +926,31 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    private void HandleStun(ReadOnlySpan<byte> datagram, IPEndPoint from)
+    private bool TryHandleTurn(ReadOnlySpan<byte> datagram, IPEndPoint from)
+    {
+        List<RelayAllocation> allocations;
+        lock (_lock)
+        {
+            if (_allocations.Count == 0)
+            {
+                return false;
+            }
+
+            allocations = [.. _allocations];
+        }
+
+        foreach (var allocation in allocations)
+        {
+            if (allocation.Client.TryHandleDatagram(datagram, from))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void HandleStun(ReadOnlySpan<byte> datagram, IPEndPoint from, IceCandidate? viaRelay)
     {
         if (!StunMessage.TryDecode(datagram, out var message) || message.Method != StunMethod.Binding)
         {
@@ -675,7 +961,7 @@ public sealed class IceAgent : IDisposable
         switch (message.Class)
         {
             case StunClass.Request:
-                HandleBindingRequest(message, from);
+                HandleBindingRequest(message, from, viaRelay);
                 break;
             case StunClass.SuccessResponse:
             case StunClass.ErrorResponse:
@@ -684,7 +970,7 @@ public sealed class IceAgent : IDisposable
                     return;
                 }
 
-                HandleCheckResponse(message, from);
+                HandleCheckResponse(message, from, viaRelay);
                 break;
             case StunClass.Indication:
                 lock (_lock)
@@ -698,7 +984,7 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    private void HandleBindingRequest(StunMessage request, IPEndPoint from)
+    private void HandleBindingRequest(StunMessage request, IPEndPoint from, IceCandidate? viaRelay)
     {
         if (!request.ValidateFingerprint())
         {
@@ -716,7 +1002,7 @@ public sealed class IceAgent : IDisposable
         if (!request.ValidateMessageIntegrity(_localKey))
         {
             _logger.Log(KeryxLogLevel.Warning, $"Dropping ICE check from {from} with a bad MESSAGE-INTEGRITY.");
-            SendStun(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.Unauthorized, "Unauthorized"), from, key: null);
+            SendStun(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.Unauthorized, "Unauthorized"), from, key: null, viaRelay);
             return;
         }
 
@@ -760,7 +1046,7 @@ public sealed class IceAgent : IDisposable
             if (response is null)
             {
                 var remote = FindOrCreatePeerReflexiveLocked(from, request.GetAttribute<StunPriorityAttribute>()?.Priority);
-                var pair = remote is null ? null : FindPairLocked(remote);
+                var pair = remote is null ? null : FindPairLocked(remote, viaRelay);
                 if (pair is not null)
                 {
                     var useCandidate = request.HasAttribute(StunAttributeType.UseCandidate);
@@ -790,11 +1076,11 @@ public sealed class IceAgent : IDisposable
             }
         }
 
-        SendStun(response, from, responseKey);
+        SendStun(response, from, responseKey, viaRelay);
         DrainEvents();
     }
 
-    private void HandleCheckResponse(StunMessage response, IPEndPoint from)
+    private void HandleCheckResponse(StunMessage response, IPEndPoint from, IceCandidate? viaRelay)
     {
         OutstandingCheck? check;
         lock (_lock)
@@ -809,6 +1095,15 @@ public sealed class IceAgent : IDisposable
         {
             // RFC 8445 section 7.2.5.2.1: a response from a different address is a failure.
             _logger.Log(KeryxLogLevel.Warning, $"ICE check response for {check.Pair} arrived from {from}; ignoring.");
+            return;
+        }
+
+        // The same rule applied to the local end: a check sent through the relay must come back
+        // through the relay, and a direct check must come back directly.
+        var expectedRelay = check.Pair.Local.Type == IceCandidateType.Relayed ? check.Pair.Local : null;
+        if (!Equals(expectedRelay, viaRelay))
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"ICE check response for {check.Pair} arrived on the wrong local candidate; ignoring.");
             return;
         }
 
@@ -872,7 +1167,7 @@ public sealed class IceAgent : IDisposable
 
     private async Task CheckLoopAsync(CancellationToken cancellationToken)
     {
-        var pending = new List<(byte[] Datagram, IPEndPoint Destination)>();
+        var pending = new List<(byte[] Datagram, IceCandidatePair Pair)>();
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -885,9 +1180,9 @@ public sealed class IceAgent : IDisposable
                     TickLocked(pending);
                 }
 
-                foreach (var (datagram, destination) in pending)
+                foreach (var (datagram, pair) in pending)
                 {
-                    SendRaw(datagram, destination);
+                    SendForPair(pair, datagram);
                 }
 
                 DrainEvents();
@@ -903,7 +1198,7 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    private void TickLocked(List<(byte[] Datagram, IPEndPoint Destination)> pending)
+    private void TickLocked(List<(byte[] Datagram, IceCandidatePair Pair)> pending)
     {
         if (_state is IceAgentState.Closed or IceAgentState.Failed || _socket is null)
         {
@@ -941,7 +1236,7 @@ public sealed class IceAgent : IDisposable
         EvaluateTimeoutsLocked(now);
     }
 
-    private void RetransmitLocked(long now, List<(byte[] Datagram, IPEndPoint Destination)> pending)
+    private void RetransmitLocked(long now, List<(byte[] Datagram, IceCandidatePair Pair)> pending)
     {
         List<OutstandingCheck>? expired = null;
         foreach (var check in _checks.Values)
@@ -960,7 +1255,7 @@ public sealed class IceAgent : IDisposable
             check.Transmissions++;
             check.Rto *= 2;
             check.NextTransmitAt = now + check.Rto;
-            pending.Add((check.Datagram, check.Pair.RemoteEndPoint));
+            pending.Add((check.Datagram, check.Pair));
         }
 
         if (expired is null)
@@ -1006,7 +1301,7 @@ public sealed class IceAgent : IDisposable
         return null;
     }
 
-    private (byte[] Datagram, IPEndPoint Destination) BuildCheckLocked(IceCandidatePair pair, long now, bool isKeepalive)
+    private (byte[] Datagram, IceCandidatePair Pair) BuildCheckLocked(IceCandidatePair pair, long now, bool isKeepalive)
     {
         // RFC 8445 section 7.1.1: PRIORITY carries the priority the peer-reflexive candidate the
         // peer may discover from this check would have.
@@ -1042,7 +1337,7 @@ public sealed class IceAgent : IDisposable
             pair.State = IceCandidatePairState.InProgress;
         }
 
-        return (datagram, pair.RemoteEndPoint);
+        return (datagram, pair);
     }
 
     private void EvaluateTimeoutsLocked(long now)
@@ -1113,6 +1408,7 @@ public sealed class IceAgent : IDisposable
         RebuildPairsLocked();
         _logger.Log(KeryxLogLevel.Info, $"ICE discovered peer-reflexive candidate {discovered}.");
         _events.Enqueue(() => OnRemoteCandidate?.Invoke(this, discovered));
+        _events.Enqueue(() => PermitRemoteOnAllocations(discovered.EndPoint));
         return discovered;
     }
 
@@ -1125,37 +1421,62 @@ public sealed class IceAgent : IDisposable
 
         foreach (var remote in _remoteCandidates)
         {
-            if (FindPairLocked(remote) is not null)
+            // The direct pair: one per remote candidate, against the highest-priority local
+            // candidate that is not relayed. Every non-relayed local candidate shares the one
+            // socket, so pairing them all would only produce duplicate checks.
+            if (FindPairLocked(remote, viaRelay: null) is null)
             {
-                continue;
-            }
-
-            IceCandidate? local = null;
-            foreach (var candidate in _localCandidates)
-            {
-                if (candidate.Address.AddressFamily == remote.Address.AddressFamily)
+                IceCandidate? local = null;
+                foreach (var candidate in _localCandidates)
                 {
-                    local = candidate;
-                    break;
+                    if (candidate.Type != IceCandidateType.Relayed
+                        && candidate.Address.AddressFamily == remote.Address.AddressFamily)
+                    {
+                        local = candidate;
+                        break;
+                    }
+                }
+
+                if (local is not null)
+                {
+                    _pairs.Add(new IceCandidatePair(local, remote, _role));
                 }
             }
 
-            if (local is null)
+            // Relayed pairs are genuinely distinct paths - a different local transport address and
+            // a different route - so each allocation gets its own pair per remote candidate.
+            foreach (var allocation in _allocations)
             {
-                continue;
-            }
+                if (allocation.Candidate is not { } relay
+                    || relay.Address.AddressFamily != remote.Address.AddressFamily
+                    || FindPairLocked(remote, relay) is not null)
+                {
+                    continue;
+                }
 
-            _pairs.Add(new IceCandidatePair(local, remote, _role));
+                _pairs.Add(new IceCandidatePair(relay, remote, _role));
+            }
         }
 
         _pairs.Sort(static (a, b) => b.Priority.CompareTo(a.Priority));
     }
 
-    private IceCandidatePair? FindPairLocked(IceCandidate remote)
+    /// <summary>
+    /// Finds the pair for <paramref name="remote"/> that runs over <paramref name="viaRelay"/>, or
+    /// over the direct path when it is null. The local candidate is part of the identity of a pair:
+    /// with a TURN allocation in play the same remote candidate appears in several.
+    /// </summary>
+    private IceCandidatePair? FindPairLocked(IceCandidate remote, IceCandidate? viaRelay)
     {
         foreach (var pair in _pairs)
         {
-            if (pair.Remote.Equals(remote))
+            if (!pair.Remote.Equals(remote))
+            {
+                continue;
+            }
+
+            var pairRelay = pair.Local.Type == IceCandidateType.Relayed ? pair.Local : null;
+            if (Equals(pairRelay, viaRelay))
             {
                 return pair;
             }
@@ -1249,8 +1570,51 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    private void SendStun(StunMessage message, IPEndPoint destination, byte[]? key)
-        => SendRaw(message.Encode(key, appendFingerprint: true), destination);
+    private void SendStun(StunMessage message, IPEndPoint destination, byte[]? key, IceCandidate? viaRelay)
+    {
+        var datagram = message.Encode(key, appendFingerprint: true);
+        if (viaRelay is null)
+        {
+            SendRaw(datagram, destination);
+            return;
+        }
+
+        SendThroughRelay(viaRelay, datagram, destination);
+    }
+
+    /// <summary>
+    /// Puts a datagram on the wire for <paramref name="pair"/>: straight out of the socket for a
+    /// direct pair, or through the TURN allocation when the pair's local candidate is relayed.
+    /// </summary>
+    private void SendForPair(IceCandidatePair pair, ReadOnlySpan<byte> datagram)
+    {
+        if (pair.Local.Type != IceCandidateType.Relayed)
+        {
+            SendRaw(datagram, pair.RemoteEndPoint);
+            return;
+        }
+
+        SendThroughRelay(pair.Local, datagram, pair.RemoteEndPoint);
+    }
+
+    private void SendThroughRelay(IceCandidate relay, ReadOnlySpan<byte> datagram, IPEndPoint destination)
+    {
+        var allocation = FindAllocation(relay);
+        if (allocation is null)
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Dropping a datagram for {destination}: the TURN allocation behind {relay.EndPoint} is gone.");
+            return;
+        }
+
+        try
+        {
+            allocation.Client.SendTo(datagram, destination);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or SocketException or ObjectDisposedException)
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Failed to relay a datagram to {destination} through {allocation.Server}.", ex);
+        }
+    }
 
     private void SendRaw(ReadOnlySpan<byte> datagram, IPEndPoint destination)
     {
@@ -1304,6 +1668,48 @@ public sealed class IceAgent : IDisposable
         public long Rto { get; set; }
 
         public long NextTransmitAt { get; set; }
+    }
+
+    /// <summary>Receives one datagram a TURN allocation relayed in, tagged with the allocation it came from.</summary>
+    private delegate void RelayedDatagramHandler(RelayAllocation allocation, ReadOnlySpan<byte> datagram, IPEndPoint peer);
+
+    /// <summary>
+    /// One live TURN allocation: the client that owns it, the relayed candidate it produced, and
+    /// the set of peers a permission has already been asked for.
+    /// </summary>
+    private sealed class RelayAllocation(TurnClient client, IPEndPoint server)
+    {
+        private readonly HashSet<IPEndPoint> _permissionRequests = [];
+
+        public TurnClient Client { get; } = client;
+
+        /// <summary>
+        /// The relayed candidate the allocation produced, or null between registering the client
+        /// for demultiplexing and the Allocate response coming back. Guarded by the agent's lock.
+        /// </summary>
+        public IceCandidate? Candidate { get; set; }
+
+        public IPEndPoint Server { get; } = server;
+
+        public event RelayedDatagramHandler? Received;
+
+        public void Handle(ReadOnlySpan<byte> datagram, IPEndPoint peer) => Received?.Invoke(this, datagram, peer);
+
+        public bool MarkPermissionRequested(IPEndPoint peer)
+        {
+            lock (_permissionRequests)
+            {
+                return _permissionRequests.Add(peer);
+            }
+        }
+
+        public void ClearPermissionRequest(IPEndPoint peer)
+        {
+            lock (_permissionRequests)
+            {
+                _permissionRequests.Remove(peer);
+            }
+        }
     }
 
     private sealed class IceTransport(IceAgent agent) : IDatagramTransport
