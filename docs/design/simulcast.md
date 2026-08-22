@@ -1,6 +1,7 @@
 # Simulcast transport primitives
 
-Status: design + initial scaffold (EWI-1250). Follow-up PRs fill the `// TODO` bodies.
+Status: implemented (EWI-1250). Follow-up chain steps 1–5 landed; the BWE seam (step 6) stays an
+app-side concern. See the "Follow-up PR breakdown" below for per-step status.
 
 Keryx is the WebRTC transport stack under the vuefix broadcast platform: a creator ingests one video
 source encoded at several qualities (simulcast), and the platform fans those out to many viewers, each
@@ -177,16 +178,21 @@ Changed (`Keryx`): `PeerConnectionEvents.cs` (`RtpPacketInfo.Rid`).
 
 ## Follow-up PR breakdown (in order)
 
-1. **SDP negotiation wiring** — `SdpNegotiator` offer/answer for simulcast: echo `a=simulcast` with
-   directions reversed, prune unaccepted RIDs, keep `a=rid` restrictions, negotiate RID/repaired-RID
-   extmaps.
-2. **Header-extension resolution** — resolve negotiated MID/RID/repaired-RID extmap ids on the peer
-   connection; populate `RtpPacketInfo.Rid`; expose the ids so the app can build a classifier.
-3. **Ingest demux integration** — drive `SimulcastClassifier` from `HandleRtp`; per-layer receive
-   stats; expose per-layer streams to the app.
-4. **Forwarder completion** — full timestamp alignment across layers (RTCP-SR wall-clock mapping),
-   egress RID stripping and MID rewrite, marker/keyframe gating hardening.
-5. **Keyframe routing completion** — deferred-request firing when the coalescing interval elapses;
-   FIR command-sequence handling; wire the coalescer to the PLI/FIR senders.
+1. **SDP negotiation wiring** — *done.* `SdpNegotiator.AnswerSimulcast` echoes `a=simulcast` with
+   directions reversed, prunes RIDs a capability predicate rejects, keeps `a=rid` restrictions verbatim,
+   and echoes the RID/repaired-RID/MID extmaps; `PeerConnection.BuildAnswer` applies it, gated by
+   `PeerConnectionConfig.EnableSimulcast`. Returns a `SimulcastAnswer`.
+2. **Header-extension resolution** — *done.* `ApplyRemoteOffer` resolves the negotiated MID/RID/
+   repaired-RID extmap ids per simulcast mid; `HandleRtp` populates `RtpPacketInfo.Rid`; the ids are
+   exposed via `PeerConnection.TryGetSimulcastExtensions` / `SimulcastMids`.
+3. **Ingest demux integration** — *done.* `HandleRtp` drives a per-mid `SimulcastClassifier` (learning
+   the SSRC↔layer binding so the RID survives after browsers stop tagging); per-layer receive counts
+   via `GetSimulcastLayerStats`, and the classifier itself via `GetSimulcastClassifier`.
+4. **Forwarder completion** — *done.* Cross-layer timestamp alignment from the RTCP-SR wall-clock
+   mapping (`RtpForwarder.RecordSenderReport`, fed by the new `PeerConnection.OnSenderReport`), egress
+   RID/repaired-RID stripping and MID rewrite (`RtpEgressExtensions`), keyframe-gated switching kept.
+5. **Keyframe routing completion** — *done.* Deferred-request firing (`TryTakeDeferred`), per-upstream
+   FIR command-sequence (`NextFirCommandSequence`), wired to the PLI/FIR senders via
+   `PeerConnection.SendCoalescedKeyframeRequest` / `SendDeferredKeyframeRequests`.
 6. **BWE seam (EWI-1248)** — document and implement the vuefix-side selection loop against the Keryx
-   primitives (in the app, not in Keryx).
+   primitives (in the app, not in Keryx). *Deliberately out of scope for Keryx.*

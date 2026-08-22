@@ -5,6 +5,7 @@ using Keryx.Ice;
 using Keryx.Rtp;
 using Keryx.Rtp.Packetization;
 using Keryx.Rtp.Rtcp;
+using Keryx.Rtp.Simulcast;
 using Keryx.Sctp;
 using Keryx.Srtp;
 using DtlsSrtpProfile = Keryx.Dtls.SrtpProtectionProfile;
@@ -36,6 +37,7 @@ public sealed partial class PeerConnection
     private NegotiatedTrack? _negotiatedVideo;
     private NegotiatedTrack? _negotiatedAudio;
     private Dictionary<byte, RtpRoute> _routes = [];
+    private Dictionary<string, SimulcastReceiveTracker> _simulcastByMid = new(StringComparer.Ordinal);
     private Timer? _rtcpTimer;
     private int _firSequence;
 
@@ -134,6 +136,55 @@ public sealed partial class PeerConnection
     public byte? NegotiatedVideoRtxPayloadType => _negotiatedVideo?.RtxPayloadType;
 
     /// <summary>
+    /// The mids of the inbound video m-sections negotiated as simulcast (RFC 8853), for which per-layer
+    /// demux is active. Empty until a remote offer carrying a simulcast section has been applied.
+    /// </summary>
+    public IReadOnlyCollection<string> SimulcastMids => [.. Volatile.Read(ref _simulcastByMid).Keys];
+
+    /// <summary>
+    /// The negotiated RID / repaired-RID / MID header-extension element ids for one simulcast
+    /// m-section, so an application can build its own <see cref="SimulcastClassifier"/> against the
+    /// same mapping the peer connection resolved.
+    /// </summary>
+    /// <param name="mid">The m-section mid.</param>
+    /// <param name="extensions">On success, the negotiated element ids.</param>
+    /// <returns>True when <paramref name="mid"/> is a simulcast section.</returns>
+    public bool TryGetSimulcastExtensions(string mid, out RtpStreamIdentifierExtensions extensions)
+    {
+        ArgumentNullException.ThrowIfNull(mid);
+        if (Volatile.Read(ref _simulcastByMid).TryGetValue(mid, out var tracker))
+        {
+            extensions = tracker.Classifier.Extensions;
+            return true;
+        }
+
+        extensions = default;
+        return false;
+    }
+
+    /// <summary>
+    /// The classifier the peer connection drives for one simulcast m-section, exposed so an application
+    /// can read a layer's learned upstream media SSRC (<see cref="SimulcastClassifier.GetMediaSsrc"/>)
+    /// to route keyframe requests. Returns <see langword="null"/> when the mid is not simulcast.
+    /// </summary>
+    /// <param name="mid">The m-section mid.</param>
+    /// <returns>The classifier, or null.</returns>
+    public SimulcastClassifier? GetSimulcastClassifier(string mid)
+    {
+        ArgumentNullException.ThrowIfNull(mid);
+        return Volatile.Read(ref _simulcastByMid).TryGetValue(mid, out var tracker) ? tracker.Classifier : null;
+    }
+
+    /// <summary>Per-layer inbound packet counts for one simulcast m-section.</summary>
+    /// <param name="mid">The m-section mid.</param>
+    /// <returns>One entry per layer seen; empty when the mid is not simulcast or no packet has arrived.</returns>
+    public IReadOnlyList<SimulcastLayerReceiveStats> GetSimulcastLayerStats(string mid)
+    {
+        ArgumentNullException.ThrowIfNull(mid);
+        return Volatile.Read(ref _simulcastByMid).TryGetValue(mid, out var tracker) ? tracker.Snapshot() : [];
+    }
+
+    /// <summary>
     /// Sends a Picture Loss Indication asking the peer for a fresh key frame, as a compound
     /// <c>RR + PLI</c> over SRTCP.
     /// </summary>
@@ -187,6 +238,64 @@ public sealed partial class PeerConnection
         var fir = new RtcpFullIntraRequest(_rtcpSenderSsrc, 0, mediaSsrc, sequenceNumber);
         return SendRtcpCompound([report, fir]) ? sequenceNumber : null;
     }
+
+    /// <summary>
+    /// Resolves one subscriber's keyframe request through <paramref name="coalescer"/> and, when the
+    /// coalescing interval allows it, sends the corresponding PLI or FIR upstream to the resolved layer
+    /// SSRC. This wires the routing primitive to the RTCP senders without Keryx choosing a layer or
+    /// fanning out: the application owns the coalescer and decides when to call this.
+    /// </summary>
+    /// <param name="coalescer">The coalescer mapping the subscriber's outbound SSRC to an upstream layer.</param>
+    /// <param name="subscriberOutboundSsrc">The SSRC the subscriber's PLI/FIR named.</param>
+    /// <param name="kind">Whether to send a PLI or a FIR upstream.</param>
+    /// <param name="now">The current time, for the coalescing interval.</param>
+    /// <returns>True when an upstream request was sent; false when it was coalesced away or unresolved.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="coalescer"/> is null.</exception>
+    public bool SendCoalescedKeyframeRequest(
+        KeyframeRequestCoalescer coalescer,
+        uint subscriberOutboundSsrc,
+        KeyframeRequestKind kind,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(coalescer);
+        return coalescer.TryResolveUpstream(subscriberOutboundSsrc, now, out var upstreamSsrc)
+            && SendKeyframeRequest(kind, upstreamSsrc);
+    }
+
+    /// <summary>
+    /// Sends every keyframe request that was coalesced away and whose interval has since elapsed, one
+    /// per due upstream layer. Call from a periodic pump so a suppressed request is still delivered the
+    /// moment the interval opens, rather than waiting for the next subscriber to ask.
+    /// </summary>
+    /// <param name="coalescer">The coalescer holding the deferred requests.</param>
+    /// <param name="kind">Whether to send PLIs or FIRs.</param>
+    /// <param name="now">The current time.</param>
+    /// <returns>The number of upstream requests sent.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="coalescer"/> is null.</exception>
+    public int SendDeferredKeyframeRequests(
+        KeyframeRequestCoalescer coalescer,
+        KeyframeRequestKind kind,
+        DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(coalescer);
+        var sent = 0;
+        while (coalescer.TryTakeDeferred(now, out var upstreamSsrc))
+        {
+            if (SendKeyframeRequest(kind, upstreamSsrc))
+            {
+                sent++;
+            }
+        }
+
+        return sent;
+    }
+
+    private bool SendKeyframeRequest(KeyframeRequestKind kind, uint upstreamSsrc) => kind switch
+    {
+        KeyframeRequestKind.PictureLossIndication => SendPictureLossIndication(upstreamSsrc),
+        KeyframeRequestKind.FullIntraRequest => SendFullIntraRequest(upstreamSsrc) is not null,
+        _ => false,
+    };
 
     private MediaTrackStats? VideoStats()
     {
@@ -595,15 +704,34 @@ public sealed partial class PeerConnection
 
         Interlocked.Increment(ref _rtpReceived);
 
+        var payloadType = packet.Header.PayloadType;
+        var routes = Volatile.Read(ref _routes);
+        var route = routes.TryGetValue(payloadType, out var found) ? found : new RtpRoute(string.Empty, MediaKind.Unknown);
+
         var handler = OnRtpPacketReceived;
+
+        // Ingest demux: when the section is simulcast, key the packet to its layer (learning the
+        // SSRC↔layer binding) so the RID travels on RtpPacketInfo without the handler re-parsing the
+        // header, and per-layer receive counts accrue whether or not a handler is attached. The RID
+        // string is materialised only when there is a handler to receive it.
+        string? rid = null;
+        if (route.Kind == MediaKind.Video && route.Mid.Length != 0)
+        {
+            var trackers = Volatile.Read(ref _simulcastByMid);
+            if (trackers.TryGetValue(route.Mid, out var tracker)
+                && tracker.TryClassify(packet.Header, out var classification)
+                && handler is not null
+                && !classification.LayerId.IsEmpty)
+            {
+                rid = classification.LayerId.ToString();
+            }
+        }
+
         if (handler is null)
         {
             return;
         }
 
-        var payloadType = packet.Header.PayloadType;
-        var routes = Volatile.Read(ref _routes);
-        var route = routes.TryGetValue(payloadType, out var found) ? found : new RtpRoute(string.Empty, MediaKind.Unknown);
         var info = new RtpPacketInfo(
             route.Kind == MediaKind.Unknown ? null : route.Mid,
             route.Kind,
@@ -611,7 +739,8 @@ public sealed partial class PeerConnection
             packet.Header.Ssrc,
             packet.Header.SequenceNumber,
             packet.Header.Timestamp,
-            packet.Header.Marker);
+            packet.Header.Marker,
+            rid);
 
         handler(in info, packet.Payload);
     }
@@ -681,12 +810,19 @@ public sealed partial class PeerConnection
                     new ReceiverReportEventArgs(report.SenderSsrc, [.. report.ReportBlocks], receivedAt));
                 break;
 
-            case RtcpSenderReport sender when sender.ReportBlocks.Count > 0:
-                Interlocked.Increment(ref _receiverReportCount);
-                IngestReportBlocks(sender.ReportBlocks, receivedAt);
-                OnReceiverReport?.Invoke(
+            case RtcpSenderReport sender:
+                OnSenderReport?.Invoke(
                     this,
-                    new ReceiverReportEventArgs(sender.SenderSsrc, [.. sender.ReportBlocks], receivedAt));
+                    new SenderReportEventArgs(sender.SenderSsrc, sender.NtpTimestamp, sender.RtpTimestamp, receivedAt));
+                if (sender.ReportBlocks.Count > 0)
+                {
+                    Interlocked.Increment(ref _receiverReportCount);
+                    IngestReportBlocks(sender.ReportBlocks, receivedAt);
+                    OnReceiverReport?.Invoke(
+                        this,
+                        new ReceiverReportEventArgs(sender.SenderSsrc, [.. sender.ReportBlocks], receivedAt));
+                }
+
                 break;
 
             case RtcpGoodbye goodbye:

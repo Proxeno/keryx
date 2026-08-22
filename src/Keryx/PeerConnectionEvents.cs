@@ -84,6 +84,45 @@ public sealed class FirEventArgs : EventArgs
     public byte SequenceNumber { get; }
 }
 
+/// <summary>
+/// A received RTCP Sender Report's sender info (RFC 3550 §6.4.1): the NTP wall-clock and the RTP
+/// timestamp that name the same instant for one sending SSRC.
+/// </summary>
+/// <remarks>
+/// This NTP↔RTP correspondence is what aligns timestamps across simulcast layers: an SFU maps the
+/// report's <see cref="SenderSsrc"/> to a layer (through <c>SimulcastClassifier</c>) and feeds the
+/// mapping to each subscriber's <c>RtpForwarder.RecordSenderReport</c> so a layer switch lands on a
+/// wall-clock-correct outbound timestamp. Fired for every sender report, including a pure sender's
+/// report that carries no reception report blocks.
+/// </remarks>
+public sealed class SenderReportEventArgs : EventArgs
+{
+    /// <summary>Creates the arguments.</summary>
+    /// <param name="senderSsrc">The SSRC the sender report describes.</param>
+    /// <param name="ntpTimestamp">The 64-bit NTP wall-clock from the sender info.</param>
+    /// <param name="rtpTimestamp">The RTP timestamp corresponding to <paramref name="ntpTimestamp"/>.</param>
+    /// <param name="receivedAt">When the report was received.</param>
+    public SenderReportEventArgs(uint senderSsrc, ulong ntpTimestamp, uint rtpTimestamp, DateTimeOffset receivedAt)
+    {
+        SenderSsrc = senderSsrc;
+        NtpTimestamp = ntpTimestamp;
+        RtpTimestamp = rtpTimestamp;
+        ReceivedAt = receivedAt;
+    }
+
+    /// <summary>The SSRC the sender report describes.</summary>
+    public uint SenderSsrc { get; }
+
+    /// <summary>The 64-bit NTP wall-clock from the sender info.</summary>
+    public ulong NtpTimestamp { get; }
+
+    /// <summary>The RTP timestamp corresponding to <see cref="NtpTimestamp"/>.</summary>
+    public uint RtpTimestamp { get; }
+
+    /// <summary>When the report was received.</summary>
+    public DateTimeOffset ReceivedAt { get; }
+}
+
 /// <summary>A received Generic NACK (RFC 4585 §6.2.1) with its bitmask already expanded.</summary>
 public sealed class NackEventArgs : EventArgs
 {

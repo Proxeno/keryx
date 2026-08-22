@@ -21,6 +21,8 @@ public sealed class KeyframeRequestCoalescer
     private readonly Dictionary<uint, SimulcastLayerId> _layerByOutput = new();
     private readonly Dictionary<SimulcastLayerId, uint> _upstreamByLayer = new();
     private readonly Dictionary<uint, DateTimeOffset> _lastRequestByUpstream = new();
+    private readonly HashSet<uint> _deferredUpstream = new();
+    private readonly Dictionary<uint, byte> _firSequenceByUpstream = new();
 
     /// <summary>Creates a coalescer with the given minimum interval between upstream requests per layer.</summary>
     /// <param name="minimumInterval">
@@ -82,15 +84,65 @@ public sealed class KeyframeRequestCoalescer
 
             if (_lastRequestByUpstream.TryGetValue(ssrc, out var last) && now - last < MinimumInterval)
             {
-                // TODO(EWI-1250 keyframe PR): track that a request was suppressed so a single upstream
-                // ask can be issued the instant the interval elapses, rather than waiting for the next
-                // subscriber to ask. The current policy simply drops coalesced requests.
+                // Remember that a request was suppressed so a single upstream ask can be issued the
+                // instant the interval elapses (see TryTakeDeferred), rather than being lost until the
+                // next subscriber happens to ask.
+                _deferredUpstream.Add(ssrc);
                 return false;
             }
 
             _lastRequestByUpstream[ssrc] = now;
+            _deferredUpstream.Remove(ssrc);
             upstreamSsrc = ssrc;
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Yields one upstream SSRC whose coalesced request has been waiting and whose interval has now
+    /// elapsed, so the caller can issue the ask that was suppressed. Call repeatedly (draining) from a
+    /// periodic pump until it returns <see langword="false"/>. Records the ask against the interval, so
+    /// a drained upstream is not returned again until a fresh request is suppressed. Never throws.
+    /// </summary>
+    /// <param name="now">The current time.</param>
+    /// <param name="upstreamSsrc">On success, the upstream SSRC to send the deferred request to.</param>
+    /// <returns>True when a deferred request became due and should be sent now.</returns>
+    public bool TryTakeDeferred(DateTimeOffset now, out uint upstreamSsrc)
+    {
+        upstreamSsrc = 0;
+        lock (_lock)
+        {
+            foreach (var ssrc in _deferredUpstream)
+            {
+                if (!_lastRequestByUpstream.TryGetValue(ssrc, out var last) || now - last >= MinimumInterval)
+                {
+                    _lastRequestByUpstream[ssrc] = now;
+                    _deferredUpstream.Remove(ssrc);
+                    upstreamSsrc = ssrc;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The next FIR command sequence number for one upstream SSRC (RFC 5104 §4.3.1): a per-source
+    /// counter that must increase by one on each new Full Intra Request so the encoder can tell a
+    /// repeated command from a fresh one. Wraps at 8 bits. Never throws.
+    /// </summary>
+    /// <param name="upstreamSsrc">The upstream media SSRC the FIR targets.</param>
+    /// <returns>The command sequence number to stamp on the next FIR for that SSRC.</returns>
+    public byte NextFirCommandSequence(uint upstreamSsrc)
+    {
+        lock (_lock)
+        {
+            var next = _firSequenceByUpstream.TryGetValue(upstreamSsrc, out var current)
+                ? unchecked((byte)(current + 1))
+                : (byte)0;
+            _firSequenceByUpstream[upstreamSsrc] = next;
+            return next;
         }
     }
 
@@ -101,6 +153,8 @@ public sealed class KeyframeRequestCoalescer
         {
             _upstreamByLayer.Clear();
             _lastRequestByUpstream.Clear();
+            _deferredUpstream.Clear();
+            _firSequenceByUpstream.Clear();
         }
     }
 }
