@@ -108,7 +108,8 @@ DTLS records (first byte 20–63) carry SCTP, and SRTP/SRTCP (128–191) carry m
 | `Keryx.Rtp` | RTP, RTCP with typed feedback, H.264/Opus packetizers, `IRtpPayloadizer`. |
 | `Keryx.Dtls` | DTLS 1.2 handshake + record layer, DTLS-SRTP keying export. |
 | `Keryx.Srtp` | SRTP/SRTCP: AES-CM + HMAC-SHA1-80 and AEAD AES-GCM. |
-| `Keryx.Ice` | ICE agent (RFC 8445 subset, full agent, aggressive nomination). |
+| `Keryx.Ice` | ICE agent (RFC 8445 subset, dual-stack IPv4/IPv6, aggressive nomination). |
+| `Keryx.Turn` | TURN client: relay allocations, permissions, channel binding (RFC 8656). |
 | `Keryx.Sctp` | SCTP over DTLS, DCEP data channels, partial reliability. |
 
 ## Verification status
@@ -184,13 +185,17 @@ allocate the document they build or parse and are not on the per-packet path.
 BUNDLE/rtcp-mux, trickle ICE (in and out), DTLS 1.2 both roles with fingerprint pinning, SRTP
 AES-CM and AES-GCM, bidirectional data channels with partial reliability, typed RTCP feedback
 in both directions, RFC 4588 RTX retransmission driven by inbound NACKs, sender-side loss/jitter/RTT
-statistics from reception reports, a minimal recvonly answerer, and a raw RTP receive surface.
+statistics from reception reports, a minimal recvonly answerer, and a raw RTP receive surface. Recent additions: `a=extmap` with outbound transport-wide-cc (TWCC) sequence numbers; TURN relay-candidate gathering (allocations, permissions, channel binding); and dual-stack IPv6 host / server-reflexive gathering with address-family-correct pairing.
 
-**Not implemented (yet, honestly):** ULPFEC and RED, bandwidth estimation / pacing / REMB
-generation / `a=extmap` (no outbound TWCC sequence numbers), TURN and IPv6 candidate pairing,
-regular (non-aggressive) nomination, renegotiation and ICE restart, simulcast, SCTP stream reset
-(RE-CONFIG), jitter buffering on the receive surface, audio receive processing. Per-layer
-simplifications are documented in [docs/layers/](docs/layers).
+**Experimental (compiles and is tested, but not yet a production path):** a send-side GCC
+bandwidth estimator and pacer (in `Keryx.Rtp`, not yet wired into the send loop), and simulcast
+transport primitives (RID / `a=simulcast` negotiation and ingest demux are complete; per-subscriber
+forwarding is scaffolded).
+
+**Not implemented (yet, honestly):** ULPFEC and RED, REMB generation, regular (non-aggressive)
+nomination, renegotiation and ICE restart, IPv6 *relay* allocation, SCTP stream reset (RE-CONFIG),
+jitter buffering on the receive surface, audio receive processing. Per-layer simplifications are
+documented in [docs/layers/](docs/layers).
 
 ## Security
 
