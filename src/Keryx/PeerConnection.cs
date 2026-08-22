@@ -40,7 +40,7 @@ namespace Keryx;
 /// retransmission is disabled rather than promised and not delivered. Reception report blocks the
 /// peer sends are folded into <see cref="GetStats"/> as loss, jitter and round-trip time.</para>
 /// <para><b>Not implemented.</b> No ULPFEC or RED, no outbound transport-cc, no bandwidth estimation
-/// or pacing, no simulcast, no renegotiation, no ICE restart, no TURN, no IPv6 candidates, no header
+/// or pacing, no simulcast, no renegotiation, no ICE restart, no IPv6 relay candidates, no header
 /// extensions (so inbound transport-cc feedback is reported but never solicited by Keryx's own
 /// sequence numbering).</para>
 /// </remarks>
