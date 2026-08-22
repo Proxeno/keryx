@@ -750,6 +750,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
             var video = SdpMediaOffer.Video(_config.VideoMid, [.. codecs]);
             video.TrackId = _videoTrackId;
             video.Ssrcs.Add(_videoSsrc);
+            if (_config.EnableTransportWideCc)
+            {
+                video.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
+            }
+
             if (codecs.Exists(static c => c.IsRtx))
             {
                 // RFC 5576 §4.2: FID associates the media source with the repair source carrying its
@@ -766,6 +771,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
             var audio = SdpMediaOffer.Audio(_config.AudioMid, [.. _config.AudioCodecs]);
             audio.TrackId = _audioTrackId;
             audio.Ssrcs.Add(_audioSsrc);
+            if (_config.EnableTransportWideCc)
+            {
+                audio.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
+            }
+
             builder.AddMedia(audio);
         }
 
@@ -905,6 +915,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 Direction = MediaDirection.RecvOnly,
                 RtcpMux = offered.RtcpMux,
             };
+
+            if (_config.EnableTransportWideCc)
+            {
+                // RFC 8285 §5: echo the offered transport-wide CC mapping, keeping the offerer's id, so
+                // the extension is negotiated symmetrically across the BUNDLE.
+                foreach (var extMap in offered.GetExtMaps())
+                {
+                    if (extMap.IsTransportWideCc)
+                    {
+                        section.HeaderExtensions.Add(SdpExtMap.TransportWideCc(extMap.Id));
+                        break;
+                    }
+                }
+            }
 
             var acceptable = string.Equals(offered.Media, "video", StringComparison.Ordinal)
                 ? _config.VideoCodecs
@@ -1078,12 +1102,27 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         string? ufrag = null;
         string? password = null;
+        byte? transportCcExtensionId = null;
         var routes = new Dictionary<byte, RtpRoute>();
 
         foreach (var media in result.Media)
         {
             ufrag ??= media.IceUfrag;
             password ??= media.IcePwd;
+
+            // The extension is transport-wide across the BUNDLE, so the first section that kept it fixes
+            // the id the send path stamps. An id outside the one-byte range disables stamping.
+            if (transportCcExtensionId is null)
+            {
+                foreach (var extMap in media.HeaderExtensions)
+                {
+                    if (extMap.IsTransportWideCc && extMap.Id is >= 1 and <= 14)
+                    {
+                        transportCcExtensionId = (byte)extMap.Id;
+                        break;
+                    }
+                }
+            }
 
             lock (_lock)
             {
@@ -1174,12 +1213,15 @@ public sealed partial class PeerConnection : IAsyncDisposable
             ice.SetRemoteCredentials(ufrag, password);
         }
 
+        _sendTransportCcExtensionId = transportCcExtensionId;
+
         Volatile.Write(ref _routes, routes);
         _logger.Log(
             KeryxLogLevel.Info,
             $"Applied answer; local DTLS role {LocalDtlsRole}, video pt {_negotiatedVideo?.PayloadType}"
             + $" (rtx pt {_negotiatedVideo?.RtxPayloadType?.ToString(CultureInfo.InvariantCulture) ?? "none"}),"
-            + $" audio pt {_negotiatedAudio?.PayloadType}.");
+            + $" audio pt {_negotiatedAudio?.PayloadType},"
+            + $" transport-cc extmap {(transportCcExtensionId?.ToString(CultureInfo.InvariantCulture) ?? "none")}.");
     }
 
     private static DtlsRole ToDtlsRole(SdpSetupRole role) => role switch

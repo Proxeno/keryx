@@ -342,6 +342,48 @@ public class RtxTests
     }
 
     [Fact]
+    public void A_stamped_retransmission_carries_the_transport_wide_sequence_number()
+    {
+        // EWI-1247: a repair packet is an outbound RTP packet like any other, so it draws its own
+        // transport-wide sequence number and carries the one-byte header extension.
+        var (rtx, history, _) = NewSender();
+        var original = Original(1000, timestamp: 555, marker: true);
+        history.Store(1000, original);
+
+        var destination = new byte[1500];
+        rtx.TryRetransmit(1000, transportCcExtensionId: 3, transportWideSequenceNumber: 42, destination, out var length)
+            .Should().Be(RtxRetransmitResult.Retransmitted);
+
+        RtpPacket.TryParse(destination.AsSpan(0, length), out var packet).Should().BeTrue();
+        packet.Header.Ssrc.Should().Be(RtxSsrc);
+        packet.Header.PayloadType.Should().Be(RtxPayloadType);
+        packet.Header.Timestamp.Should().Be(555u);
+        packet.Header.HasExtension.Should().BeTrue();
+
+        TransportCcExtension.TryRead(packet.Header, id: 3, out var transportSeq).Should().BeTrue();
+        transportSeq.Should().Be(42);
+
+        // The OSN and the original media payload survive the stamping unchanged.
+        RtxPacket.TryReadOriginalSequenceNumber(packet.Payload, out var osn).Should().BeTrue();
+        osn.Should().Be(1000);
+        packet.Payload[RtxPacket.OriginalSequenceNumberLength..].ToArray()
+            .Should().Equal(original[RtpHeader.FixedLength..]);
+    }
+
+    [Fact]
+    public void An_unstamped_retransmission_carries_no_header_extension()
+    {
+        var (rtx, history, _) = NewSender();
+        history.Store(1000, Original(1000));
+
+        var destination = new byte[1500];
+        rtx.TryRetransmit(1000, destination, out var length).Should().Be(RtxRetransmitResult.Retransmitted);
+
+        RtpPacket.TryParse(destination.AsSpan(0, length), out var packet).Should().BeTrue();
+        packet.Header.HasExtension.Should().BeFalse();
+    }
+
+    [Fact]
     public void The_retransmission_stream_reports_separately_from_the_media_stream()
     {
         // RFC 4588 §4 makes the RTX stream its own source, so it carries its own sender report.
