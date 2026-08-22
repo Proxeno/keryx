@@ -289,6 +289,74 @@ public class SrtpRoundTripTests
         freshOutput.AsSpan(0, freshWritten).ToArray().Should().Equal(freshPacket);
     }
 
+    /// <summary>
+    /// An RFC 4588 repair stream is a second outbound SSRC on the same transport, keyed from the same
+    /// master key but with its own rollover counter and its own packet index space. This is the case
+    /// that matters for RTX: the media stream and the repair stream advance independently, and the
+    /// repair stream's sequence numbers bear no relation to the media stream's.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Profiles))]
+    public void ARetransmissionSsrcSharesTheKeyButNotThePacketIndexSpace(SrtpProtectionProfileKind kind)
+    {
+        var (sender, receiver) = CreatePair(kind);
+        using var s = sender;
+        using var r = receiver;
+
+        const uint mediaSsrc = 0x0A0B_0C0D;
+        const uint rtxSsrc = 0x1122_3344;
+
+        // The media stream is well past a wrap while the repair stream has only just started, which is
+        // exactly the state a session reaches after a minute of video and its first NACK.
+        ushort mediaSequence = 65_500;
+        ushort rtxSequence = 0;
+
+        for (var i = 0; i < 80; i++)
+        {
+            var media = TestPackets.Rtp(mediaSsrc, mediaSequence, 3000u * (uint)i, [(byte)i, 1, 2, 3], 96);
+            var mediaBuffer = new byte[media.Length + s.Profile.RtpOverhead];
+            var mediaLength = s.ProtectRtp(media, mediaBuffer);
+            var mediaOutput = new byte[mediaLength];
+            r.TryUnprotectRtp(mediaBuffer.AsSpan(0, mediaLength), mediaOutput, out var written)
+                .Should().BeTrue($"media seq {mediaSequence} must round-trip");
+            mediaOutput.AsSpan(0, written).ToArray().Should().Equal(media);
+            mediaSequence++;
+
+            if (i % 5 != 0)
+            {
+                continue;
+            }
+
+            // The repair packet repeats the media packet's timestamp under the rtx payload type, and
+            // carries the OSN as the first two payload bytes.
+            var rtx = TestPackets.Rtp(
+                rtxSsrc,
+                rtxSequence,
+                3000u * (uint)i,
+                [(byte)((mediaSequence - 1) >> 8), (byte)(mediaSequence - 1), (byte)i, 1, 2, 3],
+                97);
+            var rtxBuffer = new byte[rtx.Length + s.Profile.RtpOverhead];
+            var rtxLength = s.ProtectRtp(rtx, rtxBuffer);
+            var rtxOutput = new byte[rtxLength];
+            r.TryUnprotectRtp(rtxBuffer.AsSpan(0, rtxLength), rtxOutput, out var rtxWritten)
+                .Should().BeTrue($"rtx seq {rtxSequence} must round-trip");
+            rtxOutput.AsSpan(0, rtxWritten).ToArray().Should().Equal(rtx);
+            rtxSequence++;
+        }
+
+        // The two streams produced different ciphertext for identical plaintext, because the SRTP IV
+        // mixes in the SSRC (RFC 3711 §4.1.1).
+        var payload = new byte[] { 0xAA, 0xBB, 0xCC, 0xDD };
+        var sameSeqMedia = TestPackets.Rtp(mediaSsrc, 4242, 99, payload);
+        var sameSeqRtx = TestPackets.Rtp(rtxSsrc, 4242, 99, payload);
+        var a = new byte[sameSeqMedia.Length + s.Profile.RtpOverhead];
+        var b = new byte[sameSeqRtx.Length + s.Profile.RtpOverhead];
+        var aLength = s.ProtectRtp(sameSeqMedia, a);
+        var bLength = s.ProtectRtp(sameSeqRtx, b);
+
+        a.AsSpan(12, aLength - 12).ToArray().Should().NotEqual(b.AsSpan(12, bLength - 12).ToArray());
+    }
+
     /// <summary>A packet protected with one key must never verify under a different key.</summary>
     [Theory]
     [MemberData(nameof(Profiles))]

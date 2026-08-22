@@ -11,6 +11,10 @@ The smallest layer, and deliberately boring: primitives every other layer builds
   (programmer error, e.g. negative counts).
 - **Big-endian only.** Every protocol in this stack is network byte order; the readers exist so
   no other file ever calls `BinaryPrimitives` directly with an endianness choice to get wrong.
+  One measured exception is carved out deliberately: `RtpHeader`'s fixed-header fast path moves
+  the twelve bytes as one 64-bit plus one 32-bit big-endian word rather than through six
+  `ByteWriter`/`ByteReader` calls, because six independent bounds checks dominated a 12-byte
+  round trip. It stays big-endian-only and is covered by the same round-trip tests.
 - **`ByteWriter.Reserve`/`Patch`** exist because most wire formats (STUN, RTCP, SCTP, DTLS
   records) carry a length field that is only known after the body is written. `Patch` validates in
   64-bit arithmetic so adversarial windows cannot wrap the bounds check.

@@ -122,6 +122,18 @@ public sealed class NegotiatedMedia
         return Codecs.FirstOrDefault(c => c.Is(encodingName));
     }
 
+    /// <summary>
+    /// Finds the RFC 4588 retransmission codec that repairs <paramref name="payloadType"/>: an
+    /// <c>rtx</c> entry whose <c>apt</c> names it.
+    /// </summary>
+    /// <param name="payloadType">The media payload type whose repair stream is wanted.</param>
+    /// <returns>
+    /// The rtx codec, or <see langword="null"/> when the answerer dropped it — in which case the
+    /// offerer must not retransmit, whatever <c>a=rtcp-fb</c> the answer still carries.
+    /// </returns>
+    public NegotiatedCodec? FindRtxCodec(int payloadType) =>
+        Codecs.FirstOrDefault(c => c.IsRtx && c.GetAssociatedPayloadType() == payloadType);
+
     /// <summary>Finds a negotiated codec by encoding name and one required fmtp parameter.</summary>
     /// <param name="encodingName">Encoding name, compared case-insensitively.</param>
     /// <param name="fmtpKey">fmtp parameter name, compared ordinally.</param>

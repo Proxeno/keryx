@@ -70,6 +70,9 @@ public static class AnnexB
     /// <returns>The bytes <c>00 00 00 01</c>.</returns>
     public static ReadOnlySpan<byte> FourByteStartCode => [0x00, 0x00, 0x00, 0x01];
 
+    /// <summary>The three-byte start code prefix that both start-code forms end with.</summary>
+    private static ReadOnlySpan<byte> ThreeByteStartCode => [0x00, 0x00, 0x01];
+
     /// <summary>Enumerates the NAL units of an Annex B byte stream without allocating.</summary>
     /// <param name="data">The byte stream.</param>
     /// <returns>An enumerator usable directly in <see langword="foreach"/>.</returns>
@@ -120,18 +123,27 @@ public static class AnnexB
     /// <param name="data">The byte stream.</param>
     /// <param name="offset">Where to begin searching.</param>
     /// <returns>The offset of the start code, or -1 when none remains.</returns>
+    /// <remarks>
+    /// The scan is delegated to <see cref="MemoryExtensions.IndexOf{T}(ReadOnlySpan{T}, ReadOnlySpan{T})"/>,
+    /// which searches for the three-byte pattern with the runtime's vectorized substring search instead
+    /// of one byte at a time. Slice payloads are kilobytes long, so this is the dominant cost of
+    /// packetizing an access unit.
+    /// </remarks>
     public static int IndexOfStartCode(ReadOnlySpan<byte> data, int offset)
     {
-        for (var i = Math.Max(offset, 0); i + 3 <= data.Length; i++)
+        var start = Math.Max(offset, 0);
+        if (data.Length - start < 3)
         {
-            if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1)
-            {
-                continue;
-            }
-
-            return i > offset && data[i - 1] == 0 ? i - 1 : i;
+            return -1;
         }
 
-        return -1;
+        var found = data[start..].IndexOf(ThreeByteStartCode);
+        if (found < 0)
+        {
+            return -1;
+        }
+
+        var index = start + found;
+        return index > start && data[index - 1] == 0 ? index - 1 : index;
     }
 }
