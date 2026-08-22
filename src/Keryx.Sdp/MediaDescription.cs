@@ -396,6 +396,40 @@ public sealed class MediaDescription : SdpSection
         AddAttribute(SdpAttributeNames.ExtMap, extMap.ToAttributeValue());
     }
 
+    /// <summary>Every well-formed <c>a=rid</c> line, in document order (RFC 8851).</summary>
+    /// <returns>The RID declarations; malformed values are skipped.</returns>
+    public IReadOnlyList<SdpRid> GetRids()
+    {
+        var result = new List<SdpRid>();
+        foreach (var value in GetAttributeValues(SdpAttributeNames.Rid))
+        {
+            if (SdpRid.TryParse(value, out var rid) && rid is not null)
+            {
+                result.Add(rid);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Appends an <c>a=rid</c> line.</summary>
+    /// <param name="rid">The RID declaration.</param>
+    public void AddRid(SdpRid rid)
+    {
+        ArgumentNullException.ThrowIfNull(rid);
+        AddAttribute(SdpAttributeNames.Rid, rid.ToAttributeValue());
+    }
+
+    /// <summary>
+    /// The <c>a=simulcast</c> description of this m-section (RFC 8853), or <see langword="null"/> when
+    /// absent or malformed. Setting <see langword="null"/> removes the attribute.
+    /// </summary>
+    public SdpSimulcast? Simulcast
+    {
+        get => SdpSimulcast.TryParse(GetAttributeValue(SdpAttributeNames.Simulcast), out var value) ? value : null;
+        set => SetOrRemove(SdpAttributeNames.Simulcast, value?.ToAttributeValue());
+    }
+
     /// <summary>
     /// Raw <c>a=candidate</c> values, in document order. Candidates stay strings here: parsing them
     /// belongs to the ICE layer.

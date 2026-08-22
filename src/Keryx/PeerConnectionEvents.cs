@@ -209,6 +209,12 @@ public sealed class ReceiverReportEventArgs : EventArgs
 /// <param name="SequenceNumber">The RTP sequence number.</param>
 /// <param name="Timestamp">The RTP timestamp, in the codec's clock rate.</param>
 /// <param name="Marker">The marker bit; for video it terminates an access unit.</param>
+/// <param name="Rid">
+/// The simulcast layer identifier (RFC 8851 RID) carried in the RFC 8852 <c>rtp-stream-id</c> header
+/// extension, or <see langword="null"/> when the section is not simulcast or the extension was absent.
+/// Lets a handler route each packet to its layer without re-parsing the header. Populated once the RID
+/// header extension is negotiated (EWI-1250 ingest-demux follow-up).
+/// </param>
 public readonly record struct RtpPacketInfo(
     string? Mid,
     MediaKind Kind,
@@ -216,7 +222,8 @@ public readonly record struct RtpPacketInfo(
     uint Ssrc,
     ushort SequenceNumber,
     uint Timestamp,
-    bool Marker);
+    bool Marker,
+    string? Rid = null);
 
 /// <summary>Receives one decrypted, validated inbound RTP packet.</summary>
 /// <param name="info">The packet's header fields and the m-section it resolved to.</param>
