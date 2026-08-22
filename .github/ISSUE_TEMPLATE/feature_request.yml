@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest an enhancement for Keryx
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keryx is a from-scratch, offerer-side media-server WebRTC stack. Some things are
+        deliberately out of scope for now — see the "Scope: what is and is not here"
+        section of the README before filing. Requests to add a NuGet dependency to
+        `src/` (BCL only) or to break layering are also out of scope.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the use case, not just the proposed API.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Keryx to do? Sketch the API or behavior if you can. Cite the relevant RFC(s) where applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried or other approaches you weighed.
+    validations:
+      required: false

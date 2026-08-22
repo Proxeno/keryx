@@ -1,13 +1,22 @@
 name: pack
+
+# Pack and publish the Proxeno.Keryx.* NuGet packages on version tags (v*).
+# Feed: nuget.org (public) via Trusted Publishing (OIDC) — NO stored API key.
+# Prereq: a Trusted Publishing policy on nuget.org (Repository Owner: Proxeno,
+# Repository: keryx, Workflow File: pack.yml). No repo secrets required —
+# `user: retrotom` is the nuget.org profile name (public, not a credential).
+
 on:
   push:
     tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # mint the GitHub OIDC token nuget.org exchanges for a short-lived key
+
 jobs:
-  pack-push:
+  pack-publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -15,11 +24,24 @@ jobs:
           dotnet-version: 10.0.x
       - name: Derive version from tag
         run: echo "KERYX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-      - run: dotnet pack Keryx.slnx --configuration Release -p:Version=$KERYX_VERSION -o artifacts/packages
-      # Feed is GitHub Packages while the repo is private; open-sourcing flips this URL to nuget.org.
-      - name: Push to GitHub Packages
-        run: >
-          dotnet nuget push "artifacts/packages/*.nupkg"
-          --source "https://nuget.pkg.github.com/Proxeno/index.json"
-          --api-key "${{ secrets.GITHUB_TOKEN }}"
-          --skip-duplicate
+      - name: Pack
+        run: dotnet pack Keryx.slnx --configuration Release -p:Version=$KERYX_VERSION -o artifacts/packages
+        env:
+          CI: "true"
+      # Exchange the GitHub OIDC token for a short-lived nuget.org API key (~1h).
+      # Request it immediately before the push so it can't expire first.
+      - name: NuGet login (OIDC -> short-lived API key)
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: retrotom
+      - name: Push to nuget.org
+        # Push both packages and their symbol packages. A bare *.nupkg glob never
+        # matches .snupkg, so symbols would be silently dropped — iterate both.
+        run: |
+          for f in artifacts/packages/*.nupkg artifacts/packages/*.snupkg; do
+            dotnet nuget push "$f" \
+              --source "https://api.nuget.org/v3/index.json" \
+              --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+              --skip-duplicate
+          done

@@ -1,8 +1,12 @@
-<p align="center">
-  <img src="docs/assets/hero.png" alt="Keryx" width="100%">
-</p>
+![Keryx](https://raw.githubusercontent.com/Proxeno/keryx/main/docs/assets/hero.png)
 
 # Keryx
+
+[![CI](https://github.com/Proxeno/keryx/actions/workflows/ci.yml/badge.svg)](https://github.com/Proxeno/keryx/actions/workflows/ci.yml)
+[![NuGet version](https://img.shields.io/nuget/v/Proxeno.Keryx)](https://www.nuget.org/packages/Proxeno.Keryx)
+[![NuGet downloads](https://img.shields.io/nuget/dt/Proxeno.Keryx)](https://www.nuget.org/packages/Proxeno.Keryx)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-e8912d)](https://github.com/Proxeno/keryx/blob/main/LICENSE)
+[![.NET 10](https://img.shields.io/badge/.NET-10-e8912d)](https://dotnet.microsoft.com)
 
 **A from-scratch WebRTC stack for .NET.** No native dependencies, no third-party protocol
 libraries: STUN, ICE, SDP, RTP/RTCP, DTLS 1.2, SRTP/SRTCP and SCTP are implemented in this
