@@ -1,0 +1,26 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Keryx.Core/Keryx.Core.csproj" />
+    <Project Path="src/Keryx.Dtls/Keryx.Dtls.csproj" />
+    <Project Path="src/Keryx.Ice/Keryx.Ice.csproj" />
+    <Project Path="src/Keryx.Rtp/Keryx.Rtp.csproj" />
+    <Project Path="src/Keryx.Sctp/Keryx.Sctp.csproj" />
+    <Project Path="src/Keryx.Sdp/Keryx.Sdp.csproj" />
+    <Project Path="src/Keryx.Srtp/Keryx.Srtp.csproj" />
+    <Project Path="src/Keryx.Stun/Keryx.Stun.csproj" />
+    <Project Path="src/Keryx.Turn/Keryx.Turn.csproj" />
+    <Project Path="src/Keryx/Keryx.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Keryx.Core.Tests/Keryx.Core.Tests.csproj" />
+    <Project Path="tests/Keryx.Dtls.Tests/Keryx.Dtls.Tests.csproj" />
+    <Project Path="tests/Keryx.Ice.Tests/Keryx.Ice.Tests.csproj" />
+    <Project Path="tests/Keryx.IntegrationTests/Keryx.IntegrationTests.csproj" />
+    <Project Path="tests/Keryx.Rtp.Tests/Keryx.Rtp.Tests.csproj" />
+    <Project Path="tests/Keryx.Sctp.Tests/Keryx.Sctp.Tests.csproj" />
+    <Project Path="tests/Keryx.Sdp.Tests/Keryx.Sdp.Tests.csproj" />
+    <Project Path="tests/Keryx.Srtp.Tests/Keryx.Srtp.Tests.csproj" />
+    <Project Path="tests/Keryx.Stun.Tests/Keryx.Stun.Tests.csproj" />
+    <Project Path="tests/Keryx.Turn.Tests/Keryx.Turn.Tests.csproj" />
+  </Folder>
+</Solution>

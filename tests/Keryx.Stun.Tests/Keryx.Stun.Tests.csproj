@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../../src/Keryx.Stun/Keryx.Stun.csproj" />
+  </ItemGroup>
+</Project>

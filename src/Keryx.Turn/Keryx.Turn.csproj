@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>TURN client (RFC 8656): allocations, permissions, channel bindings and relayed datagrams, from the Keryx WebRTC stack.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../Keryx.Stun/Keryx.Stun.csproj" />
+  </ItemGroup>
+</Project>

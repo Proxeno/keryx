@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>RTP and RTCP packet model, typed RTCP feedback (PLI/FIR/NACK/transport-cc) and media packetizers (H.264, Opus) from the Keryx WebRTC stack.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+  </ItemGroup>
+</Project>

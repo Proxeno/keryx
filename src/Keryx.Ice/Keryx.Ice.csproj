@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>ICE agent (host, server-reflexive and TURN-relayed gathering, connectivity checks, nomination) from the Keryx WebRTC stack.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../Keryx.Stun/Keryx.Stun.csproj" />
+    <ProjectReference Include="../Keryx.Turn/Keryx.Turn.csproj" />
+  </ItemGroup>
+</Project>
