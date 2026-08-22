@@ -127,6 +127,14 @@ public sealed class PeerConnectionConfig
     public bool EnableRetransmission { get; set; } = true;
 
     /// <summary>
+    /// Offer the transport-wide congestion-control header extension
+    /// (<c>draft-holmer-rmcat-transport-wide-cc-extensions-01</c>) via <c>a=extmap</c> and, once the
+    /// answer keeps it, stamp a monotonically increasing transport-wide sequence number on every
+    /// outbound RTP packet. This is what lets the remote return TWCC feedback. On by default.
+    /// </summary>
+    public bool EnableTransportWideCc { get; set; } = true;
+
+    /// <summary>
     /// Payload type to advertise for the first video codec's <c>rtx</c> entry. Null picks the lowest
     /// unused dynamic payload type, which is what browsers do.
     /// </summary>

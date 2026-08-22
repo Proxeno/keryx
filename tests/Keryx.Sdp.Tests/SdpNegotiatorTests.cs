@@ -251,6 +251,17 @@ public class SdpNegotiatorTests
     }
 
     [Fact]
+    public void Negotiate_SurfacesTheTransportWideCcExtensionTheAnswerKept()
+    {
+        // The offerer reads the stamping id from the answer's extmap for the TWCC URI.
+        var audio = Negotiate().GetByMid("0")!;
+
+        var twcc = audio.HeaderExtensions.Should().ContainSingle(e => e.IsTransportWideCc).Subject;
+        twcc.Id.Should().Be(2);
+        twcc.Uri.Should().Be(SdpExtMap.TransportWideCcUri);
+    }
+
+    [Fact]
     public void Negotiate_RecvOnlyAnswerCarriesNoSsrcs()
     {
         var video = Negotiate().GetByMid("1")!;

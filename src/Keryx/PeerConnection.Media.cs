@@ -28,6 +28,9 @@ public sealed partial class PeerConnection
     private readonly byte[] _rxPlain = new byte[2048];
     private readonly byte[] _rtcpTx = new byte[1500];
 
+    /// <summary>The <c>a=extmap</c> id offered for the transport-wide congestion-control extension.</summary>
+    private const int TransportCcExtensionId = 3;
+
     private TrackSender? _videoTrack;
     private TrackSender? _audioTrack;
     private NegotiatedTrack? _negotiatedVideo;
@@ -35,6 +38,11 @@ public sealed partial class PeerConnection
     private Dictionary<byte, RtpRoute> _routes = [];
     private Timer? _rtcpTimer;
     private int _firSequence;
+
+    // The transport-wide sequence number space, shared by every outbound SSRC (media and RTX). It and
+    // its stamping identifier are only touched from the send path under _sendLock, so no atomics.
+    private byte? _sendTransportCcExtensionId;
+    private ushort _transportWideSequenceNumber;
 
     private long _videoFramesDropped;
     private long _audioFramesDropped;
@@ -444,8 +452,14 @@ public sealed partial class PeerConnection
 
     private void CreateTrackSenders(IceAgent ice, SrtpProfile profile)
     {
+        var transportCcId = _sendTransportCcExtensionId;
+
+        // When the TWCC extension is negotiated every packet carries the one-byte header extension, so
+        // its fixed overhead comes out of the payload budget and out of the send-history slab size.
+        var extensionReserve = transportCcId is null ? 0 : TransportCcExtension.OneByteHeaderOverhead;
+
         var datagram = Math.Min(_config.Mtu, (_transport ?? ice.Transport).MaxDatagramSize);
-        var maxPayload = datagram - RtpHeader.FixedLength - profile.RtpOverhead;
+        var maxPayload = datagram - RtpHeader.FixedLength - extensionReserve - profile.RtpOverhead;
         if (maxPayload < 64)
         {
             throw new InvalidOperationException(
@@ -463,7 +477,7 @@ public sealed partial class PeerConnection
                 // media stream gives those two bytes back to keep repairs inside the same MTU.
                 videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
                 var history = new RtpSendHistory(
-                    RtpHeader.FixedLength + videoMaxPayload,
+                    RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
                     _config.RetransmissionHistory);
                 rtx = new RtxRetransmitter(
                     _videoRtxSsrc,
@@ -487,6 +501,7 @@ public sealed partial class PeerConnection
                 new H264Packetizer(),
                 videoMaxPayload,
                 profile.RtpOverhead,
+                transportCcId,
                 rtx);
         }
 
@@ -499,7 +514,8 @@ public sealed partial class PeerConnection
                 new RtpStreamSender(_audioSsrc, audio.PayloadType, audio.ClockRate, logger: _logger),
                 new OpusPacketizer(),
                 maxPayload,
-                profile.RtpOverhead);
+                profile.RtpOverhead,
+                transportCcId);
         }
     }
 
@@ -917,6 +933,18 @@ public sealed partial class PeerConnection
         }
     }
 
+    /// <summary>
+    /// Allocates the next transport-wide sequence number for the congestion-control header extension.
+    /// Must be called under <see cref="_sendLock"/>, which serialises every outbound RTP packet across
+    /// the media and RTX streams so the space stays gap-free and monotonic. Wraps at 65535.
+    /// </summary>
+    private ushort NextTransportWideSequenceNumber()
+    {
+        var sequenceNumber = _transportWideSequenceNumber;
+        _transportWideSequenceNumber = unchecked((ushort)(sequenceNumber + 1));
+        return sequenceNumber;
+    }
+
     private void SendProtectedRtp(byte[] buffer, int length)
     {
         var srtp = _srtp;
@@ -949,6 +977,8 @@ public sealed partial class PeerConnection
         private readonly byte[] _buffer;
         private readonly byte[]? _rtxBuffer;
         private readonly int _maxPayload;
+        private readonly int _headerReserve;
+        private readonly byte? _transportCcExtensionId;
         private uint _timestamp;
         private long _packets;
         private long _bytes;
@@ -962,12 +992,19 @@ public sealed partial class PeerConnection
             IRtpPayloadizer payloadizer,
             int maxPayload,
             int srtpOverhead,
+            byte? transportCcExtensionId = null,
             RtxRetransmitter? retransmitter = null)
         {
             _owner = owner;
             _payloadizer = payloadizer;
             _maxPayload = maxPayload;
-            _buffer = new byte[RtpHeader.FixedLength + maxPayload + srtpOverhead];
+            _transportCcExtensionId = transportCcExtensionId;
+
+            // Reserve the fixed header plus, when TWCC is negotiated, the one-byte header extension, so the
+            // payloadizer writes exactly where the assembled header ends and the packet copy is a self-copy.
+            _headerReserve = RtpHeader.FixedLength
+                + (transportCcExtensionId is null ? 0 : TransportCcExtension.OneByteHeaderOverhead);
+            _buffer = new byte[_headerReserve + maxPayload + srtpOverhead];
             _rtxBuffer = retransmitter is null
                 ? null
                 : new byte[retransmitter.MaxPacketSize + srtpOverhead];
@@ -986,17 +1023,34 @@ public sealed partial class PeerConnection
         /// <summary>The repair stream, or null when the answer kept no rtx codec.</summary>
         internal RtxRetransmitter? Retransmitter { get; }
 
-        public Span<byte> GetPayloadBuffer(int sizeHint) => _buffer.AsSpan(RtpHeader.FixedLength, _maxPayload);
+        public Span<byte> GetPayloadBuffer(int sizeHint) => _buffer.AsSpan(_headerReserve, _maxPayload);
 
         public void Commit(int length, bool marker)
         {
-            // The payload already sits at the offset the RTP header will end at, so WritePacket's
-            // copy is a no-op self-copy and the packet is assembled without a second buffer.
-            var packetLength = Stream.WritePacket(
-                _buffer.AsSpan(RtpHeader.FixedLength, length),
-                marker,
-                _timestamp,
-                _buffer);
+            // The payload already sits at the offset the RTP header (fixed part plus any stamped
+            // extension) will end at, so WritePacket's copy is a no-op self-copy and the packet is
+            // assembled without a second buffer.
+            var payload = _buffer.AsSpan(_headerReserve, length);
+            int packetLength;
+            if (_transportCcExtensionId is { } extensionId)
+            {
+                Span<byte> extensionBody = stackalloc byte[TransportCcExtension.OneByteBodyLength];
+                TransportCcExtension.WriteOneByteBody(
+                    extensionBody,
+                    extensionId,
+                    _owner.NextTransportWideSequenceNumber());
+                packetLength = Stream.WritePacket(
+                    payload,
+                    marker,
+                    _timestamp,
+                    RtpHeaderExtension.OneByteProfile,
+                    extensionBody,
+                    _buffer);
+            }
+            else
+            {
+                packetLength = Stream.WritePacket(payload, marker, _timestamp, _buffer);
+            }
 
             // Capture the plaintext before SRTP encrypts the same buffer in place.
             Retransmitter?.History.Store(Stream.LastSequenceNumber, _buffer.AsSpan(0, packetLength));
@@ -1029,7 +1083,19 @@ public sealed partial class PeerConnection
                 return false;
             }
 
-            if (rtx.TryRetransmit(sequenceNumber, _rtxBuffer, out var length) != RtxRetransmitResult.Retransmitted)
+            // A repair packet is an outbound RTP packet like any other, so it draws the next
+            // transport-wide sequence number when the TWCC extension is negotiated.
+            int length;
+            var result = _transportCcExtensionId is { } extensionId
+                ? rtx.TryRetransmit(
+                    sequenceNumber,
+                    extensionId,
+                    _owner.NextTransportWideSequenceNumber(),
+                    _rtxBuffer,
+                    out length)
+                : rtx.TryRetransmit(sequenceNumber, _rtxBuffer, out length);
+
+            if (result != RtxRetransmitResult.Retransmitted)
             {
                 return false;
             }
