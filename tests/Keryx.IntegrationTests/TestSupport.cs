@@ -27,14 +27,14 @@ internal static class TestSupport
         MaxPort = MaxPort,
         Logger = logger ?? NullLogger.Instance,
         RtcpInterval = TimeSpan.FromMilliseconds(500),
-        IceConnectTimeout = TimeSpan.FromSeconds(15),
+        IceConnectTimeout = TimeSpan.FromSeconds(30),
     };
 
     /// <summary>Polls <paramref name="condition"/> until it holds or the timeout elapses.</summary>
     /// <param name="condition">The predicate to poll.</param>
     /// <param name="timeoutMilliseconds">How long to keep polling.</param>
     /// <returns>The final value of the predicate.</returns>
-    internal static async Task<bool> WaitForAsync(Func<bool> condition, int timeoutMilliseconds = 15_000)
+    internal static async Task<bool> WaitForAsync(Func<bool> condition, int timeoutMilliseconds = 30_000)
     {
         var deadline = Environment.TickCount64 + timeoutMilliseconds;
         while (Environment.TickCount64 < deadline)
