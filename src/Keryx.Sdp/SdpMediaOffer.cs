@@ -53,6 +53,18 @@ public sealed class SdpMediaOffer
     /// <summary>RTP header extensions to offer as <c>a=extmap</c>.</summary>
     public IList<SdpExtMap> HeaderExtensions { get; } = new List<SdpExtMap>();
 
+    /// <summary>
+    /// RID declarations to offer as <c>a=rid</c> lines (RFC 8851). A simulcast video source lists one
+    /// per layer; pair them with a matching <see cref="Simulcast"/> value.
+    /// </summary>
+    public IList<SdpRid> Rids { get; } = new List<SdpRid>();
+
+    /// <summary>
+    /// The <c>a=simulcast</c> description to offer (RFC 8853), or <see langword="null"/> for a single
+    /// stream. When set, the referenced RIDs should also appear in <see cref="Rids"/>.
+    /// </summary>
+    public SdpSimulcast? Simulcast { get; set; }
+
     /// <summary>Synchronisation sources this section will transmit, emitted as <c>a=ssrc</c> lines.</summary>
     public IList<uint> Ssrcs { get; } = new List<uint>();
 
