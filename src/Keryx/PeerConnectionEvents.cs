@@ -106,9 +106,12 @@ public sealed class NackEventArgs : EventArgs
 
     /// <summary>
     /// Every sequence number the peer reports missing, with the run-length bitmasks already expanded.
-    /// Keryx ships no RTX path, so this is a signal to act on (drop quality, force a key frame), not a
-    /// retransmission request the stack will satisfy on its own.
     /// </summary>
+    /// <remarks>
+    /// When RFC 4588 retransmission was negotiated the connection has already served what it could of
+    /// this NACK from its send history before raising the event, so treat this as a congestion signal
+    /// (drop quality, force a key frame) rather than a request to act on.
+    /// </remarks>
     public IReadOnlyList<ushort> SequenceNumbers { get; }
 }
 
@@ -166,14 +169,26 @@ public sealed class ReceiverReportEventArgs : EventArgs
     /// The round-trip time, or <see langword="null"/> when the peer has not yet received a sender
     /// report from this endpoint (<see cref="RtcpReportBlock.LastSenderReport"/> is zero).
     /// </returns>
-    public TimeSpan? GetRoundTripTime(RtcpReportBlock block)
+    public TimeSpan? GetRoundTripTime(RtcpReportBlock block) => CalculateRoundTripTime(block, _receivedAt);
+
+    /// <summary>
+    /// Computes the round-trip time from a report block and the instant it arrived, using RFC 3550
+    /// §6.4.1 arithmetic: <c>RTT = now - DLSR - LSR</c>, all in compact NTP form.
+    /// </summary>
+    /// <param name="block">The reception report block.</param>
+    /// <param name="receivedAt">The wall-clock instant the report carrying it arrived.</param>
+    /// <returns>
+    /// The round-trip time, or <see langword="null"/> when the peer has not yet received a sender
+    /// report from this endpoint (<see cref="RtcpReportBlock.LastSenderReport"/> is zero).
+    /// </returns>
+    public static TimeSpan? CalculateRoundTripTime(RtcpReportBlock block, DateTimeOffset receivedAt)
     {
         if (block.LastSenderReport == 0)
         {
             return null;
         }
 
-        var now = NtpTime.ToCompact(NtpTime.FromDateTimeOffset(_receivedAt));
+        var now = NtpTime.ToCompact(NtpTime.FromDateTimeOffset(receivedAt));
         var elapsed = unchecked(now - block.LastSenderReport);
         if (elapsed < block.DelaySinceLastSenderReport)
         {

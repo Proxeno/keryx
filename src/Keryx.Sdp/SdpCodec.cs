@@ -7,6 +7,12 @@ namespace Keryx.Sdp;
 /// </summary>
 public sealed class SdpCodec
 {
+    /// <summary>The encoding name RFC 4588 gives the retransmission payload format.</summary>
+    public const string RtxEncodingName = "rtx";
+
+    /// <summary>The fmtp parameter naming the payload type an rtx entry repairs (RFC 4588 §8.1).</summary>
+    public const string AssociatedPayloadTypeParameter = "apt";
+
     /// <summary>Creates a codec entry.</summary>
     /// <param name="payloadType">RTP payload type to advertise.</param>
     /// <param name="encodingName">Encoding name for <c>a=rtpmap</c>, for example <c>H264</c>.</param>
@@ -27,6 +33,20 @@ public sealed class SdpCodec
     /// <summary>Encoding name written to <c>a=rtpmap</c>.</summary>
     public string EncodingName { get; set; }
 
+    /// <summary>True when this entry is an RFC 4588 retransmission codec.</summary>
+    public bool IsRtx => string.Equals(EncodingName, RtxEncodingName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The payload type this entry repairs, read from the <c>apt</c> fmtp parameter.</summary>
+    /// <returns>The associated payload type, or <see langword="null"/> when there is no usable <c>apt</c>.</returns>
+    public int? GetAssociatedPayloadType() =>
+        int.TryParse(
+            FmtpParameters.GetValue(Fmtp, AssociatedPayloadTypeParameter),
+            System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var apt)
+            ? apt
+            : null;
+
     /// <summary>RTP clock rate in Hz.</summary>
     public int ClockRate { get; set; }
 
@@ -40,8 +60,10 @@ public sealed class SdpCodec
     /// RTCP feedback capabilities emitted as <c>a=rtcp-fb:&lt;pt&gt; ...</c>, in list order.
     /// </summary>
     /// <remarks>
-    /// Bare <see cref="RtcpFeedback.Nack"/> is never added implicitly. Advertising it commits the
-    /// sender to RTX retransmission; add it only once that path exists.
+    /// Bare <see cref="RtcpFeedback.Nack"/> is never added implicitly, because advertising it commits
+    /// the sender to serving retransmissions. <see cref="H264"/> adds it, and a
+    /// <c>PeerConnection</c> pairs it with an <see cref="Rtx"/> entry in the same m-section so the
+    /// promise can be kept.
     /// </remarks>
     public IList<RtcpFeedback> Feedback { get; } = new List<RtcpFeedback>();
 
@@ -84,9 +106,15 @@ public sealed class SdpCodec
             .WithFeedback(RtcpFeedback.TransportCc);
 
     /// <summary>
-    /// H.264 at 90 kHz with the constrained-baseline profile browsers accept, plus <c>nack pli</c>,
-    /// <c>ccm fir</c> and <c>transport-cc</c> feedback. Bare <c>nack</c> is deliberately excluded.
+    /// H.264 at 90 kHz with the constrained-baseline profile browsers accept, plus <c>nack</c>,
+    /// <c>nack pli</c>, <c>ccm fir</c> and <c>transport-cc</c> feedback, in Chrome's order.
     /// </summary>
+    /// <remarks>
+    /// Bare <c>nack</c> promises retransmission, which Keryx serves over RTX (RFC 4588). Offer this
+    /// codec together with a matching <see cref="Rtx"/> entry — a <c>PeerConnection</c> does that
+    /// automatically — or clear <see cref="Feedback"/> of <see cref="RtcpFeedback.Nack"/> if the
+    /// m-section will carry no repair stream.
+    /// </remarks>
     /// <param name="payloadType">Payload type.</param>
     /// <param name="profileLevelId">H.264 profile-level-id; <c>42e01f</c> is constrained baseline 3.1.</param>
     /// <param name="packetizationMode">RFC 6184 packetization mode; 1 is non-interleaved.</param>
@@ -105,14 +133,23 @@ public sealed class SdpCodec
 
         return new SdpCodec(payloadType, "H264", 90000)
             .WithFmtp(fmtp)
-            .WithFeedback(RtcpFeedback.NackPli, RtcpFeedback.CcmFir, RtcpFeedback.TransportCc);
+            .WithFeedback(
+                RtcpFeedback.Nack,
+                RtcpFeedback.NackPli,
+                RtcpFeedback.CcmFir,
+                RtcpFeedback.TransportCc);
     }
 
     /// <summary>An RTX repair codec bound to <paramref name="associatedPayloadType"/> via <c>apt</c>.</summary>
     /// <param name="payloadType">Payload type of the RTX stream.</param>
     /// <param name="associatedPayloadType">Payload type being repaired.</param>
-    /// <param name="clockRate">RTP clock rate, matching the repaired codec.</param>
+    /// <param name="clockRate">RTP clock rate, which RFC 4588 §8.1 requires to match the repaired codec.</param>
     /// <returns>The codec entry.</returns>
+    /// <remarks>
+    /// Renders as <c>a=rtpmap:&lt;pt&gt; rtx/&lt;clock&gt;</c> plus <c>a=fmtp:&lt;pt&gt; apt=&lt;apt&gt;</c>.
+    /// The repair stream also needs its own SSRC, associated with the media SSRC through
+    /// <c>a=ssrc-group:FID</c> (RFC 5576 §4.2).
+    /// </remarks>
     public static SdpCodec Rtx(int payloadType, int associatedPayloadType, int clockRate = 90000) =>
         new SdpCodec(payloadType, "rtx", clockRate)
             .WithFmtp("apt=" + associatedPayloadType.ToString(System.Globalization.CultureInfo.InvariantCulture));

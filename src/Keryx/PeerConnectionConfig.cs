@@ -1,6 +1,7 @@
 using System.Net;
 using Keryx.Core;
 using Keryx.Dtls;
+using Keryx.Rtp;
 using Keryx.Sdp;
 
 namespace Keryx;
@@ -48,9 +49,14 @@ public sealed class PeerConnectionConfig
     /// <summary>
     /// Video codecs to advertise, in preference order. Defaults to exactly one entry: H.264 payload
     /// type 96, 90 kHz, <c>level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f</c>,
-    /// with <c>nack pli</c>, <c>ccm fir</c> and <c>transport-cc</c> feedback and deliberately no bare
-    /// <c>nack</c> (Keryx has no RTX path). Clear the list to offer no video.
+    /// with <c>nack</c>, <c>nack pli</c>, <c>ccm fir</c> and <c>transport-cc</c> feedback. Clear the
+    /// list to offer no video.
     /// </summary>
+    /// <remarks>
+    /// The offer builder never mutates these entries. When <see cref="EnableRetransmission"/> is set it
+    /// offers a copy of each entry alongside a generated RFC 4588 <c>rtx</c> codec, so bare
+    /// <c>nack</c> is backed by a real repair stream.
+    /// </remarks>
     public IList<SdpCodec> VideoCodecs { get; } = [SdpCodec.H264()];
 
     /// <summary>
@@ -99,6 +105,53 @@ public sealed class PeerConnectionConfig
 
     /// <summary>The <c>a=max-message-size</c> value, and the local reassembly limit, in bytes.</summary>
     public int MaxMessageSize { get; set; } = 262144;
+
+    /// <summary>
+    /// Offer RFC 4588 retransmission for video: an <c>rtx</c> codec per video codec, a dedicated repair
+    /// SSRC published through <c>a=ssrc-group:FID</c>, and NACK-driven resends once the answer keeps
+    /// the <c>rtx</c> entry. On by default.
+    /// </summary>
+    /// <remarks>
+    /// Audio is deliberately excluded: browsers do not negotiate RTX for Opus, whose in-band FEC
+    /// (<c>useinbandfec=1</c>) already repairs isolated loss without a round trip.
+    /// </remarks>
+    public bool EnableRetransmission { get; set; } = true;
+
+    /// <summary>
+    /// Payload type to advertise for the first video codec's <c>rtx</c> entry. Null picks the lowest
+    /// unused dynamic payload type, which is what browsers do.
+    /// </summary>
+    public int? RtxPayloadType { get; set; }
+
+    /// <summary>
+    /// Retention limits for the ring of recently sent video packets a NACK is served from. The
+    /// ring reserves <c>Capacity × MTU</c> bytes per connection when retransmission is negotiated.
+    /// </summary>
+    public RtpSendHistoryOptions RetransmissionHistory { get; } = new();
+
+    /// <summary>Rate and bandwidth limits applied to NACK-driven retransmission.</summary>
+    public RtxRetransmitOptions Retransmission { get; } = new();
+
+    /// <summary>
+    /// A testing and diagnostics seam: called once with the ICE agent's datagram transport, and the
+    /// transport it returns is what the connection sends on and receives from. Null (the default)
+    /// uses the ICE transport directly.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The seam sits at the datagram level, <em>below</em> DTLS and SRTP: everything it observes is
+    /// already protected, and everything it hands back is decrypted by the peer, so a wrapper can
+    /// count, delay or drop datagrams without being able to forge one. That makes it the right place
+    /// to model a lossy link — which is exactly what the fault-injection tests do — and the wrong
+    /// place to try to modify media.
+    /// </para>
+    /// <para>
+    /// The factory runs while the connection is building its ICE agent, before gathering. The
+    /// returned transport must forward <see cref="IDatagramTransport.OnReceived"/> from the transport
+    /// it was given, or the DTLS handshake will never complete; the connection does not dispose it.
+    /// </para>
+    /// </remarks>
+    public Func<IDatagramTransport, IDatagramTransport>? TransportInterceptor { get; set; }
 
     /// <summary>The <c>a=mid</c> of the video m-section.</summary>
     public string VideoMid { get; set; } = "0";

@@ -24,7 +24,11 @@ const state = {
   channels: {},           // label -> { readyState, received, echoed }
   stats: { framesDecoded: 0, framesReceived: 0, bytesReceived: 0, audioBytesReceived: 0,
            frameWidth: 0, frameHeight: 0, packetsReceived: 0, packetsLost: 0,
-           pliCount: 0, nackCount: 0, keyFramesDecoded: 0, decoderImplementation: "" },
+           pliCount: 0, nackCount: 0, keyFramesDecoded: 0, decoderImplementation: "",
+           framesPerSecond: 0, jitter: 0, freezeCount: 0, ssrc: 0,
+           retransmittedPacketsReceived: 0, retransmittedBytesReceived: 0 },
+  // A rolling trajectory, so the test can see decoding keep up rather than only its end state.
+  samples: [],
   videoElement: { width: 0, height: 0, readyState: 0 },
 };
 
@@ -64,6 +68,22 @@ async function pollStats(pc) {
       state.stats.nackCount = r.nackCount ?? 0;
       state.stats.keyFramesDecoded = r.keyFramesDecoded ?? 0;
       state.stats.decoderImplementation = r.decoderImplementation ?? "";
+      state.stats.framesPerSecond = r.framesPerSecond ?? 0;
+      state.stats.jitter = r.jitter ?? 0;
+      state.stats.freezeCount = r.freezeCount ?? 0;
+      state.stats.ssrc = r.ssrc ?? 0;
+      // RFC 4588 repairs Chrome accepted, when the build reports them.
+      state.stats.retransmittedPacketsReceived = r.retransmittedPacketsReceived ?? 0;
+      state.stats.retransmittedBytesReceived = r.retransmittedBytesReceived ?? 0;
+      state.samples.push({
+        t: Math.round(performance.now()),
+        framesDecoded: state.stats.framesDecoded,
+        packetsReceived: state.stats.packetsReceived,
+        packetsLost: state.stats.packetsLost,
+        nackCount: state.stats.nackCount,
+        keyFramesDecoded: state.stats.keyFramesDecoded,
+      });
+      if (state.samples.length > 60) { state.samples.shift(); }
     }
     if (r.type === "inbound-rtp" && r.kind === "audio") {
       state.stats.audioBytesReceived = r.bytesReceived ?? 0;

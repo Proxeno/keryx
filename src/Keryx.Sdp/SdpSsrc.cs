@@ -64,6 +64,15 @@ public sealed record SsrcAttribute(uint Ssrc, string Name, string? Value = null)
 /// <param name="Ssrcs">Member sources, in document order.</param>
 public sealed record SsrcGroup(string Semantics, IReadOnlyList<uint> Ssrcs)
 {
+    /// <summary>
+    /// The <c>FID</c> (flow identification) semantics of RFC 5576 §4.2: the sources carry the same
+    /// content, which is how an RFC 4588 repair stream is bound to the stream it repairs.
+    /// </summary>
+    public const string FidSemantics = "FID";
+
+    /// <summary>The <c>SIM</c> semantics used to group simulcast layers.</summary>
+    public const string SimulcastSemantics = "SIM";
+
     /// <summary>Parses an <c>a=ssrc-group</c> attribute value.</summary>
     /// <param name="value">The attribute value, without the <c>a=ssrc-group:</c> prefix.</param>
     /// <param name="group">Receives the parsed group.</param>

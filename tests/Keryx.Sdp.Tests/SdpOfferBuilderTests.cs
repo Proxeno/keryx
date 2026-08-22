@@ -77,6 +77,7 @@ public class SdpOfferBuilderTests
             a=msid:{StreamId} {VideoTrack}
             a=rtcp-mux
             a=rtpmap:96 H264/90000
+            a=rtcp-fb:96 nack
             a=rtcp-fb:96 nack pli
             a=rtcp-fb:96 ccm fir
             a=rtcp-fb:96 transport-cc
@@ -99,28 +100,60 @@ public class SdpOfferBuilderTests
     }
 
     [Fact]
-    public void Build_VideoNeverAdvertisesBareNack()
+    public void Build_VideoAdvertisesBareNackInChromesOrder()
     {
+        // RFC 4585 §4: bare nack is generic NACK feedback, distinct from nack pli. Keryx offers it
+        // because it serves retransmissions over RFC 4588 RTX.
         var video = ProxenoOffer().Build().MediaDescriptions[1];
 
         video.GetRtcpFeedback(96).Should().Equal(
+            RtcpFeedback.Nack,
             RtcpFeedback.NackPli,
             RtcpFeedback.CcmFir,
             RtcpFeedback.TransportCc);
-        video.GetRtcpFeedback(96).Should().NotContain(RtcpFeedback.Nack);
     }
 
     [Fact]
-    public void Build_BareNackIsOptInOnly()
+    public void Build_BareNackCanBeRemovedForASenderWithNoRepairStream()
     {
-        var codec = SdpCodec.H264(96).WithFeedback(RtcpFeedback.Nack);
+        var codec = SdpCodec.H264(96);
+        codec.Feedback.Remove(RtcpFeedback.Nack);
         var media = new SdpOfferBuilder
         {
             IceCredentials = new SdpIceCredentials("u", "p"),
             Fingerprint = new SdpFingerprint("sha-256", "AA:BB"),
         }.AddVideo("0", codec).Build().MediaDescriptions[0];
 
-        media.GetRtcpFeedback(96).Should().Contain(RtcpFeedback.Nack);
+        media.GetRtcpFeedback(96).Should().NotContain(RtcpFeedback.Nack);
+        media.GetRtcpFeedback(96).Should().Contain(RtcpFeedback.NackPli);
+    }
+
+    [Fact]
+    public void Build_EmitsTheRtxCodecAndFidGroupForARepairStream()
+    {
+        // RFC 4588 §8.1 pairs a=rtpmap:<pt> rtx/<clock> with a=fmtp:<pt> apt=<media pt>, and
+        // RFC 5576 §4.2 binds the repair SSRC to the media SSRC with a=ssrc-group:FID.
+        var video = SdpMediaOffer.Video("1", SdpCodec.H264(96), SdpCodec.Rtx(97, 96));
+        video.TrackId = VideoTrack;
+        video.Ssrcs.Add(3204773231u);
+        video.Ssrcs.Add(1245781936u);
+        video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [3204773231u, 1245781936u]));
+
+        var media = new SdpOfferBuilder
+        {
+            IceCredentials = new SdpIceCredentials("u", "p"),
+            Fingerprint = new SdpFingerprint("sha-256", "AA:BB"),
+            Cname = Cname,
+            StreamId = StreamId,
+        }.AddMedia(video).Build().MediaDescriptions[0];
+
+        var text = media.ToSdpString();
+        text.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97");
+        text.Should().Contain("a=rtpmap:97 rtx/90000");
+        text.Should().Contain("a=fmtp:97 apt=96");
+        text.Should().Contain("a=ssrc-group:FID 3204773231 1245781936");
+        media.GetSsrcCname(1245781936u).Should().Be(Cname);
+        media.GetSsrcCname(3204773231u).Should().Be(Cname);
     }
 
     [Fact]
@@ -351,7 +384,28 @@ public class SdpOfferBuilderTests
         h264.ClockRate.Should().Be(90000);
         h264.Channels.Should().BeNull();
         h264.Fmtp.Should().Be("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
-        h264.Feedback.Should().Equal(RtcpFeedback.NackPli, RtcpFeedback.CcmFir, RtcpFeedback.TransportCc);
+        h264.Feedback.Should().Equal(
+            RtcpFeedback.Nack,
+            RtcpFeedback.NackPli,
+            RtcpFeedback.CcmFir,
+            RtcpFeedback.TransportCc);
+    }
+
+    [Fact]
+    public void Rtx_BindsToTheRepairedPayloadTypeThroughApt()
+    {
+        // RFC 4588 §8.1: "apt ... the payload type of the associated original stream".
+        var rtx = SdpCodec.Rtx(97, 96);
+
+        rtx.PayloadType.Should().Be(97);
+        rtx.EncodingName.Should().Be("rtx");
+        rtx.ClockRate.Should().Be(90000);
+        rtx.Fmtp.Should().Be("apt=96");
+        rtx.IsRtx.Should().BeTrue();
+        rtx.GetAssociatedPayloadType().Should().Be(96);
+        rtx.ToRtpMap().ToAttributeValue().Should().Be("97 rtx/90000");
+        SdpCodec.H264().IsRtx.Should().BeFalse();
+        SdpCodec.H264().GetAssociatedPayloadType().Should().BeNull();
     }
 
     [Fact]
