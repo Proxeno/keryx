@@ -43,8 +43,11 @@ export, written from scratch against the RFCs with all cryptographic primitives 
 
 ## Testing
 
-67 tests: PRF vectors, record round-trips, replay-window unit tests, fragmentation/reassembly,
-and a full client↔server loopback suite over in-memory transports — including lossy transports
-(first flight dropped each direction, heavy uniform loss), tampered Finished/CertificateVerify,
-wrong pinned fingerprint (both roles), replayed records, exporter equality on both sides, and
-timeout behavior.
+96 tests: PRF vectors and key-schedule seed-order/label assertions, ECDHE point validation,
+record round-trips, replay-window unit tests, fragmentation/reassembly (including the pathological
+one-byte-fragment CPU case and the slot-exhaustion case), and a full client↔server loopback suite
+over in-memory transports — including lossy transports (first flight dropped each direction, heavy
+uniform loss), tampered Finished/CertificateVerify, wrong and blank pinned fingerprint (both roles),
+replayed records, exporter equality on both sides, timeout behavior, and an adversarial suite
+(DTLS 1.0 downgrade, injected/duplicate ClientHello, forged epoch-0 records). The structured
+internal security review that produced the adversarial suite is written up in `../../SECURITY-REVIEW.md`.

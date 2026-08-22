@@ -272,9 +272,17 @@ public class SrtpRoundTripTests
 
         // The second stream never wrapped, so sequence 0 is unseen there even though the first
         // stream has already consumed it. Independent replay lists must let it through.
+        //
+        // The packet is minted from a second sender holding the same keys rather than from `s`:
+        // sequence 0 sits behind the 13 that `s` has already emitted on this SSRC, and a sender that
+        // rewinds its own sequence number reuses an SRTP packet index, which SrtpEncryptContext now
+        // refuses (RFC 3711 Section 9.1). A receiver still has to accept such a packet — reordering
+        // on the network is normal — which is exactly what this asserts.
+        var (freshSender, _) = CreatePair(kind);
+        using var f = freshSender;
         var freshPacket = TestPackets.Rtp(second, 0, 0, [9, 9]);
-        var freshBuffer = new byte[freshPacket.Length + s.Profile.RtpOverhead];
-        var freshLength = s.ProtectRtp(freshPacket, freshBuffer);
+        var freshBuffer = new byte[freshPacket.Length + f.Profile.RtpOverhead];
+        var freshLength = f.ProtectRtp(freshPacket, freshBuffer);
         var freshOutput = new byte[freshLength];
         r.TryUnprotectRtp(freshBuffer.AsSpan(0, freshLength), freshOutput, out var freshWritten)
             .Should().BeTrue("the two SSRCs must not share a replay list");

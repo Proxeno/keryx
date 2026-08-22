@@ -12,13 +12,18 @@ Keryx implements its own DTLS 1.2 handshake and record layer and its own SRTP/SR
 (protocol logic only — all cryptographic primitives are the platform's
 `System.Security.Cryptography`).
 
-**The DTLS and SRTP implementations have NOT received an independent security review.**
-They are correctness-focused and verify everything the RFCs require — peer CertificateVerify over
-the handshake transcript, Finished verify_data, certificate fingerprint pinning against the SDP
-`a=fingerprint`, AEAD auth tags, anti-replay windows, constant-time tag comparisons — and these
-behaviors are covered by tests, including tamper and replay cases. That is a necessary bar, not a
-sufficient one. Until an independent review has been completed and noted here, do not use Keryx
-to protect sensitive traffic in production.
+**The DTLS and SRTP implementations have had a structured internal security review
+(`SECURITY-REVIEW.md`) but NOT an independent external audit.** The internal review was adversarial:
+it verifies everything the RFCs require — peer CertificateVerify over the handshake transcript,
+Finished verify_data, certificate fingerprint pinning against the SDP `a=fingerprint`, AEAD auth
+tags, anti-replay windows, constant-time tag comparisons — and each of those behaviors is backed by
+a test that fails closed on tamper, replay, forgery, or downgrade. It also found and fixed real gaps
+(a fail-open when the SDP carried no fingerprint, SRTP packet-index reuse, a version-downgrade
+acceptance, and several unauthenticated-input DoS vectors); see `SECURITY-REVIEW.md` for the full
+ledger, threat model, and residual-risk list. That is a meaningful bar, but it remains an internal
+review, not a third-party audit, and it did not include fuzzing or side-channel measurement. Until
+an independent external audit has been completed and noted here, do not use Keryx to protect
+sensitive traffic in production.
 
 Known, deliberate limitations of the current implementation are documented in
 `docs/layers/dtls.md` and `docs/layers/srtp.md` (e.g. no DTLS session resumption or

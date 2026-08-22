@@ -20,6 +20,9 @@ RFC 3711 SRTP/SRTCP as a pure transform over wire bytes, keyed by raw material f
 
 ## Testing
 
-120 tests: RFC 3711 B.2 keystream and B.3 key-derivation vectors, RFC 7714 §16/§17 GCM vectors
+136 tests: RFC 3711 B.2 keystream and B.3 key-derivation vectors, RFC 7714 §16/§17 GCM vectors
 (SRTP and SRTCP), protect→unprotect identity across sequence wrap with ROC transitions, tamper
-and replay rejection, two-SSRC independence, and the RFC 5764 key-split helper.
+and replay rejection, two-SSRC independence, the RFC 5764 key-split helper, and an adversarial
+sender/receiver suite (packet-index reuse refused, SRTCP index-wrap stop, no per-SSRC state
+allocated from unauthenticated packets, forged far-future sequence numbers do not slide the
+replay window). See `../../SECURITY-REVIEW.md`.

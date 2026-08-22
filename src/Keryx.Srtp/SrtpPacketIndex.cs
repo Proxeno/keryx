@@ -114,3 +114,78 @@ internal sealed class SrtpStreamState
         // v == ROC-1: an old packet from the previous rollover period; no update.
     }
 }
+
+/// <summary>
+/// Per-SSRC <em>sender</em> state: the rollover counter maintained by counting wraps, and the
+/// highest packet index already emitted.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A sender must not use the RFC 3711 Appendix A estimation that <see cref="SrtpStreamState"/>
+/// implements. Appendix A is specified for receivers, which have to guess which rollover period an
+/// arriving sequence number belongs to; a sender knows, because it chose the sequence number. Using
+/// the estimator on the send path is actively dangerous: after a genuine wrap, a forward jump of
+/// more than 32768 makes it answer <c>ROC-1</c>, rewinding the 48-bit index by 2^16 back into a
+/// range the session has already consumed.
+/// </para>
+/// <para>
+/// Index reuse is catastrophic in both profiles. The index is the only varying input to the AES-CM
+/// IV (RFC 3711 Section 4.1.1), so a repeat is a repeated keystream — two ciphertexts XOR to the XOR
+/// of their plaintexts. It is likewise the only varying input to the RFC 7714 Section 8.1 GCM nonce,
+/// and a repeated GCM nonce leaks the GHASH subkey, which hands the attacker forgery rather than
+/// merely confidentiality loss. RFC 3711 Section 9.1 states the requirement directly.
+/// </para>
+/// </remarks>
+internal sealed class SrtpSendStreamState
+{
+    private bool _started;
+    private ushort _lastSequence;
+
+    /// <summary>The rollover counter, incremented whenever the sequence number wraps.</summary>
+    public uint RolloverCounter { get; private set; }
+
+    /// <summary>The highest 48-bit packet index emitted so far.</summary>
+    public ulong HighestIndex { get; private set; }
+
+    /// <summary>
+    /// Returns the rollover counter for <paramref name="sequenceNumber"/> and records it as used.
+    /// </summary>
+    /// <param name="sequenceNumber">The sequence number of the packet about to be protected.</param>
+    /// <param name="ssrc">The stream's SSRC, for the diagnostic message.</param>
+    /// <returns>The rollover counter to compose the packet index with.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The resulting index has already been used for this master key.
+    /// </exception>
+    public uint NextRolloverCounter(ushort sequenceNumber, uint ssrc)
+    {
+        if (!_started)
+        {
+            _started = true;
+            _lastSequence = sequenceNumber;
+            HighestIndex = SrtpPacketIndex.Compose(RolloverCounter, sequenceNumber);
+            return RolloverCounter;
+        }
+
+        // Only a backwards step large enough to be a wrap advances the ROC. A small backwards step is
+        // an out-of-order or duplicate send, which stays in the current rollover period and is caught
+        // by the index check below.
+        if (sequenceNumber < _lastSequence && _lastSequence - sequenceNumber > (1 << 15))
+        {
+            RolloverCounter = unchecked(RolloverCounter + 1);
+        }
+
+        var index = SrtpPacketIndex.Compose(RolloverCounter, sequenceNumber);
+        if (index <= HighestIndex)
+        {
+            throw new InvalidOperationException(
+                $"SRTP packet index {index} for SSRC 0x{ssrc:x8} sequence number {sequenceNumber} has already been "
+                + "used with this master key. Reusing an index repeats the AES-CM keystream and the AES-GCM nonce "
+                + "(RFC 3711 Section 9.1), so the packet is refused rather than protected.");
+        }
+
+        _lastSequence = sequenceNumber;
+        HighestIndex = index;
+        return RolloverCounter;
+    }
+}
+

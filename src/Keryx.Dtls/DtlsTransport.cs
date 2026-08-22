@@ -81,6 +81,21 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
     private bool _certificateRequested;
     private byte[]? _serverKeyExchangePoint;
 
+    // "Have we already handled one of these?" flags. DTLS carries no per-message state machine of
+    // its own — message_seq only orders messages, it does not constrain their type — so every
+    // handshake message that mutates negotiated state has to police its own arity. Without this a
+    // peer (or an injector, for the unencrypted part of the handshake) can re-send a message with a
+    // fresh message_seq and rewrite state that has already been agreed. See RFC 6347 §4.2.4.
+    private bool _sawClientHello;
+    private bool _sawServerHello;
+    private bool _sawPeerCertificate;
+    private bool _sawServerKeyExchange;
+    private bool _sawCertificateRequest;
+    private bool _sawServerHelloDone;
+    private bool _sawClientKeyExchange;
+    private bool _sawCertificateVerify;
+    private bool _sawPeerFinished;
+
     // Record layer state.
     private ushort _writeEpoch;
     private ulong _writeSequenceEpoch0;
@@ -112,6 +127,19 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         ArgumentNullException.ThrowIfNull(lower);
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(config.Certificate);
+
+        // A blank expected fingerprint used to be treated as "no pin" by the certificate check while
+        // still counting as "pinning requested" everywhere else, so the transport demanded a peer
+        // certificate, reported its fingerprint, and completed the handshake without ever comparing
+        // anything — every observable signal said authenticated and nothing was. Config binders that
+        // materialise an absent key as "" make that a very ordinary mistake, so it is refused here
+        // rather than silently honoured. Null still means "no pinning", which is documented.
+        if (config.ExpectedRemoteFingerprintSha256 is { } pin && string.IsNullOrWhiteSpace(pin))
+        {
+            throw new ArgumentException(
+                "ExpectedRemoteFingerprintSha256 must be either null (no pinning) or a real digest; a blank string is not a pin.",
+                nameof(config));
+        }
 
         _lower = lower;
         _config = config;
@@ -444,16 +472,22 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             return;
         }
 
-        if (_replayWindow.IsReplay(record.SequenceNumber))
-        {
-            return;
-        }
-
         var cipher = _readEpoch == 0 ? null : _readCipher;
         if (cipher is null)
         {
-            _replayWindow.Accept(record.SequenceNumber);
+            // Epoch 0 is unauthenticated, so there is nothing the anti-replay window may legitimately
+            // be updated from: RFC 6347 §4.1.2.6 requires the window not to advance until a record is
+            // authenticated. Running it here anyway let one forged 13-byte record with sequence
+            // number 2^48-1 anchor the window at the top of the space and silently drop every genuine
+            // record that followed, wedging the handshake until it timed out. Duplicate suppression at
+            // epoch 0 does not need the window: the reassembler already discards fragments for an
+            // already-consumed message_seq and merges duplicate fragments idempotently.
             DispatchPlaintextLocked(record.Type, record.Fragment);
+            return;
+        }
+
+        if (_replayWindow.IsReplay(record.SequenceNumber))
+        {
             return;
         }
 
@@ -552,9 +586,12 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
         if (_pendingReadCipher is null)
         {
-            throw new DtlsException(
-                "Received ChangeCipherSpec before the session keys were established.",
-                DtlsAlertDescription.UnexpectedMessage);
+            // Either the peer retransmitted its flight (RFC 6347 §4.2.4 requires that to be
+            // tolerated, and with no anti-replay at epoch 0 the duplicate now reaches us) or this is
+            // injected garbage. Both are discards: acting on it would advance the read epoch a second
+            // time with no cipher behind it.
+            _log.Log(KeryxLogLevel.Debug, "Discarding a ChangeCipherSpec with no pending read cipher.");
+            return;
         }
 
         _readCipher?.Dispose();
@@ -603,7 +640,26 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleHandshakeRecordLocked(ReadOnlySpan<byte> plaintext)
     {
-        var progressed = _reassembler.AddRecord(plaintext, out var sawRetransmission);
+        bool progressed;
+        bool sawRetransmission;
+        try
+        {
+            progressed = _reassembler.AddRecord(plaintext, out sawRetransmission);
+        }
+        catch (DtlsException) when (_readEpoch == 0)
+        {
+            // RFC 6347 §4.1.2.7: an invalid record that arrived with no authentication behind it is
+            // discarded, not escalated. Anyone able to put a datagram on the wire could otherwise end
+            // a handshake in progress with a single malformed fragment header.
+            _log.Log(KeryxLogLevel.Warning, "Discarding a malformed unauthenticated DTLS handshake record.");
+            return;
+        }
+        catch (ByteBufferException) when (_readEpoch == 0)
+        {
+            _log.Log(KeryxLogLevel.Warning, "Discarding a truncated unauthenticated DTLS handshake record.");
+            return;
+        }
+
         if (sawRetransmission && !progressed)
         {
             RetransmitFlightIfDueLocked();
@@ -680,6 +736,12 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 break;
 
             case HandshakeType.ServerHelloDone when _role == DtlsRole.Client:
+                if (_sawServerHelloDone)
+                {
+                    throw new DtlsException("A second ServerHelloDone arrived.", DtlsAlertDescription.UnexpectedMessage);
+                }
+
+                _sawServerHelloDone = true;
                 SendClientFlightLocked();
                 break;
 
@@ -734,6 +796,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleServerHelloLocked(byte[] body)
     {
+        if (_sawServerHello)
+        {
+            throw new DtlsException(
+                "A second ServerHello arrived; Keryx does not support renegotiation.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawServerHello = true;
         var hello = HandshakeCodec.ParseServerHello(body);
         if (hello.Version != ProtocolVersions.Dtls12)
         {
@@ -778,6 +848,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleServerKeyExchangeLocked(byte[] body)
     {
+        if (_sawServerKeyExchange)
+        {
+            throw new DtlsException(
+                "A second ServerKeyExchange arrived.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawServerKeyExchange = true;
         var ske = HandshakeCodec.ParseServerKeyExchange(body);
         if (ske.NamedCurve != NamedGroups.Secp256r1)
         {
@@ -808,6 +886,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleCertificateRequestLocked(byte[] body)
     {
+        if (_sawCertificateRequest)
+        {
+            throw new DtlsException(
+                "A second CertificateRequest arrived.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawCertificateRequest = true;
         var request = HandshakeCodec.ParseCertificateRequest(body);
         _certificateRequested = true;
         _localSignatureAlgorithm = ChooseLocalSignatureAlgorithm(request.SignatureAlgorithms);
@@ -870,18 +956,42 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleClientHelloLocked(byte[] body)
     {
+        // RFC 6347 §4.2.4: once the server has committed to a handshake by sending its ServerHello,
+        // a further ClientHello is a renegotiation attempt, which Keryx does not implement. Honouring
+        // it would let anyone who can place a datagram on the ICE-validated path destroy the
+        // in-progress session (fresh server_random and a fresh ECDHE key) and would turn one small
+        // ClientHello into a full certificate flight — a reflected amplification vector. A genuine
+        // retransmission of the client's first flight reuses message_seq 0 and is absorbed by the
+        // reassembler before it ever reaches here, so anything arriving at this point is hostile.
+        if (_sawClientHello)
+        {
+            throw new DtlsException(
+                "A second ClientHello arrived; Keryx does not support renegotiation.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
         if (_state == DtlsTransportState.New)
         {
             SetStateLocked(DtlsTransportState.Connecting);
         }
 
         var hello = HandshakeCodec.ParseClientHello(body);
-        if (hello.Version is not (ProtocolVersions.Dtls12 or ProtocolVersions.Dtls10))
+
+        // DTLS versions are ordered by descending numeric value (DTLS 1.0 = 0xFEFF, 1.2 = 0xFEFD,
+        // 1.3 = 0xFEFC), so "at least DTLS 1.2" is "numerically <= 0xFEFD". RFC 5246 §7.4.1.2 and
+        // RFC 6347 §4.2.1 require a server whose lowest supported version exceeds the offered
+        // client_version to abort with protocol_version rather than answer anyway. Keryx implements
+        // DTLS 1.2 only, so a 1.0 ClientHello is refused here instead of being silently answered
+        // with a 1.2 ServerHello. A client offering a *newer* version negotiates down to 1.2, which
+        // is the behaviour the RFC prescribes.
+        if (hello.Version > ProtocolVersions.Dtls12)
         {
             throw new DtlsException(
-                $"ClientHello offered unsupported version 0x{hello.Version:X4}.",
+                $"ClientHello offered version 0x{hello.Version:X4}; Keryx requires DTLS 1.2 (0x{ProtocolVersions.Dtls12:X4}) or newer.",
                 DtlsAlertDescription.ProtocolVersion);
         }
+
+        _sawClientHello = true;
 
         if (Array.IndexOf(hello.CompressionMethods, (byte)0) < 0)
         {
@@ -967,6 +1077,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             throw new DtlsException("ClientKeyExchange arrived before ServerHello.", DtlsAlertDescription.UnexpectedMessage);
         }
 
+        // A second ClientKeyExchange would re-run the key schedule and swap the pending ciphers out
+        // from under an already-agreed session.
+        if (_sawClientKeyExchange)
+        {
+            throw new DtlsException("A second ClientKeyExchange arrived.", DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawClientKeyExchange = true;
         var point = HandshakeCodec.ParseClientKeyExchange(body);
         var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, point);
         DeriveKeysLocked(preMasterSecret);
@@ -976,6 +1094,20 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandlePeerCertificateLocked(byte[] body)
     {
+        // A second Certificate message would replace RemoteCertificate/RemoteFingerprint while
+        // _peerCertificateVerified still records the *first* certificate's CertificateVerify, so a
+        // peer could complete the handshake proving possession of one key and then have Keryx report
+        // a different certificate to the application. Fingerprint pinning independently blocks that,
+        // but callers that read RemoteFingerprint to make their own trust decision must not be
+        // exposed to it either.
+        if (_sawPeerCertificate)
+        {
+            throw new DtlsException(
+                "A second Certificate message arrived.",
+                DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawPeerCertificate = true;
         var chain = HandshakeCodec.ParseCertificate(body);
         if (chain.Count == 0)
         {
@@ -1006,7 +1138,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         // The WebRTC trust decision: the certificate itself is untrusted (self-signed by design);
         // what must match is the fingerprint carried in the signalling channel.
         var expected = _config.ExpectedRemoteFingerprintSha256;
-        if (!string.IsNullOrWhiteSpace(expected) && !DtlsCertificate.FingerprintsEqual(expected, RemoteFingerprint))
+        if (expected is not null && !DtlsCertificate.FingerprintsEqual(expected, RemoteFingerprint))
         {
             throw new DtlsException(
                 $"The peer certificate fingerprint {RemoteFingerprint} does not match the expected {expected}.",
@@ -1028,6 +1160,13 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
+        if (_sawCertificateVerify)
+        {
+            throw new DtlsException("A second CertificateVerify arrived.", DtlsAlertDescription.UnexpectedMessage);
+        }
+
+        _sawCertificateVerify = true;
+
         var certificate = _peerCertificate
                           ?? throw new DtlsException(
                               "CertificateVerify arrived without a peer certificate.",
@@ -1047,6 +1186,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void HandleFinishedLocked(byte[] body, byte[] transcriptHash)
     {
+        // A second Finished would drive the server through AppendChangeCipherSpecAndFinishedLocked
+        // a second time, advancing the write epoch with no pending cipher behind it and tearing down
+        // an established connection.
+        if (_sawPeerFinished)
+        {
+            throw new DtlsException("A second Finished arrived.", DtlsAlertDescription.UnexpectedMessage);
+        }
+
         if (_masterSecret is null)
         {
             throw new DtlsException("Finished arrived before the master secret was established.", DtlsAlertDescription.UnexpectedMessage);
@@ -1073,6 +1220,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
+        _sawPeerFinished = true;
         var label = _role == DtlsRole.Server ? TlsPrf.ClientFinishedLabel : TlsPrf.ServerFinishedLabel;
         var expected = TlsPrf.VerifyData(_masterSecret, label, transcriptHash);
         if (body.Length != expected.Length || !CryptographicOperations.FixedTimeEquals(body, expected))

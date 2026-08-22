@@ -134,11 +134,16 @@ internal sealed class HandshakeReassembler
 
             if (!_pending.TryGetValue(messageSeq, out var partial))
             {
-                if (_pending.Count >= _maxBufferedMessages)
+                // Never abort on a local buffering limit: it is reachable from wholly unauthenticated
+                // input, so one datagram of empty fragments carrying distinct far-future message_seq
+                // values could otherwise make the next genuine message fatal (RFC 6347 §4.1.2.7 asks
+                // for a discard). Evicting the partial furthest ahead of NextReceiveSeq — rather than
+                // dropping the arrival — is what keeps that flood from starving the in-order message
+                // the handshake is actually waiting on. Anything evicted is recovered by flight
+                // retransmission.
+                if (_pending.Count >= _maxBufferedMessages && !TryEvictFurthestAhead(messageSeq))
                 {
-                    throw new DtlsException(
-                        "Too many out-of-order DTLS handshake messages buffered.",
-                        DtlsAlertDescription.InternalError);
+                    continue;
                 }
 
                 partial = new Partial(type, length);
@@ -151,7 +156,14 @@ internal sealed class HandshakeReassembler
                     DtlsAlertDescription.IllegalParameter);
             }
 
-            partial.Add(fragmentOffset, data);
+            if (!partial.Add(fragmentOffset, data))
+            {
+                // Pathologically fragmented: stop tracking new holes for this message. Contiguous
+                // fragments still merge into the intervals already held, so a legitimate
+                // retransmission continues to fill the gaps and complete the message.
+                continue;
+            }
+
             progressed = true;
         }
 
@@ -174,6 +186,40 @@ internal sealed class HandshakeReassembler
     /// <summary>True when a fragment for <paramref name="messageSeq"/> has been seen.</summary>
     public bool HasPending(ushort messageSeq) => _pending.ContainsKey(messageSeq);
 
+    /// <summary>
+    /// Frees a slot for <paramref name="arriving"/> by discarding the buffered message furthest ahead
+    /// of <see cref="NextReceiveSeq"/>. Returns false when <paramref name="arriving"/> is itself the
+    /// furthest ahead, in which case it is the one that should be dropped.
+    /// </summary>
+    private bool TryEvictFurthestAhead(ushort arriving)
+    {
+        var furthestSeq = arriving;
+        var furthestDistance = Distance(arriving);
+        var found = false;
+
+        foreach (var seq in _pending.Keys)
+        {
+            var distance = Distance(seq);
+            if (distance > furthestDistance)
+            {
+                furthestDistance = distance;
+                furthestSeq = seq;
+                found = true;
+            }
+        }
+
+        if (!found)
+        {
+            return false;
+        }
+
+        _pending.Remove(furthestSeq);
+        return true;
+    }
+
+    /// <summary>How far ahead of <see cref="NextReceiveSeq"/> a message_seq sits, wrapping at 2^16.</summary>
+    private ushort Distance(ushort messageSeq) => unchecked((ushort)(messageSeq - NextReceiveSeq));
+
     private static bool IsBefore(ushort candidate, ushort reference)
     {
         // message_seq wraps at 2^16; treat the nearer half of the space as "in the past".
@@ -183,6 +229,12 @@ internal sealed class HandshakeReassembler
     private sealed class Partial
     {
         private readonly List<(int Start, int End)> _ranges = [];
+
+        /// <summary>
+        /// Largest number of disjoint received-byte intervals tracked for one message before it is
+        /// abandoned. Legitimate fragmenters produce one or two.
+        /// </summary>
+        private const int MaxRanges = 64;
 
         public Partial(HandshakeType type, int length)
         {
@@ -199,7 +251,11 @@ internal sealed class HandshakeReassembler
 
         public bool IsComplete => _ranges.Count == 1 && _ranges[0].Start == 0 && _ranges[0].End == Length;
 
-        public void Add(int offset, ReadOnlySpan<byte> data)
+        /// <summary>
+        /// Adds a fragment. Returns false when the fragment would open yet another hole in a message
+        /// already fragmented past anything legitimate, in which case it is ignored.
+        /// </summary>
+        public bool Add(int offset, ReadOnlySpan<byte> data)
         {
             if (Length == 0)
             {
@@ -209,16 +265,44 @@ internal sealed class HandshakeReassembler
                     _ranges.Add((0, 0));
                 }
 
-                return;
+                return true;
             }
 
             if (data.Length == 0)
             {
-                return;
+                return true;
+            }
+
+            // Merge is linear in the number of disjoint intervals and List.Insert memmoves the tail,
+            // so tracking is quadratic overall. A real fragmenter emits contiguous fragments and
+            // never exceeds one or two intervals; an attacker sending one-byte fragments at every
+            // other offset drives the count to Length/2 and burns that quadratic cost inside the
+            // transport lock, which blocks every other datagram and the retransmit timer with it.
+            // Measured at roughly a second of CPU per 832 KiB of such input. Sixty-four intervals is
+            // far beyond anything legitimate, so past that only fragments that touch an interval
+            // already held are accepted — which is every fragment a real peer sends, since real
+            // fragmenters emit contiguous pieces.
+            if (_ranges.Count >= MaxRanges && !TouchesExistingRange(offset, offset + data.Length))
+            {
+                return false;
             }
 
             data.CopyTo(Buffer.AsSpan(offset));
             Merge(offset, offset + data.Length);
+            return true;
+        }
+
+        private bool TouchesExistingRange(int start, int end)
+        {
+            foreach (var (rangeStart, rangeEnd) in _ranges)
+            {
+                if (rangeStart <= end && start <= rangeEnd)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void Merge(int start, int end)
