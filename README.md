@@ -18,11 +18,14 @@ message.
 > below states exactly what is proven today, including a real-Chrome media interop test — and the
 > [honest scope](#scope-what-is-and-is-not-here) section states what is *not* here.
 
-## Why Keryx exists
+## What it's for
 
-Shipping WebRTC from a .NET server has meant choosing between native wrappers and managed stacks
-whose licenses or API gaps don't fit an Apache-2.0 product. Keryx is Apache-2.0 from the first
-commit, and it turns the workarounds we carried in production into first-class API:
+Real-time media from a .NET server — game streaming, camera and robotics feeds, screen share, any
+low-latency server-to-browser pipeline. Doing that has meant a hard choice: wrap a native library
+(a C/C++ dependency to build, ship and keep patched) or adopt a managed stack whose license or API
+gaps don't fit an Apache-2.0 product. Keryx is a third option — a pure-managed WebRTC stack,
+Apache-2.0 from the first commit, that exposes what a media server actually needs as first-class API
+instead of string-splicing over a lower-level SDK:
 
 - **Typed RTCP feedback.** PLI, FIR, NACK and transport-cc arrive as dedicated events
   (`OnPictureLossIndication`, …), and `a=rtcp-fb` lines are emitted natively per configured codec —
@@ -211,9 +214,6 @@ reporting: [SECURITY.md](SECURITY.md).
 See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: layering is law, zero NuGet
 dependencies in `src/`, warnings are errors, wire parsers never throw on hostile input, and
 protocol claims cite their RFC section.
-
-Repository social preview: upload `docs/assets/social-preview.jpg` in the GitHub repository
-settings (Settings → General → Social preview) — it cannot be set from the repository itself.
 
 ## License
 
