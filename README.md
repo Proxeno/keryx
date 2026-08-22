@@ -8,41 +8,42 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-e8912d)](https://github.com/Proxeno/keryx/blob/main/LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10-e8912d)](https://dotnet.microsoft.com)
 
-**A from-scratch WebRTC stack for .NET.** No native dependencies, no third-party protocol
-libraries: STUN, ICE, SDP, RTP/RTCP, DTLS 1.2, SRTP/SRTCP and SCTP are implemented in this
-repository against the RFCs, with cryptographic primitives supplied exclusively by
-`System.Security.Cryptography`. *Keryx* (κῆρυξ) is the Greek herald — the one who carries the
-message.
+**A from-scratch WebRTC media stack for .NET.** Pure managed C#, zero native dependencies,
+Apache-2.0. Stream real-time audio and video from a .NET server to any WebRTC client — the whole
+protocol suite (ICE, DTLS-SRTP, RTP/RTCP, SCTP) is implemented here, in this repository, against
+the RFCs. *Keryx* (κῆρυξ) is the Greek herald — the one who carries the message.
 
-> **Status: pre-release (0.x).** APIs will change. The [verification status](#verification-status)
-> below states exactly what is proven today, including a real-Chrome media interop test — and the
-> [honest scope](#scope-what-is-and-is-not-here) section states what is *not* here.
+> **Status: pre-release (0.x).** APIs will change. Every capability listed here is backed by a test
+> in this repository — including a real-Chrome media interop test — and the [Scope](#scope) section
+> says plainly what is and isn't here yet.
 
-## What it's for
+## What you can build
 
-Real-time media from a .NET server — game streaming, camera and robotics feeds, screen share, any
-low-latency server-to-browser pipeline. Doing that has meant a hard choice: wrap a native library
-(a C/C++ dependency to build, ship and keep patched) or adopt a managed stack whose license or API
-gaps don't fit an Apache-2.0 product. Keryx is a third option — a pure-managed WebRTC stack,
-Apache-2.0 from the first commit, that exposes what a media server actually needs as first-class API
-instead of string-splicing over a lower-level SDK:
+Keryx is the **sending** side of WebRTC: one .NET process encodes once and streams to browsers and
+native clients over standard WebRTC — no plugin, no gateway, no native runtime on your server. It's
+built for low-latency, server-to-client media, such as:
 
-- **Typed RTCP feedback.** PLI, FIR, NACK and transport-cc arrive as dedicated events
-  (`OnPictureLossIndication`, …), and `a=rtcp-fb` lines are emitted natively per configured codec —
-  no SDP string-splicing between `createOffer` and `setLocalDescription`, no parsing raw RTCP
-  compound packets in application code. H.264 offers `nack`, `nack pli` and `ccm fir` by default.
-- **NACK-driven retransmission that actually retransmits.** Bare `a=rtcp-fb nack` is backed by a
-  real RFC 4588 repair stream: an `rtx` codec, a dedicated SSRC published as `a=ssrc-group:FID`,
-  and a ring of recently sent packets that inbound NACKs are served from — under a per-packet
-  resend rate limit and a bandwidth budget, with counters on `GetStats()`. If the answer drops the
-  `rtx` codec, retransmission is switched off rather than promised and not delivered.
-- **Sender-side link quality.** Reception report blocks the browser sends are folded into
-  `GetStats()` per track: fraction lost, cumulative loss, interarrival jitter and LSR/DLSR
-  round-trip time — the signal a rate controller needs, without parsing RTCP yourself.
-- **A codec-agnostic packetizer seam.** H.264 (packetization-mode=1, STAP-A/FU-A) and Opus ship
-  in-box; community codecs implement one interface (`IRtpPayloadizer`) plus one `SdpCodec` entry.
-- **Strict layering.** Each protocol layer is its own package with no upward dependencies,
-  testable in isolation over in-memory transports — including lossy and reordering ones.
+- **Game & cloud-gaming streaming** — render and encode on a server, play in a browser.
+- **Camera, drone & robotics feeds** — live video and telemetry to an operator's screen.
+- **Screen share & remote desktop** — a headless host streaming its own output.
+- **Interactive media servers** — anything that renders a frame and needs it on a remote display in
+  well under a second.
+
+The far end is ordinary WebRTC, so your client is a plain browser `RTCPeerConnection` and its
+`<video>` element — nothing Keryx-specific to install.
+
+## Goals
+
+- **Pure managed.** 100% C# on .NET 10 — no native library to cross-compile, ship, or keep patched.
+  Cryptography comes only from `System.Security.Cryptography`; ciphers are never hand-rolled.
+- **Genuinely open.** Apache-2.0 from the first commit — embed it in commercial or proprietary
+  products with no copyleft or source-available strings attached.
+- **Faithful to the specs.** Each protocol layer is implemented against its RFC, cites the clause in
+  the source, and has a test behind every claim.
+- **Strictly layered.** Every protocol is its own package with no upward dependencies, testable in
+  isolation over in-memory transports — including lossy and reordering ones.
+- **Honest about maturity.** A 0.x that tells you exactly what is proven, what is experimental, and
+  what is not here.
 
 ## Quickstart: offering H.264 to a browser
 
@@ -74,8 +75,27 @@ var rtt = video?.Quality?.RoundTripTime;              // RFC 3550 LSR/DLSR arith
 var resent = video?.Retransmission?.PacketsRetransmitted;
 ```
 
-That is the whole surface a sendonly media server needs: ICE gathering, DTLS with fingerprint
-pinning, SRTP keying, SCTP data channels and RTCP loops all run behind those calls.
+That single surface runs ICE gathering, DTLS with fingerprint pinning, SRTP keying, SCTP data
+channels and the RTCP loops behind those calls.
+
+## What you get
+
+The parts a real media server needs, exposed as first-class API instead of SDP string-splicing and
+raw RTCP parsing in your application:
+
+- **Typed RTCP feedback.** PLI, FIR, NACK and transport-cc arrive as dedicated events
+  (`OnPictureLossIndication`, …), and `a=rtcp-fb` lines are emitted natively per configured codec.
+  H.264 offers `nack`, `nack pli` and `ccm fir` by default.
+- **NACK-driven retransmission that actually retransmits.** Bare `a=rtcp-fb nack` is backed by a
+  real RFC 4588 repair stream: an `rtx` codec, a dedicated SSRC published as `a=ssrc-group:FID`,
+  and a ring of recently sent packets that inbound NACKs are served from — under a per-packet
+  resend rate limit and a bandwidth budget, with counters on `GetStats()`. If the answer drops the
+  `rtx` codec, retransmission is switched off rather than promised and not delivered.
+- **Sender-side link quality.** The reception-report blocks the browser sends are folded into
+  `GetStats()` per track: fraction lost, cumulative loss, interarrival jitter and LSR/DLSR
+  round-trip time — the signal a rate controller needs, without parsing RTCP yourself.
+- **A codec-agnostic packetizer seam.** H.264 (packetization-mode=1, STAP-A/FU-A) and Opus ship
+  in-box; other codecs implement one interface (`IRtpPayloadizer`) plus one `SdpCodec` entry.
 
 ## Architecture
 
@@ -115,6 +135,9 @@ DTLS records (first byte 20–63) carry SCTP, and SRTP/SRTCP (128–191) carry m
 | `Keryx.Turn` | TURN client: relay allocations, permissions, channel binding (RFC 8656). |
 | `Keryx.Sctp` | SCTP over DTLS, DCEP data channels, partial reliability. |
 
+Packages are published as `Proxeno.Keryx*` on nuget.org; the assemblies and namespaces are
+`Keryx.*` (so `using Keryx;` is what you write). Reference `Proxeno.Keryx` to get everything.
+
 ## Verification status
 
 Every claim is backed by a test in this repository.
@@ -143,7 +166,6 @@ Every claim is backed by a test in this repository.
 - [x] **Soak** — five minutes of 30 fps video across a 5% lossy, reordering link: 31,815 packets,
       1,564 repaired, zero holes, zero history misses, and a managed heap that ends 0.9% *below*
       where it started (`--filter "Category=Soak"`).
-- [x] **Benchmarks** — Keryx's own measured baseline; see below.
 
 885 tests across ten projects (`dotnet test Keryx.slnx`), plus the trait-gated Chrome interop and
 soak suites.
@@ -151,7 +173,7 @@ soak suites.
 ## Benchmarks
 
 BenchmarkDotNet 0.15.8 (default job), Apple M5 Max / macOS 26.6 / .NET 10.0.11 arm64, run
-2026-08-21. Measured, absolute numbers — no marketing rounding.
+2026-08-21. Measured, absolute numbers.
 
 | Benchmark | Keryx | Allocated |
 | --- | ---: | ---: |
@@ -181,14 +203,18 @@ allocate the document they build or parse and are not on the per-packet path.
 | 6347 / 5246 / 5288 / 7627 / 5705 | DTLS 1.2 records, PRF vectors, AES-GCM, EMS, exporter | `Keryx.Dtls.Tests` |
 | 9260 / 3758 / 8831 / 8832 | SCTP, FORWARD-TSN, data channels, DCEP | `Keryx.Sctp.Tests` |
 | 7983 / 5761 | Demux on the bundled transport | `Keryx.Rtp.Tests`, `Keryx.IntegrationTests` |
+| 8656 | TURN allocations, permissions, channel binding | `Keryx.Turn.Tests` |
 
-## Scope: what is and is not here
+## Scope
 
 **Implemented:** the offerer-side media server path end to end — sendonly H.264 + Opus with
 BUNDLE/rtcp-mux, trickle ICE (in and out), DTLS 1.2 both roles with fingerprint pinning, SRTP
 AES-CM and AES-GCM, bidirectional data channels with partial reliability, typed RTCP feedback
 in both directions, RFC 4588 RTX retransmission driven by inbound NACKs, sender-side loss/jitter/RTT
-statistics from reception reports, a minimal recvonly answerer, and a raw RTP receive surface. Recent additions: `a=extmap` with outbound transport-wide-cc (TWCC) sequence numbers; TURN relay-candidate gathering (allocations, permissions, channel binding); and dual-stack IPv6 host / server-reflexive gathering with address-family-correct pairing.
+statistics from reception reports, a minimal recvonly answerer, and a raw RTP receive surface.
+Recent additions: `a=extmap` with outbound transport-wide-cc (TWCC) sequence numbers; TURN
+relay-candidate gathering (allocations, permissions, channel binding); and dual-stack IPv6 host /
+server-reflexive gathering with address-family-correct pairing.
 
 **Experimental (compiles and is tested, but not yet a production path):** a send-side GCC
 bandwidth estimator and pacer (in `Keryx.Rtp`, not yet wired into the send loop), and simulcast
@@ -211,9 +237,9 @@ reporting: [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: layering is law, zero NuGet
-dependencies in `src/`, warnings are errors, wire parsers never throw on hostile input, and
-protocol claims cite their RFC section.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The short version: layering is
+law, zero NuGet dependencies in `src/`, warnings are errors, wire parsers never throw on hostile
+input, and protocol claims cite their RFC section. Sign off commits with `git commit -s` (DCO).
 
 ## License
 
