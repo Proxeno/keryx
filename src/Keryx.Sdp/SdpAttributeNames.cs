@@ -60,6 +60,12 @@ public static class SdpAttributeNames
     /// <summary><c>a=extmap-allow-mixed</c>.</summary>
     public const string ExtMapAllowMixed = "extmap-allow-mixed";
 
+    /// <summary><c>a=rid</c> (RFC 8851).</summary>
+    public const string Rid = "rid";
+
+    /// <summary><c>a=simulcast</c> (RFC 8853).</summary>
+    public const string Simulcast = "simulcast";
+
     /// <summary><c>a=candidate</c>.</summary>
     public const string Candidate = "candidate";
 
