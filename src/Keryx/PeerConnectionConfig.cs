@@ -2,6 +2,7 @@ using System.Net;
 using Keryx.Core;
 using Keryx.Dtls;
 using Keryx.Rtp;
+using Keryx.Rtp.CongestionControl;
 using Keryx.Sdp;
 using Keryx.Turn;
 
@@ -133,6 +134,34 @@ public sealed class PeerConnectionConfig
     /// outbound RTP packet. This is what lets the remote return TWCC feedback. On by default.
     /// </summary>
     public bool EnableTransportWideCc { get; set; } = true;
+
+    /// <summary>
+    /// Enable the send-side Google Congestion Control estimator and its leaky-bucket pacer. When set,
+    /// inbound transport-wide-cc feedback, reception-report loss and REMB drive a
+    /// <see cref="Keryx.Rtp.CongestionControl.GccCongestionController"/> whose target bitrate is
+    /// published through <c>PeerConnection.TargetBitrateChanged</c> and used to pace outbound RTP.
+    /// </summary>
+    /// <remarks>
+    /// Off by default. Enabling it routes every outbound RTP packet through a pacing queue drained on a
+    /// timer, which reshapes send timing and so is opt-in; it also relies on
+    /// <see cref="EnableTransportWideCc"/> being negotiated for the delay-based estimate to receive
+    /// feedback (loss and REMB still apply without it). Leaving it off keeps the immediate,
+    /// unbuffered send path that the loopback and retransmission tests assert against.
+    /// </remarks>
+    public bool EnableCongestionControl { get; set; }
+
+    /// <summary>
+    /// Bitrate clamps and filter tunables for the congestion controller, honoured only when
+    /// <see cref="EnableCongestionControl"/> is set. Defaults track draft-ietf-rmcat-gcc-02.
+    /// </summary>
+    public CongestionControllerOptions CongestionControl { get; set; } = new();
+
+    /// <summary>
+    /// Clock used for congestion-control timing and pacing, so tests can drive an
+    /// <see cref="System.TimeProvider"/> fake instead of the wall clock. Defaults to
+    /// <see cref="System.TimeProvider.System"/>.
+    /// </summary>
+    public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
 
     /// <summary>
     /// Payload type to advertise for the first video codec's <c>rtx</c> entry. Null picks the lowest

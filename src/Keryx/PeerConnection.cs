@@ -4,6 +4,7 @@ using Keryx.Core;
 using Keryx.Dtls;
 using Keryx.Ice;
 using Keryx.Rtp;
+using Keryx.Rtp.CongestionControl;
 using Keryx.Sctp;
 using Keryx.Sdp;
 using Keryx.Srtp;
@@ -39,16 +40,21 @@ namespace Keryx;
 /// under a resend rate limit and a bandwidth budget. If the answer drops the <c>rtx</c> codec,
 /// retransmission is disabled rather than promised and not delivered. Reception report blocks the
 /// peer sends are folded into <see cref="GetStats"/> as loss, jitter and round-trip time.</para>
-/// <para><b>Not implemented.</b> No ULPFEC or RED, no outbound transport-cc, no bandwidth estimation
-/// or pacing, no simulcast, no renegotiation, no ICE restart, no IPv6 relay candidates, no header
-/// extensions (so inbound transport-cc feedback is reported but never solicited by Keryx's own
-/// sequence numbering).</para>
+/// <para><b>Congestion control.</b> Opt-in via
+/// <see cref="PeerConnectionConfig.EnableCongestionControl"/>: inbound transport-wide-cc feedback,
+/// reception-report loss and REMB drive a send-side GCC estimator whose target bitrate paces outbound
+/// RTP and is published through <see cref="TargetBitrateChanged"/> for an encoder to consume. Off by
+/// default, leaving the immediate, unbuffered send path in place.</para>
+/// <para><b>Not implemented.</b> No ULPFEC or RED, no simulcast, no renegotiation, no ICE restart and
+/// no IPv6 relay candidates.</para>
 /// </remarks>
 public sealed partial class PeerConnection : IAsyncDisposable
 {
     private const string ExporterLabel = "EXTRACTOR-dtls_srtp";
 
     private readonly PeerConnectionConfig _config;
+    private readonly TimeProvider _time;
+    private readonly GccCongestionController? _congestionController;
     private readonly IKeryxLogger _logger;
     private readonly DtlsCertificate _certificate;
     private readonly bool _ownsCertificate;
@@ -87,6 +93,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
     {
         _config = config ?? new PeerConnectionConfig();
         _logger = _config.Logger;
+        _time = _config.TimeProvider;
         _certificate = _config.Certificate ?? DtlsCertificate.GenerateSelfSigned();
         _ownsCertificate = _config.Certificate is null;
         _cname = _config.Cname ?? NewIdentifier("keryx");
@@ -97,6 +104,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _videoRtxSsrc = NewSsrc();
         _audioSsrc = NewSsrc();
         _rtcpSenderSsrc = NewSsrc();
+
+        if (_config.EnableCongestionControl)
+        {
+            // The controller is transport-independent: it consumes RTCP feedback and publishes a
+            // target bitrate. It exists from construction so the feedback dispatch and any subscriber
+            // can bind to it before the transport is up. The pacer that consumes its target is built
+            // later, once the send path and its MTU are known (see CreateTrackSenders).
+            _congestionController = new GccCongestionController(_config.CongestionControl, _time);
+            _congestionController.TargetBitrateChanged += OnControllerTargetBitrateChanged;
+        }
     }
 
     /// <summary>Raised whenever <see cref="State"/> changes. Terminal state is <see cref="PeerConnectionState.Closed"/>.</summary>
@@ -128,6 +145,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     /// <summary>Raised for each inbound report carrying reception report blocks (RR, or SR with blocks).</summary>
     public event EventHandler<ReceiverReportEventArgs>? OnReceiverReport;
+
+    /// <summary>
+    /// Raised when the send-side congestion controller's target bitrate moves. An encoder rate
+    /// controller subscribes to this to retune the codec. Never raised unless
+    /// <see cref="PeerConnectionConfig.EnableCongestionControl"/> was set.
+    /// </summary>
+    /// <remarks>Raised on the RTCP receive thread; handlers must be quick and must not block.</remarks>
+    public event EventHandler<TargetBitrateChangedEventArgs>? TargetBitrateChanged;
 
     /// <summary>The connection's lifecycle state.</summary>
     public PeerConnectionState State
@@ -182,6 +207,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     /// <summary>The RTCP canonical name this endpoint publishes.</summary>
     public string Cname => _cname;
+
+    /// <summary>
+    /// The send-side congestion controller, or <see langword="null"/> when
+    /// <see cref="PeerConnectionConfig.EnableCongestionControl"/> was not set. Read
+    /// <see cref="ICongestionController.TargetBitrateBitsPerSecond"/> for the current target, or
+    /// subscribe to <see cref="TargetBitrateChanged"/> to be notified as it moves.
+    /// </summary>
+    public ICongestionController? CongestionController => _congestionController;
 
     /// <summary>The synchronisation source of the outbound video stream.</summary>
     public uint VideoSsrc => _videoSsrc;
@@ -515,6 +548,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
         Interlocked.Read(ref _mediaBeforeReady));
 
     /// <summary>
+    /// Forwards a congestion-controller target change to the pacer and to public subscribers. Runs on
+    /// the RTCP receive thread that drove the feedback.
+    /// </summary>
+    private void OnControllerTargetBitrateChanged(object? sender, TargetBitrateChangedEventArgs e)
+    {
+        _pacedSender?.SetTargetBitrate(e.TargetBitrateBitsPerSecond);
+        TargetBitrateChanged?.Invoke(this, e);
+    }
+
+    /// <summary>
     /// Closes the connection: RTCP <c>BYE</c> for every active stream, SCTP shutdown, DTLS
     /// <c>close_notify</c>, ICE socket close, then <see cref="PeerConnectionState.Closed"/>.
     /// Idempotent; safe to call concurrently with anything else.
@@ -545,6 +588,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         StopRtcpTimer();
+        _pacedSender?.Dispose();
+        if (_congestionController is not null)
+        {
+            _congestionController.TargetBitrateChanged -= OnControllerTargetBitrateChanged;
+        }
+
         TrySendGoodbye();
 
         try
