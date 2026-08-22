@@ -192,6 +192,16 @@ public sealed class SdpOfferBuilder
             media.AddExtMap(extMap);
         }
 
+        foreach (var rid in offer.Rids)
+        {
+            media.AddRid(rid);
+        }
+
+        if (offer.Simulcast is { } simulcast)
+        {
+            media.Simulcast = simulcast;
+        }
+
         if (offer.Direction is { } direction)
         {
             media.AddAttribute(direction.ToAttributeName());
