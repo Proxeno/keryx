@@ -154,6 +154,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <remarks>Raised on the RTCP receive thread; handlers must be quick and must not block.</remarks>
     public event EventHandler<TargetBitrateChangedEventArgs>? TargetBitrateChanged;
 
+    /// <summary>
+    /// Raised for every received RTCP Sender Report, carrying the NTP↔RTP timestamp correspondence for
+    /// the sending SSRC. Supplies the wall-clock mapping a simulcast SFU feeds to
+    /// <c>RtpForwarder.RecordSenderReport</c> to align timestamps across layer switches.
+    /// </summary>
+    public event EventHandler<SenderReportEventArgs>? OnSenderReport;
+
     /// <summary>The connection's lifecycle state.</summary>
     public PeerConnectionState State
     {
@@ -1039,6 +1046,25 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 }
             }
 
+            if (_config.EnableSimulcast
+                && string.Equals(offered.Media, "video", StringComparison.Ordinal)
+                && section.Codecs.Count > 0
+                && section.Port != 0
+                && SdpNegotiator.AnswerSimulcast(offered) is { HasRidExtension: true } simulcast)
+            {
+                foreach (var extMap in simulcast.HeaderExtensions)
+                {
+                    section.HeaderExtensions.Add(extMap);
+                }
+
+                foreach (var rid in simulcast.Rids)
+                {
+                    section.Rids.Add(rid);
+                }
+
+                section.Simulcast = simulcast.Simulcast;
+            }
+
             builder.AddMedia(section);
         }
 
@@ -1130,9 +1156,62 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         Volatile.Write(ref _routes, routes);
+        Volatile.Write(ref _simulcastByMid, BuildSimulcastTrackers(offer));
         _logger.Log(
             KeryxLogLevel.Info,
             $"Applied remote offer; local DTLS role {LocalDtlsRole}, {routes.Count} inbound payload type(s).");
+    }
+
+    private Dictionary<string, SimulcastReceiveTracker> BuildSimulcastTrackers(SessionDescription offer)
+    {
+        var trackers = new Dictionary<string, SimulcastReceiveTracker>(StringComparer.Ordinal);
+        if (!_config.EnableSimulcast)
+        {
+            return trackers;
+        }
+
+        foreach (var media in offer.MediaDescriptions)
+        {
+            if (media.Mid is not { } mid
+                || !string.Equals(media.Media, "video", StringComparison.Ordinal)
+                || SdpNegotiator.AnswerSimulcast(media) is not { HasRidExtension: true } simulcast)
+            {
+                continue;
+            }
+
+            var extensions = ToStreamExtensions(simulcast.HeaderExtensions);
+            trackers[mid] = new SimulcastReceiveTracker(extensions);
+        }
+
+        return trackers;
+    }
+
+    private static Keryx.Rtp.Simulcast.RtpStreamIdentifierExtensions ToStreamExtensions(
+        IReadOnlyList<SdpExtMap> extMaps)
+    {
+        byte mid = 0, rid = 0, repairedRid = 0;
+        foreach (var extMap in extMaps)
+        {
+            if (extMap.Id is < 1 or > 14)
+            {
+                continue;
+            }
+
+            if (string.Equals(extMap.Uri, RtpHeaderExtensionUri.Mid, StringComparison.Ordinal))
+            {
+                mid = (byte)extMap.Id;
+            }
+            else if (string.Equals(extMap.Uri, RtpHeaderExtensionUri.Rid, StringComparison.Ordinal))
+            {
+                rid = (byte)extMap.Id;
+            }
+            else if (string.Equals(extMap.Uri, RtpHeaderExtensionUri.RepairedRid, StringComparison.Ordinal))
+            {
+                repairedRid = (byte)extMap.Id;
+            }
+        }
+
+        return new Keryx.Rtp.Simulcast.RtpStreamIdentifierExtensions(mid, rid, repairedRid);
     }
 
     private void ApplyAnswer(SessionDescription answer)
