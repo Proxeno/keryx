@@ -106,6 +106,133 @@ public static class SdpNegotiator
         return new SdpNegotiationResult(offer, answer, media, answer.GetBundleGroup());
     }
 
+    /// <summary>
+    /// Builds the simulcast parts of an answer to one offered m-section: the <c>a=simulcast</c> line
+    /// with its directions reversed (RFC 8853 §5.2), the <c>a=rid</c> declarations reversed with their
+    /// restrictions kept verbatim, and the RID / repaired-RID / MID <c>a=extmap</c>s echoed from the
+    /// offer. Never throws.
+    /// </summary>
+    /// <param name="offered">The offered m-section.</param>
+    /// <param name="acceptRid">
+    /// A capability predicate deciding whether the answerer keeps an offered RID, by RID id. An
+    /// answerer MAY remove offered RIDs it cannot handle (RFC 8853 §5.2); this is the one
+    /// selection-shaped decision made here and it is a capability decision (codec/resolution support),
+    /// not a per-viewer bandwidth decision. <see langword="null"/> keeps every offered RID.
+    /// </param>
+    /// <returns>
+    /// The simulcast answer parts, or <see langword="null"/> when the section carries no
+    /// <c>a=simulcast</c> line (it is not a simulcast section) or every offered RID was pruned.
+    /// </returns>
+    public static SimulcastAnswer? AnswerSimulcast(MediaDescription offered, Func<string, bool>? acceptRid = null)
+    {
+        ArgumentNullException.ThrowIfNull(offered);
+
+        var offeredSimulcast = offered.Simulcast;
+        if (offeredSimulcast is null)
+        {
+            return null;
+        }
+
+        acceptRid ??= static _ => true;
+
+        // The offered a=rid declarations, indexed by id, so kept RIDs preserve their restrictions and
+        // an alternative referencing an undeclared RID is dropped rather than echoed bare.
+        var offeredRids = new Dictionary<string, SdpRid>(StringComparer.Ordinal);
+        foreach (var rid in offered.GetRids())
+        {
+            offeredRids.TryAdd(rid.Id, rid);
+        }
+
+        bool Keep(string id) => offeredRids.ContainsKey(id) && acceptRid(id);
+
+        // Reverse directions (offered send becomes the answerer's recv, and vice versa) and prune the
+        // RIDs the answerer will not accept from each stream's alternative list.
+        var answerSend = PruneStreams(offeredSimulcast.Recv, Keep);
+        var answerRecv = PruneStreams(offeredSimulcast.Send, Keep);
+        if (answerSend.Count == 0 && answerRecv.Count == 0)
+        {
+            return null;
+        }
+
+        // Echo an a=rid line for every RID that survived, in offered document order, with its direction
+        // reversed and its restrictions carried through untouched.
+        var kept = CollectKeptIds(answerSend, answerRecv);
+        var answerRids = new List<SdpRid>();
+        foreach (var rid in offered.GetRids())
+        {
+            if (kept.Contains(rid.Id) && !answerRids.Exists(r => string.Equals(r.Id, rid.Id, StringComparison.Ordinal)))
+            {
+                var direction = rid.Direction == RidDirection.Send ? RidDirection.Recv : RidDirection.Send;
+                answerRids.Add(new SdpRid(rid.Id, direction, rid.Restrictions));
+            }
+        }
+
+        var extensions = new List<SdpExtMap>();
+        foreach (var extMap in offered.GetExtMaps())
+        {
+            if (IsStreamIdentifierExtension(extMap.Uri))
+            {
+                extensions.Add(new SdpExtMap(extMap.Id, extMap.Uri));
+            }
+        }
+
+        return new SimulcastAnswer(new SdpSimulcast(answerSend, answerRecv), answerRids, extensions);
+    }
+
+    private static IReadOnlyList<SdpSimulcastStream> PruneStreams(
+        IReadOnlyList<SdpSimulcastStream> streams,
+        Func<string, bool> keep)
+    {
+        if (streams.Count == 0)
+        {
+            return Array.Empty<SdpSimulcastStream>();
+        }
+
+        var result = new List<SdpSimulcastStream>();
+        foreach (var stream in streams)
+        {
+            var alternatives = new List<SdpSimulcastAlternative>();
+            foreach (var alternative in stream.Alternatives)
+            {
+                if (keep(alternative.Id))
+                {
+                    alternatives.Add(alternative);
+                }
+            }
+
+            if (alternatives.Count != 0)
+            {
+                result.Add(new SdpSimulcastStream(alternatives));
+            }
+        }
+
+        return result;
+    }
+
+    private static HashSet<string> CollectKeptIds(
+        IReadOnlyList<SdpSimulcastStream> send,
+        IReadOnlyList<SdpSimulcastStream> recv)
+    {
+        var kept = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var streams in new[] { send, recv })
+        {
+            foreach (var stream in streams)
+            {
+                foreach (var alternative in stream.Alternatives)
+                {
+                    kept.Add(alternative.Id);
+                }
+            }
+        }
+
+        return kept;
+    }
+
+    private static bool IsStreamIdentifierExtension(string uri) =>
+        string.Equals(uri, RtpHeaderExtensionUri.Rid, StringComparison.Ordinal)
+        || string.Equals(uri, RtpHeaderExtensionUri.RepairedRid, StringComparison.Ordinal)
+        || string.Equals(uri, RtpHeaderExtensionUri.Mid, StringComparison.Ordinal);
+
     private static NegotiatedMedia Interpret(
         int index,
         MediaDescription offered,
