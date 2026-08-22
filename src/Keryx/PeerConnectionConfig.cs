@@ -135,6 +135,15 @@ public sealed class PeerConnectionConfig
     public bool EnableTransportWideCc { get; set; } = true;
 
     /// <summary>
+    /// When answering an offer whose video m-section is simulcast (RFC 8853), echo the
+    /// <c>a=simulcast</c> line with its directions reversed, keep the <c>a=rid</c> declarations the
+    /// answerer accepts, and negotiate the RID / repaired-RID / MID header extensions so each incoming
+    /// packet's simulcast layer can be resolved. The answerer receives every offered layer; layer
+    /// selection and fan-out remain an application concern. On by default.
+    /// </summary>
+    public bool EnableSimulcast { get; set; } = true;
+
+    /// <summary>
     /// Payload type to advertise for the first video codec's <c>rtx</c> entry. Null picks the lowest
     /// unused dynamic payload type, which is what browsers do.
     /// </summary>

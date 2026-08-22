@@ -38,6 +38,13 @@ public sealed class RtpForwarder
 {
     private readonly uint _outboundSsrc;
     private readonly byte? _outboundPayloadType;
+    private readonly uint _clockRate;
+    private readonly RtpEgressExtensions? _egress;
+    private readonly byte[]? _outboundMid;
+    private readonly byte[]? _extScratch;
+
+    private readonly object _srLock = new();
+    private readonly Dictionary<SimulcastLayerId, SenderReportMapping> _senderReports = new();
 
     private SimulcastLayerId _desiredLayer;
     private SimulcastLayerId _activeLayer;
@@ -48,16 +55,62 @@ public sealed class RtpForwarder
     private int _seqOffset;
     private uint _tsOffset;
     private bool _segmentInitialized;
+    private uint _lastInTs;
+    private uint _lastOutTs;
+
+    /// <summary>One layer's RTCP sender-report correspondence between NTP wall-clock and RTP timestamp.</summary>
+    private readonly record struct SenderReportMapping(ulong NtpTimestamp, uint RtpTimestamp);
 
     /// <summary>Creates a forwarder that emits one subscriber's outbound stream.</summary>
     /// <param name="outboundSsrc">The stable SSRC every forwarded packet is rewritten to carry.</param>
     /// <param name="outboundPayloadType">
     /// The payload type to stamp on egress, or <see langword="null"/> to keep each packet's own type.
     /// </param>
-    public RtpForwarder(uint outboundSsrc, byte? outboundPayloadType = null)
+    /// <param name="clockRate">
+    /// The RTP timestamp clock rate (90000 for video), used to convert the RTCP sender-report
+    /// wall-clock mapping to RTP ticks when aligning timestamps across a layer switch.
+    /// </param>
+    /// <param name="egressExtensions">
+    /// How to rewrite RFC 8285 header extensions on egress — strip the ingest RID/repaired-RID
+    /// elements and rewrite MID to the subscriber's value. <see langword="null"/> re-emits the header
+    /// extensions as received.
+    /// </param>
+    public RtpForwarder(
+        uint outboundSsrc,
+        byte? outboundPayloadType = null,
+        uint clockRate = 90000,
+        RtpEgressExtensions? egressExtensions = null)
     {
         _outboundSsrc = outboundSsrc;
         _outboundPayloadType = outboundPayloadType;
+        _clockRate = clockRate == 0 ? 90000 : clockRate;
+        if (egressExtensions is { RewritesAnything: true })
+        {
+            _egress = egressExtensions;
+            _outboundMid = egressExtensions.OutboundMid is { Length: > 0 } mid
+                ? System.Text.Encoding.ASCII.GetBytes(mid)
+                : null;
+
+            // One RTP header extension block is bounded by the 16-bit word-count field; a subscriber's
+            // rewritten block is smaller than the ingest one, so a modest scratch buffer suffices.
+            _extScratch = new byte[512];
+        }
+    }
+
+    /// <summary>
+    /// Records the RTCP sender-report NTP↔RTP correspondence for one layer, so a later switch to or
+    /// from that layer can align the outbound timestamp to real time. Safe to call from the RTCP
+    /// receive path while forwarding proceeds on the send path. Never throws.
+    /// </summary>
+    /// <param name="layerId">The layer the sender report describes.</param>
+    /// <param name="ntpTimestamp">The 64-bit NTP wall-clock from the sender report.</param>
+    /// <param name="rtpTimestamp">The RTP timestamp corresponding to <paramref name="ntpTimestamp"/>.</param>
+    public void RecordSenderReport(SimulcastLayerId layerId, ulong ntpTimestamp, uint rtpTimestamp)
+    {
+        lock (_srLock)
+        {
+            _senderReports[layerId] = new SenderReportMapping(ntpTimestamp, rtpTimestamp);
+        }
     }
 
     /// <summary>The SSRC every forwarded packet carries.</summary>
@@ -115,6 +168,7 @@ public sealed class RtpForwarder
             return RtpForwardResult.Dropped;
         }
 
+        var previousLayer = _activeLayer;
         var isDesired = _desiredLayer == classification.LayerId;
         var isActive = _hasActiveLayer && _activeLayer == classification.LayerId;
 
@@ -135,7 +189,7 @@ public sealed class RtpForwarder
 
         if (!_segmentInitialized)
         {
-            InitializeSegment(header);
+            InitializeSegment(header, previousLayer, classification.LayerId);
         }
 
         var outSeq = unchecked((ushort)(header.SequenceNumber + _seqOffset));
@@ -150,9 +204,12 @@ public sealed class RtpForwarder
             rewritten.PayloadType = pt;
         }
 
-        // TODO(EWI-1250 forwarding PR): strip the RID/repaired-RID header extensions on egress and, for
-        // BUNDLE, rewrite the MID extension to the subscriber's negotiated MID. For now the header is
-        // re-emitted as received apart from the three rewritten identifiers.
+        // Strip the ingest-only RID/repaired-RID extensions and rewrite MID to the subscriber's value.
+        if (_egress is not null)
+        {
+            RewriteEgressExtensions(ref rewritten, in header);
+        }
+
         var headerLength = rewritten.HeaderLength;
         if (destination.Length < headerLength + payload.Length)
         {
@@ -170,13 +227,16 @@ public sealed class RtpForwarder
         if (!_started || IsNewer(outSeq, _highestOutSeq))
         {
             _highestOutSeq = outSeq;
-            _started = true;
         }
+
+        _started = true;
+        _lastInTs = header.Timestamp;
+        _lastOutTs = outTs;
 
         return RtpForwardResult.Forwarded;
     }
 
-    private void InitializeSegment(in RtpHeader header)
+    private void InitializeSegment(in RtpHeader header, SimulcastLayerId previousLayer, SimulcastLayerId newLayer)
     {
         if (!_started)
         {
@@ -189,14 +249,112 @@ public sealed class RtpForwarder
             // A switch mid-stream: continue one past the highest sequence number already emitted.
             _seqOffset = unchecked((ushort)(_highestOutSeq + 1) - header.SequenceNumber);
 
-            // TODO(EWI-1250 forwarding PR): align the timestamp across layers. Simulcast encodings of
-            // one source share a capture clock but carry independent random RTP offsets, so a correct
-            // switch computes _tsOffset from the wall-clock/RTCP-SR mapping of both layers. The baseline
-            // leaves _tsOffset unchanged, which is adequate for a proof of concept but not for
-            // lip-sync-accurate switching.
+            // Align the timestamp across layers. Simulcast encodings of one source share a capture
+            // clock but carry independent random RTP offsets, so the outbound timestamp for the switch
+            // packet is placed on a timeline that advances from the last emitted packet by the real
+            // (wall-clock) time between the two, read from each layer's RTCP sender report. Without a
+            // sender report for either layer, fall back to a single-tick advance so egress stays
+            // strictly monotonic even if not lip-sync accurate.
+            var desiredOutTs = ComputeSwitchTimestamp(header.Timestamp, previousLayer, newLayer);
+            _tsOffset = unchecked(desiredOutTs - header.Timestamp);
         }
 
         _segmentInitialized = true;
+    }
+
+    private uint ComputeSwitchTimestamp(uint newInTs, SimulcastLayerId previousLayer, SimulcastLayerId newLayer)
+    {
+        if (TryGetSenderReport(previousLayer, out var previous) && TryGetSenderReport(newLayer, out var next))
+        {
+            var previousWall = WallClockSeconds(previous, _lastInTs);
+            var newWall = WallClockSeconds(next, newInTs);
+            var deltaTicks = (long)Math.Round((newWall - previousWall) * _clockRate);
+            if (deltaTicks < 1)
+            {
+                // The new layer's wall-clock is at or behind the last emitted packet's; still advance so
+                // the outbound timeline never stalls or runs backwards.
+                deltaTicks = 1;
+            }
+
+            return unchecked(_lastOutTs + (uint)deltaTicks);
+        }
+
+        return unchecked(_lastOutTs + 1);
+    }
+
+    private bool TryGetSenderReport(SimulcastLayerId layerId, out SenderReportMapping mapping)
+    {
+        lock (_srLock)
+        {
+            return _senderReports.TryGetValue(layerId, out mapping);
+        }
+    }
+
+    private double WallClockSeconds(SenderReportMapping mapping, uint rtpTimestamp)
+    {
+        // The RTP delta from the sender-report reference wraps at 32 bits; a signed reading spans a
+        // window of roughly ±6.6 hours at 90 kHz around the report, far wider than any switch gap.
+        var rtpDelta = unchecked((int)(rtpTimestamp - mapping.RtpTimestamp));
+        return NtpToSeconds(mapping.NtpTimestamp) + (rtpDelta / (double)_clockRate);
+    }
+
+    private static double NtpToSeconds(ulong ntpTimestamp) =>
+        (ntpTimestamp >> 32) + ((ntpTimestamp & 0xFFFFFFFF) / 4294967296.0);
+
+    private void RewriteEgressExtensions(ref RtpHeader rewritten, in RtpHeader source)
+    {
+        var egress = _egress!;
+        var writer = new RtpOneByteExtensionWriter(_extScratch);
+        var midWritten = false;
+
+        if (source.HasExtension && source.ExtensionProfile == RtpHeaderExtension.OneByteProfile)
+        {
+            foreach (var element in source.GetExtensionElements())
+            {
+                if (egress.RidElementId is >= 1 and <= 14 && element.Id == egress.RidElementId)
+                {
+                    continue;
+                }
+
+                if (egress.RepairedRidElementId is >= 1 and <= 14 && element.Id == egress.RepairedRidElementId)
+                {
+                    continue;
+                }
+
+                if (egress.MidElementId is >= 1 and <= 14 && element.Id == egress.MidElementId)
+                {
+                    // Replace the ingest MID with the subscriber's; drop it when no outbound MID is set.
+                    if (_outboundMid is not null)
+                    {
+                        writer.TryAppend(egress.MidElementId, _outboundMid);
+                        midWritten = true;
+                    }
+
+                    continue;
+                }
+
+                writer.TryAppend(element.Id, element.Data);
+            }
+        }
+
+        // Add the subscriber MID when the source carried none but one must be present (RFC 8843).
+        if (!midWritten && egress.MidElementId is >= 1 and <= 14 && _outboundMid is not null)
+        {
+            writer.TryAppend(egress.MidElementId, _outboundMid);
+        }
+
+        var length = writer.Finish();
+        if (length == 0)
+        {
+            rewritten.HasExtension = false;
+            rewritten.ExtensionData = default;
+        }
+        else
+        {
+            rewritten.HasExtension = true;
+            rewritten.ExtensionProfile = RtpHeaderExtension.OneByteProfile;
+            rewritten.ExtensionData = _extScratch.AsSpan(0, length);
+        }
     }
 
     private static bool IsNewer(ushort candidate, ushort reference) =>

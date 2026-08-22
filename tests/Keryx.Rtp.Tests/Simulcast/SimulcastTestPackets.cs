@@ -18,6 +18,15 @@ internal static class SimulcastTestPackets
     public static byte[] Plain(uint ssrc, ushort seq, uint ts, byte payloadType = 96, byte[]? payload = null) =>
         Build(ssrc, seq, ts, payloadType, payload);
 
+    public static byte[] WithExtensions(
+        uint ssrc,
+        ushort seq,
+        uint ts,
+        byte payloadType,
+        byte[]? payload,
+        params (byte Id, string Value)[] extensions) =>
+        Build(ssrc, seq, ts, payloadType, payload, extensions);
+
     private static byte[] Build(
         uint ssrc,
         ushort seq,
