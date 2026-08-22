@@ -1,3 +1,7 @@
+using System.Buffers.Binary;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Keryx.Core;
 
 namespace Keryx.Rtp;
@@ -15,6 +19,12 @@ namespace Keryx.Rtp;
 /// </para>
 /// <para>
 /// Parsing never throws for malformed input: <see cref="TryParse"/> returns <see langword="false"/>.
+/// </para>
+/// <para>
+/// Serialization and parsing both take a straight-line fast path for the common shape — no CSRC list
+/// and no header extension — that moves the twelve fixed bytes as one 64-bit plus one 32-bit
+/// big-endian word behind a single length check. CSRC lists and extensions run through a separate
+/// cold path; the observable behaviour of the public methods is identical either way.
 /// </para>
 /// </remarks>
 public ref struct RtpHeader
@@ -77,6 +87,28 @@ public ref struct RtpHeader
     public readonly int HeaderLength =>
         FixedLength + CsrcData.Length + (HasExtension ? 4 + ExtensionData.Length : 0);
 
+    /// <summary>
+    /// True for the common header shape — no CSRC list, no header extension — which is exactly
+    /// <see cref="FixedLength"/> bytes on the wire and cannot fail <see cref="Validate"/>.
+    /// </summary>
+    private readonly bool IsFixedOnly => CsrcData.IsEmpty && !HasExtension;
+
+    /// <summary>The first header octet: version, P, X and CC.</summary>
+    private readonly byte FirstByte => (byte)(
+        FixedOnlyFirstByte
+        | (HasExtension ? 0x10 : 0)
+        | CsrcCount);
+
+    /// <summary>
+    /// The first header octet for a header with no CSRC list and no extension, so the X and CC fields
+    /// are known to be zero and the CSRC-count division drops out.
+    /// </summary>
+    private readonly byte FixedOnlyFirstByte => (byte)(
+        ((Version == 0 ? SupportedVersion : Version) << 6) | (HasPadding ? 0x20 : 0));
+
+    /// <summary>The second header octet: M and PT.</summary>
+    private readonly byte SecondByte => (byte)((Marker ? 0x80 : 0) | (PayloadType & 0x7F));
+
     /// <summary>Reads the contributing source identifier at <paramref name="index"/>.</summary>
     /// <param name="index">Zero-based index into the CSRC list.</param>
     /// <returns>The CSRC value.</returns>
@@ -131,6 +163,7 @@ public ref struct RtpHeader
     /// <see cref="SupportedVersion"/>, or the CSRC list or declared extension length runs past the end
     /// of the buffer.
     /// </returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryParse(ReadOnlySpan<byte> buffer, out RtpHeader header)
     {
         header = default;
@@ -140,50 +173,98 @@ public ref struct RtpHeader
             return false;
         }
 
-        var first = buffer[0];
-        var version = (byte)(first >> 6);
-        if (version != SupportedVersion)
+        // The single length check above covers both reads: bytes 0-7 carry V/P/X/CC, M/PT, the
+        // sequence number and the timestamp; bytes 8-11 carry the SSRC.
+        ref var start = ref MemoryMarshal.GetReference(buffer);
+        var word = Unsafe.ReadUnaligned<ulong>(ref start);
+        var ssrc = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref start, 8));
+        if (BitConverter.IsLittleEndian)
+        {
+            word = BinaryPrimitives.ReverseEndianness(word);
+            ssrc = BinaryPrimitives.ReverseEndianness(ssrc);
+        }
+
+        var first = (byte)(word >> 56);
+        if ((first & 0xC0) != SupportedVersion << 6)
         {
             return false;
         }
 
-        var csrcCount = first & 0x0F;
-        var csrcBytes = csrcCount * 4;
-        if (buffer.Length < FixedLength + csrcBytes)
-        {
-            return false;
-        }
-
+        var second = (byte)(word >> 48);
+        var csrcBytes = (first & 0x0F) * 4;
         var hasExtension = (first & 0x10) != 0;
-        var second = buffer[1];
 
-        var reader = new ByteReader(buffer);
-        try
+        header.Version = SupportedVersion;
+        header.HasPadding = (first & 0x20) != 0;
+        header.HasExtension = hasExtension;
+        header.Marker = (second & 0x80) != 0;
+        header.PayloadType = (byte)(second & 0x7F);
+        header.SequenceNumber = (ushort)(word >> 32);
+        header.Timestamp = (uint)word;
+        header.Ssrc = ssrc;
+
+        if (csrcBytes == 0 && !hasExtension)
         {
-            reader.Skip(2);
-            header.Version = version;
-            header.HasPadding = (first & 0x20) != 0;
-            header.HasExtension = hasExtension;
-            header.Marker = (second & 0x80) != 0;
-            header.PayloadType = (byte)(second & 0x7F);
-            header.SequenceNumber = reader.ReadU16();
-            header.Timestamp = reader.ReadU32();
-            header.Ssrc = reader.ReadU32();
-            header.CsrcData = reader.ReadBytes(csrcBytes);
-
-            if (hasExtension)
-            {
-                header.ExtensionProfile = reader.ReadU16();
-                var wordCount = reader.ReadU16();
-                header.ExtensionData = reader.ReadBytes(wordCount * 4);
-            }
+            return true;
         }
-        catch (ByteBufferException)
+
+        if (!TryParseTail(buffer, csrcBytes, hasExtension, out var csrcData, out var profile, out var extensionData))
         {
             header = default;
             return false;
         }
 
+        header.CsrcData = csrcData;
+        header.ExtensionProfile = profile;
+        header.ExtensionData = extensionData;
+        return true;
+    }
+
+    /// <summary>
+    /// Parses the CSRC list and header extension that follow the fixed header. Cold path: reached only
+    /// when the CC field is non-zero or the X bit is set.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryParseTail(
+        ReadOnlySpan<byte> buffer,
+        int csrcBytes,
+        bool hasExtension,
+        out ReadOnlySpan<byte> csrcData,
+        out ushort extensionProfile,
+        out ReadOnlySpan<byte> extensionData)
+    {
+        csrcData = default;
+        extensionProfile = 0;
+        extensionData = default;
+
+        if (buffer.Length < FixedLength + csrcBytes)
+        {
+            return false;
+        }
+
+        csrcData = buffer.Slice(FixedLength, csrcBytes);
+
+        if (!hasExtension)
+        {
+            return true;
+        }
+
+        var offset = FixedLength + csrcBytes;
+        if (buffer.Length - offset < 4)
+        {
+            return false;
+        }
+
+        extensionProfile = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(offset, 2));
+        var bodyLength = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(offset + 2, 2)) * 4;
+        offset += 4;
+
+        if (buffer.Length - offset < bodyLength)
+        {
+            return false;
+        }
+
+        extensionData = buffer.Slice(offset, bodyLength);
         return true;
     }
 
@@ -194,16 +275,21 @@ public ref struct RtpHeader
     /// <returns>The number of bytes written, equal to <see cref="HeaderLength"/>.</returns>
     /// <exception cref="ByteBufferException">The destination is too small.</exception>
     /// <exception cref="InvalidOperationException">The CSRC list or extension body has an invalid length.</exception>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly int WriteTo(Span<byte> destination)
     {
-        Validate();
-        if (destination.Length < HeaderLength)
+        if (IsFixedOnly)
         {
-            throw new ByteBufferException(
-                $"RTP header needs {HeaderLength} byte(s) but the destination holds {destination.Length}.");
+            if (destination.Length < FixedLength)
+            {
+                ThrowDestinationTooSmall(FixedLength, destination.Length);
+            }
+
+            WriteFixed(destination, FixedOnlyFirstByte);
+            return FixedLength;
         }
 
-        return WriteCore(destination);
+        return WriteToSlow(destination);
     }
 
     /// <summary>
@@ -213,7 +299,64 @@ public ref struct RtpHeader
     /// <param name="bytesWritten">On success, the number of bytes written.</param>
     /// <returns><see langword="false"/> when the destination is too small.</returns>
     /// <exception cref="InvalidOperationException">The CSRC list or extension body has an invalid length.</exception>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public readonly bool TryWriteTo(Span<byte> destination, out int bytesWritten)
+    {
+        if (IsFixedOnly)
+        {
+            if (destination.Length < FixedLength)
+            {
+                bytesWritten = 0;
+                return false;
+            }
+
+            WriteFixed(destination, FixedOnlyFirstByte);
+            bytesWritten = FixedLength;
+            return true;
+        }
+
+        return TryWriteToSlow(destination, out bytesWritten);
+    }
+
+    /// <summary>
+    /// Writes the twelve fixed header bytes. The caller must already have checked that
+    /// <paramref name="destination"/> holds at least <see cref="FixedLength"/> bytes.
+    /// </summary>
+    private readonly void WriteFixed(Span<byte> destination, byte firstByte)
+    {
+        var word = ((ulong)firstByte << 56)
+            | ((ulong)SecondByte << 48)
+            | ((ulong)SequenceNumber << 32)
+            | Timestamp;
+        var ssrc = Ssrc;
+        if (BitConverter.IsLittleEndian)
+        {
+            word = BinaryPrimitives.ReverseEndianness(word);
+            ssrc = BinaryPrimitives.ReverseEndianness(ssrc);
+        }
+
+        ref var start = ref MemoryMarshal.GetReference(destination);
+        Unsafe.WriteUnaligned(ref start, word);
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref start, 8), ssrc);
+    }
+
+    /// <summary>Cold serialization path: headers carrying a CSRC list or a header extension.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private readonly int WriteToSlow(Span<byte> destination)
+    {
+        Validate();
+        var length = HeaderLength;
+        if (destination.Length < length)
+        {
+            ThrowDestinationTooSmall(length, destination.Length);
+        }
+
+        return WriteCore(destination);
+    }
+
+    /// <summary>Cold non-throwing serialization path: headers carrying a CSRC list or a header extension.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private readonly bool TryWriteToSlow(Span<byte> destination, out int bytesWritten)
     {
         Validate();
         if (destination.Length < HeaderLength)
@@ -228,17 +371,8 @@ public ref struct RtpHeader
 
     private readonly int WriteCore(Span<byte> destination)
     {
-        var writer = new ByteWriter(destination);
-        var version = Version == 0 ? SupportedVersion : Version;
-        var first = (byte)((version << 6)
-            | (HasPadding ? 0x20 : 0)
-            | (HasExtension ? 0x10 : 0)
-            | CsrcCount);
-        writer.WriteU8(first);
-        writer.WriteU8((byte)((Marker ? 0x80 : 0) | (PayloadType & 0x7F)));
-        writer.WriteU16(SequenceNumber);
-        writer.WriteU32(Timestamp);
-        writer.WriteU32(Ssrc);
+        WriteFixed(destination, FirstByte);
+        var writer = new ByteWriter(destination[FixedLength..]);
         writer.WriteBytes(CsrcData);
 
         if (HasExtension)
@@ -248,7 +382,7 @@ public ref struct RtpHeader
             writer.WriteBytes(ExtensionData);
         }
 
-        return writer.Position;
+        return FixedLength + writer.Position;
     }
 
     private readonly void Validate()
@@ -276,4 +410,9 @@ public ref struct RtpHeader
             }
         }
     }
+
+    [DoesNotReturn]
+    private static void ThrowDestinationTooSmall(int required, int available) =>
+        throw new ByteBufferException(
+            $"RTP header needs {required} byte(s) but the destination holds {available}.");
 }

@@ -24,6 +24,22 @@ public sealed record NegotiatedCodec(
     /// <summary>Clock rate from <see cref="RtpMap"/>.</summary>
     public int ClockRate => RtpMap.ClockRate;
 
+    /// <summary>True when this is an RFC 4588 retransmission codec (<c>a=rtpmap:&lt;pt&gt; rtx/…</c>).</summary>
+    public bool IsRtx => Is(SdpCodec.RtxEncodingName);
+
+    /// <summary>
+    /// The payload type this entry repairs, read from the <c>apt</c> fmtp parameter (RFC 4588 §8.1).
+    /// </summary>
+    /// <returns>The associated payload type, or <see langword="null"/> when there is no usable <c>apt</c>.</returns>
+    public int? GetAssociatedPayloadType() =>
+        int.TryParse(
+            FmtpParameters.GetValue(Fmtp, SdpCodec.AssociatedPayloadTypeParameter),
+            System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var apt)
+            ? apt
+            : null;
+
     /// <summary>The fmtp string split on <c>;</c> into key/value pairs.</summary>
     /// <returns>An ordinal lookup; empty when there is no fmtp.</returns>
     public IReadOnlyDictionary<string, string> GetFmtpParameters() => FmtpParameters.Parse(Fmtp);

@@ -45,8 +45,12 @@ public sealed partial class PeerConnection
     private long _pliCount;
     private long _firCount;
     private long _nackCount;
+    private long _videoNackCount;
     private long _twccCount;
     private long _receiverReportCount;
+
+    private volatile OutboundStreamQuality? _videoQuality;
+    private volatile OutboundStreamQuality? _audioQuality;
 
     /// <summary>
     /// Packetizes one H.264 access unit and sends it over SRTP.
@@ -115,6 +119,13 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>
+    /// The <c>rtx</c> payload type the answer settled on for video, or <see langword="null"/> when the
+    /// peer kept no RFC 4588 repair codec and retransmission is therefore disabled.
+    /// </summary>
+    /// <remarks>Meaningful once a remote answer has been applied.</remarks>
+    public byte? NegotiatedVideoRtxPayloadType => _negotiatedVideo?.RtxPayloadType;
+
+    /// <summary>
     /// Sends a Picture Loss Indication asking the peer for a fresh key frame, as a compound
     /// <c>RR + PLI</c> over SRTCP.
     /// </summary>
@@ -125,6 +136,33 @@ public sealed partial class PeerConnection
         var report = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
         var pli = new RtcpPictureLossIndication(_rtcpSenderSsrc, mediaSsrc);
         return SendRtcpCompound([report, pli]);
+    }
+
+    /// <summary>
+    /// Asks the peer to retransmit RTP packets it failed to deliver, as a compound
+    /// <c>RR + Generic NACK</c> over SRTCP (RFC 4585 §6.2.1).
+    /// </summary>
+    /// <param name="mediaSsrc">The SSRC of the inbound stream the packets are missing from.</param>
+    /// <param name="sequenceNumbers">
+    /// The missing sequence numbers. They are sorted and packed greedily into PID/BLP entries, each of
+    /// which covers a packet identifier and the sixteen sequence numbers that follow it.
+    /// </param>
+    /// <returns>
+    /// True when the feedback was protected and sent; false when the transport is not ready or the
+    /// list is empty.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="sequenceNumbers"/> is null.</exception>
+    public bool SendNack(uint mediaSsrc, IEnumerable<ushort> sequenceNumbers)
+    {
+        ArgumentNullException.ThrowIfNull(sequenceNumbers);
+        var nack = new RtcpGenericNack(_rtcpSenderSsrc, mediaSsrc, sequenceNumbers);
+        if (nack.Entries.Count == 0)
+        {
+            return false;
+        }
+
+        var report = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
+        return SendRtcpCompound([report, nack]);
     }
 
     /// <summary>
@@ -146,28 +184,49 @@ public sealed partial class PeerConnection
     {
         var track = _videoTrack;
         var dropped = Interlocked.Read(ref _videoFramesDropped);
+        var quality = _videoQuality;
         if (track is not null)
         {
-            return track.GetStats(dropped);
+            return track.GetStats(dropped, quality, RetransmissionStatsFor(track));
         }
 
-        return dropped == 0
+        return dropped == 0 && quality is null
             ? null
-            : new MediaTrackStats(MediaKind.Video, _config.VideoMid, _videoSsrc, 0, 0, 0, 0, dropped);
+            : new MediaTrackStats(MediaKind.Video, _config.VideoMid, _videoSsrc, 0, 0, 0, 0, dropped, quality);
     }
 
     private MediaTrackStats? AudioStats()
     {
         var track = _audioTrack;
         var dropped = Interlocked.Read(ref _audioFramesDropped);
+        var quality = _audioQuality;
         if (track is not null)
         {
-            return track.GetStats(dropped);
+            return track.GetStats(dropped, quality, null);
         }
 
-        return dropped == 0
+        return dropped == 0 && quality is null
             ? null
-            : new MediaTrackStats(MediaKind.Audio, _config.AudioMid, _audioSsrc, 0, 0, 0, 0, dropped);
+            : new MediaTrackStats(MediaKind.Audio, _config.AudioMid, _audioSsrc, 0, 0, 0, 0, dropped, quality);
+    }
+
+    private RetransmissionStats? RetransmissionStatsFor(TrackSender track)
+    {
+        if (track.Retransmitter is not { } rtx)
+        {
+            return null;
+        }
+
+        var counters = rtx.GetStats();
+        return new RetransmissionStats(
+            counters.Ssrc,
+            counters.PayloadType,
+            Interlocked.Read(ref _videoNackCount),
+            counters.RequestedPackets,
+            counters.PacketsRetransmitted,
+            counters.BytesRetransmitted,
+            counters.HistoryMisses,
+            counters.Suppressed);
     }
 
     private void StartDriver()
@@ -353,7 +412,7 @@ public sealed partial class PeerConnection
 
     private void CreateTrackSenders(IceAgent ice, SrtpProfile profile)
     {
-        var datagram = Math.Min(_config.Mtu, ice.Transport.MaxDatagramSize);
+        var datagram = Math.Min(_config.Mtu, (_transport ?? ice.Transport).MaxDatagramSize);
         var maxPayload = datagram - RtpHeader.FixedLength - profile.RtpOverhead;
         if (maxPayload < 64)
         {
@@ -363,14 +422,40 @@ public sealed partial class PeerConnection
 
         if (_negotiatedVideo is { } video)
         {
+            var videoMaxPayload = maxPayload;
+            RtxRetransmitter? rtx = null;
+
+            if (_config.EnableRetransmission && video.RtxPayloadType is { } rtxPayloadType)
+            {
+                // An RTX packet is the original packet plus the two-octet OSN (RFC 4588 §4), so the
+                // media stream gives those two bytes back to keep repairs inside the same MTU.
+                videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
+                var history = new RtpSendHistory(
+                    RtpHeader.FixedLength + videoMaxPayload,
+                    _config.RetransmissionHistory);
+                rtx = new RtxRetransmitter(
+                    _videoRtxSsrc,
+                    rtxPayloadType,
+                    video.ClockRate,
+                    history,
+                    _config.Retransmission,
+                    logger: _logger);
+
+                _logger.Log(
+                    KeryxLogLevel.Info,
+                    $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{_videoRtxSsrc:x8}, "
+                    + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
+            }
+
             _videoTrack = new TrackSender(
                 this,
                 video.Mid,
                 MediaKind.Video,
                 new RtpStreamSender(_videoSsrc, video.PayloadType, video.ClockRate, logger: _logger),
                 new H264Packetizer(),
-                maxPayload,
-                profile.RtpOverhead);
+                videoMaxPayload,
+                profile.RtpOverhead,
+                rtx);
         }
 
         if (_negotiatedAudio is { } audio)
@@ -504,7 +589,12 @@ public sealed partial class PeerConnection
         }
     }
 
-    private void DispatchRtcp(RtcpPacket packet, DateTimeOffset receivedAt)
+    /// <summary>
+    /// Routes one parsed RTCP packet to its counters, its typed event, and — for NACK and reception
+    /// reports — to the retransmission and link-quality paths. Internal so tests can drive the
+    /// feedback path without standing up a transport.
+    /// </summary>
+    internal void DispatchRtcp(RtcpPacket packet, DateTimeOffset receivedAt)
     {
         switch (packet)
         {
@@ -526,6 +616,7 @@ public sealed partial class PeerConnection
 
             case RtcpGenericNack nack:
                 Interlocked.Increment(ref _nackCount);
+                ServeNack(nack);
                 OnNack?.Invoke(this, new NackEventArgs(nack.SenderSsrc, nack.MediaSsrc, nack.ExpandedSequenceNumbers));
                 break;
 
@@ -536,6 +627,7 @@ public sealed partial class PeerConnection
 
             case RtcpReceiverReport report:
                 Interlocked.Increment(ref _receiverReportCount);
+                IngestReportBlocks(report.ReportBlocks, receivedAt);
                 OnReceiverReport?.Invoke(
                     this,
                     new ReceiverReportEventArgs(report.SenderSsrc, [.. report.ReportBlocks], receivedAt));
@@ -543,6 +635,7 @@ public sealed partial class PeerConnection
 
             case RtcpSenderReport sender when sender.ReportBlocks.Count > 0:
                 Interlocked.Increment(ref _receiverReportCount);
+                IngestReportBlocks(sender.ReportBlocks, receivedAt);
                 OnReceiverReport?.Invoke(
                     this,
                     new ReceiverReportEventArgs(sender.SenderSsrc, [.. sender.ReportBlocks], receivedAt));
@@ -556,6 +649,97 @@ public sealed partial class PeerConnection
 
             default:
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Serves an inbound Generic NACK out of the video send history as RTX packets.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// RFC 4585 §6.2.1: every FCI entry names a PID plus, in its BLP, up to sixteen further sequence
+    /// numbers. The entries are expanded in place rather than through
+    /// <see cref="RtcpGenericNack.ExpandedSequenceNumbers"/> so the receive loop allocates nothing on
+    /// this path however many packets a NACK asks for.
+    /// </para>
+    /// <para>
+    /// This runs on the ICE receive loop and takes the send lock, which serialises it against
+    /// <see cref="SendVideoFrame"/> and against the SRTP encryption both share. The history itself is
+    /// separately locked, so a NACK never tears a slab a frame is being written into.
+    /// </para>
+    /// </remarks>
+    private void ServeNack(RtcpGenericNack nack)
+    {
+        var track = _videoTrack;
+        if (track?.Retransmitter is null || nack.MediaSsrc != _videoSsrc)
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _videoNackCount);
+
+        lock (_sendLock)
+        {
+            if (_srtp is null)
+            {
+                return;
+            }
+
+            var entries = nack.Entries;
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                track.Retransmit(entry.PacketId);
+                for (var bit = 0; bit < 16; bit++)
+                {
+                    if ((entry.Bitmask & (1 << bit)) != 0)
+                    {
+                        track.Retransmit((ushort)(entry.PacketId + bit + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Folds reception report blocks (RFC 3550 §6.4.1) describing this endpoint's own streams into the
+    /// link-quality snapshot <see cref="GetStats"/> publishes. Blocks about any other source are
+    /// ignored.
+    /// </summary>
+    private void IngestReportBlocks(IList<RtcpReportBlock> blocks, DateTimeOffset receivedAt)
+    {
+        for (var i = 0; i < blocks.Count; i++)
+        {
+            var block = blocks[i];
+            var video = block.SourceSsrc == _videoSsrc;
+            if (!video && block.SourceSsrc != _audioSsrc)
+            {
+                // Report blocks for the RTX SSRC describe the repair stream, which has no separate
+                // quality surface, and blocks for anything else are not about us at all.
+                continue;
+            }
+
+            var clockRate = video ? _negotiatedVideo?.ClockRate : _negotiatedAudio?.ClockRate;
+            var quality = new OutboundStreamQuality(
+                block.SourceSsrc,
+
+                // RFC 3550 §6.4.1: the fraction lost is a fixed-point number with denominator 256.
+                block.FractionLost / 256.0,
+                block.CumulativePacketsLost,
+                block.ExtendedHighestSequenceNumber,
+                block.Jitter,
+                clockRate is > 0 ? TimeSpan.FromSeconds(block.Jitter / (double)clockRate.Value) : null,
+                ReceiverReportEventArgs.CalculateRoundTripTime(block, receivedAt),
+                receivedAt);
+
+            if (video)
+            {
+                _videoQuality = quality;
+            }
+            else
+            {
+                _audioQuality = quality;
+            }
         }
     }
 
@@ -613,11 +797,21 @@ public sealed partial class PeerConnection
             return;
         }
 
-        SendRtcpCompound(
-        [
+        var packets = new List<RtcpPacket>(4)
+        {
             track.Stream.CreateSenderReport(now),
             RtcpSourceDescription.CreateCname(track.Stream.Ssrc, _cname),
-        ]);
+        };
+
+        // RFC 4588 §4 makes the repair stream a source in its own right, so it reports separately once
+        // it has actually sent something.
+        if (track.Retransmitter is { } rtx && rtx.PacketCount > 0)
+        {
+            packets.Add(rtx.CreateSenderReport(now));
+            packets.Add(RtcpSourceDescription.CreateCname(rtx.Ssrc, _cname));
+        }
+
+        SendRtcpCompound(packets);
     }
 
     private void TrySendGoodbye()
@@ -638,6 +832,10 @@ public sealed partial class PeerConnection
                 packets.Add(track.Stream.CreateSenderReport(now));
                 packets.Add(RtcpSourceDescription.CreateCname(track.Stream.Ssrc, _cname));
                 sources.Add(track.Stream.Ssrc);
+                if (track.Retransmitter is { } rtx && rtx.PacketCount > 0)
+                {
+                    sources.Add(rtx.Ssrc);
+                }
             }
 
             if (packets.Count == 0)
@@ -666,8 +864,8 @@ public sealed partial class PeerConnection
         lock (_sendLock)
         {
             var srtp = _srtp;
-            var ice = _ice;
-            if (srtp is null || ice is null)
+            var transport = _transport;
+            if (srtp is null || transport is null)
             {
                 return false;
             }
@@ -676,7 +874,7 @@ public sealed partial class PeerConnection
             {
                 var length = RtcpPacket.WriteCompound(packets, _rtcpTx);
                 var protectedLength = srtp.Outbound.ProtectRtcp(_rtcpTx.AsSpan(0, length), _rtcpTx);
-                ice.Transport.Send(_rtcpTx.AsSpan(0, protectedLength));
+                transport.Send(_rtcpTx.AsSpan(0, protectedLength));
                 return true;
             }
             catch (InvalidOperationException)
@@ -690,8 +888,8 @@ public sealed partial class PeerConnection
     private void SendProtectedRtp(byte[] buffer, int length)
     {
         var srtp = _srtp;
-        var ice = _ice;
-        if (srtp is null || ice is null)
+        var transport = _transport;
+        if (srtp is null || transport is null)
         {
             return;
         }
@@ -699,7 +897,7 @@ public sealed partial class PeerConnection
         var protectedLength = srtp.Outbound.ProtectRtp(buffer.AsSpan(0, length), buffer);
         try
         {
-            ice.Transport.Send(buffer.AsSpan(0, protectedLength));
+            transport.Send(buffer.AsSpan(0, protectedLength));
         }
         catch (InvalidOperationException)
         {
@@ -709,13 +907,15 @@ public sealed partial class PeerConnection
 
     /// <summary>
     /// One outbound RTP stream: the payloadizer, the sequence/timestamp state, and a single reusable
-    /// datagram buffer that the payloadizer fills in place and SRTP encrypts in place.
+    /// datagram buffer that the payloadizer fills in place and SRTP encrypts in place. When RFC 4588
+    /// retransmission is negotiated it also owns the repair stream and a second buffer for it.
     /// </summary>
     private sealed class TrackSender : IRtpPayloadWriter
     {
         private readonly PeerConnection _owner;
         private readonly IRtpPayloadizer _payloadizer;
         private readonly byte[] _buffer;
+        private readonly byte[]? _rtxBuffer;
         private readonly int _maxPayload;
         private uint _timestamp;
         private long _packets;
@@ -729,15 +929,20 @@ public sealed partial class PeerConnection
             RtpStreamSender stream,
             IRtpPayloadizer payloadizer,
             int maxPayload,
-            int srtpOverhead)
+            int srtpOverhead,
+            RtxRetransmitter? retransmitter = null)
         {
             _owner = owner;
             _payloadizer = payloadizer;
             _maxPayload = maxPayload;
             _buffer = new byte[RtpHeader.FixedLength + maxPayload + srtpOverhead];
+            _rtxBuffer = retransmitter is null
+                ? null
+                : new byte[retransmitter.MaxPacketSize + srtpOverhead];
             Mid = mid;
             Kind = kind;
             Stream = stream;
+            Retransmitter = retransmitter;
         }
 
         internal string Mid { get; }
@@ -745,6 +950,9 @@ public sealed partial class PeerConnection
         internal MediaKind Kind { get; }
 
         internal RtpStreamSender Stream { get; }
+
+        /// <summary>The repair stream, or null when the answer kept no rtx codec.</summary>
+        internal RtxRetransmitter? Retransmitter { get; }
 
         public Span<byte> GetPayloadBuffer(int sizeHint) => _buffer.AsSpan(RtpHeader.FixedLength, _maxPayload);
 
@@ -757,6 +965,9 @@ public sealed partial class PeerConnection
                 marker,
                 _timestamp,
                 _buffer);
+
+            // Capture the plaintext before SRTP encrypts the same buffer in place.
+            Retransmitter?.History.Store(Stream.LastSequenceNumber, _buffer.AsSpan(0, packetLength));
 
             _owner.SendProtectedRtp(_buffer, packetLength);
             _packets++;
@@ -772,7 +983,33 @@ public sealed partial class PeerConnection
             return packets;
         }
 
-        internal MediaTrackStats GetStats(long dropped) => new(
+        /// <summary>
+        /// Resends one NACKed packet as an RTX packet. The caller holds the send lock, which is what
+        /// serialises the repair stream's sequence numbering and the SRTP context it shares with the
+        /// media stream.
+        /// </summary>
+        /// <param name="sequenceNumber">The media stream sequence number the peer reported missing.</param>
+        /// <returns>True when a repair packet was sent.</returns>
+        internal bool Retransmit(ushort sequenceNumber)
+        {
+            if (Retransmitter is not { } rtx || _rtxBuffer is null)
+            {
+                return false;
+            }
+
+            if (rtx.TryRetransmit(sequenceNumber, _rtxBuffer, out var length) != RtxRetransmitResult.Retransmitted)
+            {
+                return false;
+            }
+
+            _owner.SendProtectedRtp(_rtxBuffer, length);
+            return true;
+        }
+
+        internal MediaTrackStats GetStats(
+            long dropped,
+            OutboundStreamQuality? quality,
+            RetransmissionStats? retransmission) => new(
             Kind,
             Mid,
             Stream.Ssrc,
@@ -780,6 +1017,8 @@ public sealed partial class PeerConnection
             _packets,
             _bytes,
             _frames,
-            dropped);
+            dropped,
+            quality,
+            retransmission);
     }
 }

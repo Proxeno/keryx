@@ -33,10 +33,16 @@ namespace Keryx;
 /// <see cref="OnRtpPacketReceived"/> and to data channel handlers are valid only for the duration of
 /// the call. <see cref="SendVideoFrame"/> and <see cref="SendAudioFrame"/> are safe to call from any
 /// thread and serialize internally.</para>
-/// <para><b>Not implemented.</b> No RTX/NACK retransmission, no bandwidth estimation or pacing, no
-/// simulcast, no renegotiation, no ICE restart, no TURN, no IPv6 candidates, no header extensions
-/// (so inbound transport-cc feedback is reported but never solicited by Keryx's own sequence
-/// numbering). These are reported honestly in SDP: bare <c>a=rtcp-fb:96 nack</c> is never offered.</para>
+/// <para><b>Resilience.</b> Video is offered with bare <c>a=rtcp-fb nack</c> backed by a real
+/// RFC 4588 repair stream: an <c>rtx</c> codec, a dedicated SSRC published through
+/// <c>a=ssrc-group:FID</c>, and a ring of recently sent packets that inbound NACKs are served from
+/// under a resend rate limit and a bandwidth budget. If the answer drops the <c>rtx</c> codec,
+/// retransmission is disabled rather than promised and not delivered. Reception report blocks the
+/// peer sends are folded into <see cref="GetStats"/> as loss, jitter and round-trip time.</para>
+/// <para><b>Not implemented.</b> No ULPFEC or RED, no outbound transport-cc, no bandwidth estimation
+/// or pacing, no simulcast, no renegotiation, no ICE restart, no TURN, no IPv6 candidates, no header
+/// extensions (so inbound transport-cc feedback is reported but never solicited by Keryx's own
+/// sequence numbering).</para>
 /// </remarks>
 public sealed partial class PeerConnection : IAsyncDisposable
 {
@@ -55,10 +61,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private readonly string _videoTrackId;
     private readonly string _audioTrackId;
     private readonly uint _videoSsrc;
+    private readonly uint _videoRtxSsrc;
     private readonly uint _audioSsrc;
     private readonly uint _rtcpSenderSsrc;
 
     private IceAgent? _ice;
+    private IDatagramTransport? _transport;
     private DtlsLowerTransport? _dtlsLower;
     private DtlsTransport? _dtls;
     private SctpAssociation? _sctp;
@@ -86,6 +94,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _videoTrackId = _config.VideoTrackId ?? NewIdentifier("video");
         _audioTrackId = _config.AudioTrackId ?? NewIdentifier("audio");
         _videoSsrc = NewSsrc();
+        _videoRtxSsrc = NewSsrc();
         _audioSsrc = NewSsrc();
         _rtcpSenderSsrc = NewSsrc();
     }
@@ -176,6 +185,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     /// <summary>The synchronisation source of the outbound video stream.</summary>
     public uint VideoSsrc => _videoSsrc;
+
+    /// <summary>
+    /// The synchronisation source of the outbound video retransmission stream, published as the second
+    /// member of <c>a=ssrc-group:FID</c> when RFC 4588 RTX is offered.
+    /// </summary>
+    public uint VideoRtxSsrc => _videoRtxSsrc;
 
     /// <summary>The synchronisation source of the outbound audio stream.</summary>
     public uint AudioSsrc => _audioSsrc;
@@ -657,8 +672,15 @@ public sealed partial class PeerConnection : IAsyncDisposable
             OnLocalIceCandidate?.Invoke(this, new LocalIceCandidateEventArgs(candidate.ToAttributeString(), mid));
         ice.OnGatheringComplete += (_, _) => OnIceGatheringComplete?.Invoke(this, EventArgs.Empty);
         ice.OnStateChanged += (_, state) => HandleIceStateChanged(state);
-        ice.Transport.OnReceived += HandleTransportDatagram;
+        // PeerConnectionConfig.TransportInterceptor is the fault-injection / diagnostics seam: the
+        // connection sends on, and receives from, whatever it returns rather than the ICE transport
+        // itself. It sits below DTLS and SRTP, so a wrapper sees only protected datagrams.
+        var transport = _config.TransportInterceptor is { } intercept
+            ? intercept(ice.Transport) ?? ice.Transport
+            : ice.Transport;
+        transport.OnReceived += HandleTransportDatagram;
 
+        _transport = transport;
         _ice = ice;
         _dtlsLower = new DtlsLowerTransport(this);
 
@@ -719,9 +741,18 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         if (_config.VideoCodecs.Count > 0)
         {
-            var video = SdpMediaOffer.Video(_config.VideoMid, [.. _config.VideoCodecs]);
+            var codecs = BuildOfferedVideoCodecs();
+            var video = SdpMediaOffer.Video(_config.VideoMid, [.. codecs]);
             video.TrackId = _videoTrackId;
             video.Ssrcs.Add(_videoSsrc);
+            if (codecs.Exists(static c => c.IsRtx))
+            {
+                // RFC 5576 §4.2: FID associates the media source with the repair source carrying its
+                // retransmissions. Both sources publish the same cname, which the builder writes.
+                video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [_videoSsrc, _videoRtxSsrc]));
+                video.Ssrcs.Add(_videoRtxSsrc);
+            }
+
             builder.AddMedia(video);
         }
 
@@ -736,6 +767,107 @@ public sealed partial class PeerConnection : IAsyncDisposable
         builder.AddDataChannel(_config.ApplicationMid, _config.SctpPort, _config.MaxMessageSize);
         return builder.Build();
     }
+
+    /// <summary>
+    /// Copies the configured video codecs and, when retransmission is enabled, gives each one bare
+    /// <c>nack</c> feedback and a matching RFC 4588 <c>rtx</c> entry on a free dynamic payload type.
+    /// The configured codecs themselves are never mutated.
+    /// </summary>
+    private List<SdpCodec> BuildOfferedVideoCodecs()
+    {
+        var codecs = new List<SdpCodec>(_config.VideoCodecs.Count * 2);
+        foreach (var codec in _config.VideoCodecs)
+        {
+            codecs.Add(CloneCodec(codec));
+        }
+
+        if (!_config.EnableRetransmission || codecs.Count == 0)
+        {
+            return codecs;
+        }
+
+        var used = new HashSet<int>();
+        foreach (var codec in _config.VideoCodecs)
+        {
+            used.Add(codec.PayloadType);
+        }
+
+        foreach (var codec in _config.AudioCodecs)
+        {
+            used.Add(codec.PayloadType);
+        }
+
+        var repairs = new List<SdpCodec>(codecs.Count);
+        foreach (var codec in codecs)
+        {
+            if (codec.IsRtx)
+            {
+                continue;
+            }
+
+            var preferred = repairs.Count == 0 ? _config.RtxPayloadType : null;
+            if (NextDynamicPayloadType(used, preferred) is not { } rtxPayloadType)
+            {
+                _logger.Log(
+                    KeryxLogLevel.Warning,
+                    "No dynamic payload type is free for an rtx codec; retransmission is not offered.");
+                return codecs;
+            }
+
+            if (!codec.Feedback.Contains(RtcpFeedback.Nack))
+            {
+                codec.Feedback.Insert(0, RtcpFeedback.Nack);
+            }
+
+            repairs.Add(SdpCodec.Rtx(rtxPayloadType, codec.PayloadType, codec.ClockRate));
+        }
+
+        codecs.AddRange(repairs);
+        return codecs;
+    }
+
+    private static int? NextDynamicPayloadType(HashSet<int> used, int? preferred)
+    {
+        if (preferred is { } candidate && candidate is >= 0 and <= 127 && used.Add(candidate))
+        {
+            return candidate;
+        }
+
+        // RFC 3551 §6 reserves 96-127 for dynamic assignment, which is what browsers use for rtx.
+        for (var payloadType = 96; payloadType <= 127; payloadType++)
+        {
+            if (used.Add(payloadType))
+            {
+                return payloadType;
+            }
+        }
+
+        return null;
+    }
+
+    private static SdpCodec CloneCodec(SdpCodec codec)
+    {
+        var copy = new SdpCodec(codec.PayloadType, codec.EncodingName, codec.ClockRate, codec.Channels)
+        {
+            Fmtp = codec.Fmtp,
+        };
+
+        foreach (var feedback in codec.Feedback)
+        {
+            copy.Feedback.Add(feedback);
+        }
+
+        return copy;
+    }
+
+    private static int? AssociatedPayloadType(string? fmtp) =>
+        int.TryParse(
+            FmtpParameters.GetValue(fmtp, SdpCodec.AssociatedPayloadTypeParameter),
+            NumberStyles.None,
+            CultureInfo.InvariantCulture,
+            out var apt)
+            ? apt
+            : null;
 
     private SessionDescription BuildAnswer(SessionDescription offer, IceAgent ice)
     {
@@ -773,6 +905,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 ? _config.VideoCodecs
                 : _config.AudioCodecs;
 
+            var accepted = new HashSet<int>();
             foreach (var payloadType in offered.GetPayloadTypes())
             {
                 var rtpMap = offered.GetRtpMap(payloadType);
@@ -781,14 +914,26 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     continue;
                 }
 
-                if (!acceptable.Any(c => string.Equals(c.EncodingName, rtpMap.EncodingName, StringComparison.OrdinalIgnoreCase)))
+                var fmtp = offered.GetFmtp(payloadType);
+                if (string.Equals(rtpMap.EncodingName, SdpCodec.RtxEncodingName, StringComparison.OrdinalIgnoreCase))
+                {
+                    // RFC 4588 §8.1: a repair codec is only meaningful when its apt names a codec that
+                    // survived, so answer rtx if and only if the stream it repairs was kept.
+                    if (AssociatedPayloadType(fmtp) is not { } apt || !accepted.Contains(apt))
+                    {
+                        continue;
+                    }
+                }
+                else if (!acceptable.Any(c => string.Equals(c.EncodingName, rtpMap.EncodingName, StringComparison.OrdinalIgnoreCase)))
                 {
                     continue;
                 }
 
                 var codec = new SdpCodec(payloadType, rtpMap.EncodingName, rtpMap.ClockRate, rtpMap.Channels);
-                if (offered.GetFmtp(payloadType) is { } fmtp)
+                if (fmtp is not null)
                 {
+                    // Codec parameters the offerer set — Opus useinbandfec and minptime, H.264
+                    // packetization-mode and profile-level-id — are echoed unchanged.
                     codec.Fmtp = fmtp;
                 }
 
@@ -798,6 +943,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 }
 
                 section.Codecs.Add(codec);
+                accepted.Add(payloadType);
             }
 
             if (section.Codecs.Count == 0)
@@ -866,7 +1012,25 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     }
 
                     var rtpMap = media.GetRtpMap(payloadType);
-                    if (rtpMap is null || !acceptable.Any(c =>
+                    if (rtpMap is null)
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(rtpMap.EncodingName, SdpCodec.RtxEncodingName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Route inbound repair packets alongside the stream they repair.
+                        if (AssociatedPayloadType(media.GetFmtp(payloadType)) is { } apt
+                            && apt is >= 0 and <= 127
+                            && routes.ContainsKey((byte)apt))
+                        {
+                            routes[(byte)payloadType] = new RtpRoute(media.Mid ?? string.Empty, kind);
+                        }
+
+                        continue;
+                    }
+
+                    if (!acceptable.Any(c =>
                             string.Equals(c.EncodingName, rtpMap.EncodingName, StringComparison.OrdinalIgnoreCase)))
                     {
                         continue;
@@ -967,7 +1131,32 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
             if (kind == MediaKind.Video)
             {
-                _negotiatedVideo = new NegotiatedTrack(media.Mid ?? _config.VideoMid, (byte)chosen.PayloadType, (uint)chosen.ClockRate);
+                byte? rtxPayloadType = null;
+                if (_config.EnableRetransmission)
+                {
+                    // RFC 4588 §8.1: retransmission is negotiated only if the answer keeps an rtx
+                    // codec whose apt names the media codec we settled on. Bare a=rtcp-fb nack in the
+                    // answer is not enough — without a repair stream there is nowhere to send resends,
+                    // and resending on the media SSRC would corrupt its sequence numbering.
+                    var rtx = media.FindRtxCodec(chosen.PayloadType);
+                    if (rtx is not null && rtx.PayloadType is >= 0 and <= 127)
+                    {
+                        rtxPayloadType = (byte)rtx.PayloadType;
+                        routes[(byte)rtx.PayloadType] = new RtpRoute(media.Mid ?? string.Empty, kind);
+                    }
+                    else
+                    {
+                        _logger.Log(
+                            KeryxLogLevel.Info,
+                            $"The answer kept no rtx codec for payload type {chosen.PayloadType}; retransmission is disabled.");
+                    }
+                }
+
+                _negotiatedVideo = new NegotiatedTrack(
+                    media.Mid ?? _config.VideoMid,
+                    (byte)chosen.PayloadType,
+                    (uint)chosen.ClockRate,
+                    rtxPayloadType);
             }
             else
             {
@@ -983,7 +1172,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
         Volatile.Write(ref _routes, routes);
         _logger.Log(
             KeryxLogLevel.Info,
-            $"Applied answer; local DTLS role {LocalDtlsRole}, video pt {_negotiatedVideo?.PayloadType}, audio pt {_negotiatedAudio?.PayloadType}.");
+            $"Applied answer; local DTLS role {LocalDtlsRole}, video pt {_negotiatedVideo?.PayloadType}"
+            + $" (rtx pt {_negotiatedVideo?.RtxPayloadType?.ToString(CultureInfo.InvariantCulture) ?? "none"}),"
+            + $" audio pt {_negotiatedAudio?.PayloadType}.");
     }
 
     private static DtlsRole ToDtlsRole(SdpSetupRole role) => role switch
@@ -1010,25 +1201,33 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     private readonly record struct RtpRoute(string Mid, MediaKind Kind);
 
-    private sealed record NegotiatedTrack(string Mid, byte PayloadType, uint ClockRate);
+    /// <summary>
+    /// What the answer settled on for one media kind. <paramref name="RtxPayloadType"/> is null when
+    /// the answerer dropped the RFC 4588 repair codec, which disables retransmission for the track.
+    /// </summary>
+    private sealed record NegotiatedTrack(
+        string Mid,
+        byte PayloadType,
+        uint ClockRate,
+        byte? RtxPayloadType = null);
 
     private sealed class DtlsLowerTransport(PeerConnection owner) : IDatagramTransport
     {
-        public int MaxDatagramSize => owner._ice?.Transport.MaxDatagramSize ?? 1200;
+        public int MaxDatagramSize => owner._transport?.MaxDatagramSize ?? 1200;
 
         public event DatagramReceivedHandler? OnReceived;
 
         public void Send(ReadOnlySpan<byte> datagram)
         {
-            var ice = owner._ice;
-            if (ice is null)
+            var transport = owner._transport;
+            if (transport is null)
             {
                 return;
             }
 
             try
             {
-                ice.Transport.Send(datagram);
+                transport.Send(datagram);
             }
             catch (InvalidOperationException)
             {

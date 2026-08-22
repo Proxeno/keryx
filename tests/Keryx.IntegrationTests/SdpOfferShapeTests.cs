@@ -16,12 +16,21 @@ public sealed class SdpOfferShapeTests
         await using var peer = new PeerConnection(TestSupport.NewConfig());
         var offer = await peer.CreateOfferAsync(TestTimeout());
 
-        // Feedback: pli and fir are offered, bare nack is not — Keryx has no RTX path and must not
-        // claim one, because a browser that sees bare nack will ask for retransmissions forever.
+        // Feedback: bare nack is offered because it is backed by a real RFC 4588 repair stream, and
+        // it precedes nack pli exactly as Chrome writes it.
+        offer.Split("\r\n").Should().Contain("a=rtcp-fb:96 nack");
         offer.Should().Contain("a=rtcp-fb:96 nack pli");
         offer.Should().Contain("a=rtcp-fb:96 ccm fir");
         offer.Should().Contain("a=rtcp-fb:96 transport-cc");
-        offer.Split("\r\n").Should().NotContain("a=rtcp-fb:96 nack");
+
+        // RTX: an rtx codec on the next free dynamic payload type, bound to H.264 by apt, with its own
+        // SSRC grouped to the media SSRC by FID (RFC 4588 §8.1, RFC 5576 §4.2).
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97");
+        offer.Should().Contain("a=rtpmap:97 rtx/90000");
+        offer.Should().Contain("a=fmtp:97 apt=96");
+        offer.Should().Contain($"a=ssrc-group:FID {peer.VideoSsrc} {peer.VideoRtxSsrc}");
+        offer.Should().Contain($"a=ssrc:{peer.VideoRtxSsrc} cname:{peer.Cname}");
+        offer.Should().Contain($"a=ssrc:{peer.VideoSsrc} cname:{peer.Cname}");
 
         // Codecs.
         offer.Should().Contain("a=rtpmap:96 H264/90000");
@@ -45,7 +54,6 @@ public sealed class SdpOfferShapeTests
         offer.Should().Contain("127.0.0.1");
 
         // Media directions and the data channel section.
-        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96");
         offer.Should().Contain("m=audio 9 UDP/TLS/RTP/SAVPF 111");
         offer.Should().Contain("m=application 9 UDP/DTLS/SCTP webrtc-datachannel");
         offer.Should().Contain("a=sctp-port:5000");
@@ -72,10 +80,13 @@ public sealed class SdpOfferShapeTests
         await using var peer = new PeerConnection(config);
         var offer = await peer.CreateOfferAsync(TestTimeout());
 
-        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 100");
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 100 96");
         offer.Should().Contain("a=rtpmap:100 VP8/90000");
         offer.Should().Contain("a=fmtp:100 max-fr=60");
         offer.Should().Contain("a=rtcp-fb:100 goog-remb");
+        offer.Should().Contain("a=rtcp-fb:100 nack");
+        offer.Should().Contain("a=rtpmap:96 rtx/90000");
+        offer.Should().Contain("a=fmtp:96 apt=100");
         offer.Should().NotContain("H264");
         offer.Should().NotContain("m=audio");
         offer.Should().Contain("a=group:BUNDLE 0 2");
@@ -94,6 +105,53 @@ public sealed class SdpOfferShapeTests
         stats.Video!.Value.FramesDropped.Should().Be(1);
         stats.Audio!.Value.FramesDropped.Should().Be(1);
         stats.Video!.Value.PacketsSent.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task RetransmissionCanBeTurnedOffEntirely()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableRetransmission = false;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96");
+        offer.Should().NotContain("rtx/90000");
+        offer.Should().NotContain("a=ssrc-group:FID");
+        offer.Should().NotContain($"a=ssrc:{peer.VideoRtxSsrc}");
+
+        // The codec's own bare nack survives — the config owns the feedback list — but nothing in the
+        // offer promises a repair stream, and no answer can negotiate one.
+        peer.NegotiatedVideoRtxPayloadType.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task TheRtxPayloadTypeCanBePinned()
+    {
+        var config = TestSupport.NewConfig();
+        config.RtxPayloadType = 120;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 120");
+        offer.Should().Contain("a=rtpmap:120 rtx/90000");
+        offer.Should().Contain("a=fmtp:120 apt=96");
+    }
+
+    [Fact]
+    public async Task TheConfiguredCodecListIsNeverMutatedByBuildingAnOffer()
+    {
+        var config = TestSupport.NewConfig();
+        var h264 = config.VideoCodecs[0];
+        var feedbackBefore = h264.Feedback.Count;
+
+        await using var peer = new PeerConnection(config);
+        await peer.CreateOfferAsync(TestTimeout());
+
+        config.VideoCodecs.Should().HaveCount(1);
+        h264.Feedback.Should().HaveCount(feedbackBefore);
     }
 
     private static CancellationToken TestTimeout() =>

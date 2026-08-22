@@ -6,8 +6,11 @@ is correctness against the RFCs, proven by tests.
 ## Building
 
 - .NET SDK 10.0+ (`dotnet build Keryx.slnx`)
-- `dotnet test Keryx.slnx` runs everything except Chrome interop tests
-  (`--filter "Category=ChromeInterop"` runs those; they need Google Chrome installed).
+- `dotnet test Keryx.slnx` runs everything except the trait-gated suites:
+  - `--filter "Category=ChromeInterop"` runs the browser interop tests; they need Google Chrome
+    installed (override the path with `KERYX_CHROME_PATH`).
+  - `--filter "Category=Soak"` runs the five-minute lossy-link soak (`KERYX_SOAK_SECONDS`
+    shortens it).
 
 ## Ground rules
 
