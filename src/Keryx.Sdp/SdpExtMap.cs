@@ -12,6 +12,22 @@ namespace Keryx.Sdp;
 /// <param name="Parameters">Optional trailing extension attributes, preserved verbatim.</param>
 public sealed record SdpExtMap(int Id, string Uri, MediaDirection? Direction = null, string? Parameters = null)
 {
+    /// <summary>
+    /// URI of the transport-wide congestion-control header extension
+    /// (<c>draft-holmer-rmcat-transport-wide-cc-extensions-01</c>), which carries a monotonically
+    /// increasing transport-wide sequence number so the remote can return TWCC feedback.
+    /// </summary>
+    public const string TransportWideCcUri =
+        "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+
+    /// <summary>Creates the <c>a=extmap</c> for the transport-wide congestion-control extension.</summary>
+    /// <param name="id">The header-extension identifier to negotiate; 1–14 for the one-byte form.</param>
+    /// <returns>An extmap mapping <paramref name="id"/> to <see cref="TransportWideCcUri"/>.</returns>
+    public static SdpExtMap TransportWideCc(int id) => new(id, TransportWideCcUri);
+
+    /// <summary>True when this mapping is the transport-wide congestion-control extension.</summary>
+    public bool IsTransportWideCc => string.Equals(Uri, TransportWideCcUri, StringComparison.Ordinal);
+
     /// <summary>Parses an <c>a=extmap</c> attribute value.</summary>
     /// <param name="value">The attribute value, without the <c>a=extmap:</c> prefix.</param>
     /// <param name="extMap">Receives the parsed mapping.</param>

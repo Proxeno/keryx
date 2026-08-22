@@ -93,6 +93,37 @@ public sealed class SdpOfferShapeTests
     }
 
     [Fact]
+    public async Task OfferNegotiatesTheTransportWideCcExtensionOnEveryRtpSection()
+    {
+        await using var peer = new PeerConnection(TestSupport.NewConfig());
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        var parsed = SessionDescription.Parse(offer);
+
+        var audio = parsed.MediaDescriptions.Single(m => m.Media == "audio");
+        audio.GetExtMaps().Should().ContainSingle(e => e.IsTransportWideCc).Which.Id.Should().Be(3);
+
+        var video = parsed.MediaDescriptions.Single(m => m.Media == "video");
+        video.GetExtMaps().Should().ContainSingle(e => e.IsTransportWideCc).Which.Id.Should().Be(3);
+
+        // The data channel section carries no RTP header extensions.
+        parsed.MediaDescriptions.Single(m => m.Media == "application")
+            .GetExtMaps().Should().NotContain(e => e.IsTransportWideCc);
+    }
+
+    [Fact]
+    public async Task DisablingTransportWideCcOmitsTheExtmap()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableTransportWideCc = false;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        offer.Should().NotContain(SdpExtMap.TransportWideCcUri);
+    }
+
+    [Fact]
     public async Task MediaSentBeforeConnectingIsDroppedAndCounted()
     {
         await using var peer = new PeerConnection(TestSupport.NewConfig());
