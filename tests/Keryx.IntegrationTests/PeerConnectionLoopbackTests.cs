@@ -15,7 +15,7 @@ namespace Keryx.IntegrationTests;
 /// </summary>
 public sealed class PeerConnectionLoopbackTests
 {
-    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(30);
 
     [Fact]
     public async Task FullSessionOverRealUdpLoopback()

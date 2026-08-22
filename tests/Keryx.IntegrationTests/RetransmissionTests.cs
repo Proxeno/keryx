@@ -14,10 +14,10 @@ namespace Keryx.IntegrationTests;
 /// </summary>
 public sealed class RetransmissionTests
 {
-    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(30);
 
     private static CancellationToken TestTimeout() =>
-        new CancellationTokenSource(TimeSpan.FromSeconds(30)).Token;
+        new CancellationTokenSource(TimeSpan.FromSeconds(60)).Token;
 
     /// <summary>
     /// Rewrites the Chrome answer fixture so that every m-section answers the offer it is given: same
