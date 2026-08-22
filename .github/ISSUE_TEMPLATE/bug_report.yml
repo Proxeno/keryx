@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a defect in the Keryx WebRTC stack
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. For **security** issues (DTLS, SRTP,
+        fingerprint pinning, anything that could weaken transport security), please do
+        not open a public issue — use a private advisory instead:
+        https://github.com/Proxeno/keryx/security/advisories/new
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: Negotiating H.264 with a Chrome answer produces ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        Minimal steps or code. Include the SDP offer/answer if signaling is involved,
+        the `PeerConnectionConfig` used, and whether a specific peer (browser + version)
+        is required to trigger it.
+      render: csharp
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Keryx version
+      description: Package version (Proxeno.Keryx) or commit SHA.
+      placeholder: "0.1.6"
+    validations:
+      required: true
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer?
+      description: Which package does the bug appear to originate in?
+      options:
+        - Keryx (PeerConnection / composition root)
+        - Keryx.Stun
+        - Keryx.Turn
+        - Keryx.Ice
+        - Keryx.Sdp
+        - Keryx.Rtp / RTCP
+        - Keryx.Dtls
+        - Keryx.Srtp
+        - Keryx.Sctp / data channels
+        - Keryx.Core
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: peer
+    attributes:
+      label: Remote peer
+      description: The other end of the session (browser + version, or another Keryx).
+      placeholder: Chrome 151, or Keryx loopback
+    validations:
+      required: false
+  - type: input
+    id: os
+    attributes:
+      label: OS and .NET version
+      placeholder: macOS 15 (arm64), .NET 10.0.x
+    validations:
+      required: true
