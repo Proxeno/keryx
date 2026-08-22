@@ -72,7 +72,8 @@ public readonly record struct RtxStats(
 /// the marker bit are copied from the original packet.
 /// </para>
 /// <para>
-/// <b>Thread safety.</b> <see cref="TryRetransmit"/> mutates the RTX sequence number and must be
+/// <b>Thread safety.</b> <see cref="TryRetransmit(ushort, Span{byte}, out int)"/> mutates the RTX
+/// sequence number and must be
 /// serialised with itself and with the SRTP encryption of the packets it produces; a
 /// <c>PeerConnection</c> does that under its send lock. <see cref="GetStats"/> and
 /// <see cref="History"/> are safe to call from any thread.
@@ -179,10 +180,40 @@ public sealed class RtxRetransmitter
     /// <param name="length">On <see cref="RtxRetransmitResult.Retransmitted"/>, the packet's length.</param>
     /// <returns>Whether a packet was produced, and if not, why.</returns>
     /// <exception cref="ByteBufferException">The destination cannot hold the RTX packet.</exception>
-    public RtxRetransmitResult TryRetransmit(ushort originalSequenceNumber, Span<byte> destination, out int length)
+    public RtxRetransmitResult TryRetransmit(ushort originalSequenceNumber, Span<byte> destination, out int length) =>
+        TryRetransmit(originalSequenceNumber, 0, 0, destination, out length);
+
+    /// <summary>
+    /// Retransmits one NACKed packet as an RTX packet, additionally stamping the transport-wide
+    /// congestion-control header extension (<c>draft-holmer-rmcat-transport-wide-cc-extensions-01</c>) so
+    /// the repair packet is visible to the remote's feedback like any other outbound packet.
+    /// </summary>
+    /// <param name="originalSequenceNumber">The sequence number the peer reported missing.</param>
+    /// <param name="transportCcExtensionId">
+    /// The negotiated <c>a=extmap</c> element identifier (1–14) for the transport-wide sequence number.
+    /// </param>
+    /// <param name="transportWideSequenceNumber">
+    /// The transport-wide sequence number to stamp, drawn from the connection's shared counter.
+    /// </param>
+    /// <param name="destination">
+    /// Buffer receiving the RTX packet. Must hold <see cref="MaxPacketSize"/> bytes plus whatever headroom
+    /// SRTP needs for its tag.
+    /// </param>
+    /// <param name="length">On <see cref="RtxRetransmitResult.Retransmitted"/>, the packet's length.</param>
+    /// <returns>Whether a packet was produced, and if not, why.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">The extension identifier is outside 1–14.</exception>
+    /// <exception cref="ByteBufferException">The destination cannot hold the RTX packet.</exception>
+    public RtxRetransmitResult TryRetransmit(
+        ushort originalSequenceNumber,
+        byte transportCcExtensionId,
+        ushort transportWideSequenceNumber,
+        Span<byte> destination,
+        out int length)
     {
         length = 0;
         Interlocked.Increment(ref _requested);
+
+        var extensionOverhead = transportCcExtensionId == 0 ? 0 : TransportCcExtension.OneByteHeaderOverhead;
 
         var lookup = History.TryCopy(
             originalSequenceNumber,
@@ -214,7 +245,10 @@ public sealed class RtxRetransmitter
 
         var headerLength = header.HeaderLength;
         var payloadLength = storedLength - headerLength;
-        var rtxLength = RtpHeader.FixedLength + RtxPacket.OriginalSequenceNumberLength + payloadLength;
+        var rtxLength = RtpHeader.FixedLength
+            + extensionOverhead
+            + RtxPacket.OriginalSequenceNumberLength
+            + payloadLength;
         if (destination.Length < rtxLength)
         {
             throw new ByteBufferException(
@@ -232,17 +266,33 @@ public sealed class RtxRetransmitter
         // From here the repair is certain to be produced, so the rate limit starts now.
         History.MarkRetransmitted(originalSequenceNumber);
 
-        // Build the RTX payload where the RTP header will end, so the sender's payload copy becomes a
-        // no-op self-copy and the packet is assembled without a second buffer.
+        // Build the RTX payload where the RTP header (fixed part plus any stamped extension) will end, so
+        // the sender's payload copy becomes a no-op self-copy and the packet is assembled in one buffer.
         var payloadSlot = destination.Slice(
-            RtpHeader.FixedLength,
+            RtpHeader.FixedLength + extensionOverhead,
             RtxPacket.OriginalSequenceNumberLength + payloadLength);
         RtxPacket.WritePayload(
             header.SequenceNumber,
             _scratch.AsSpan(headerLength, payloadLength),
             payloadSlot);
 
-        length = _stream.WritePacket(payloadSlot, header.Marker, header.Timestamp, destination);
+        if (extensionOverhead == 0)
+        {
+            length = _stream.WritePacket(payloadSlot, header.Marker, header.Timestamp, destination);
+        }
+        else
+        {
+            Span<byte> extensionBody = stackalloc byte[TransportCcExtension.OneByteBodyLength];
+            TransportCcExtension.WriteOneByteBody(extensionBody, transportCcExtensionId, transportWideSequenceNumber);
+            length = _stream.WritePacket(
+                payloadSlot,
+                header.Marker,
+                header.Timestamp,
+                RtpHeaderExtension.OneByteProfile,
+                extensionBody,
+                destination);
+        }
+
         Interlocked.Increment(ref _retransmitted);
         Interlocked.Add(ref _bytes, length);
 
