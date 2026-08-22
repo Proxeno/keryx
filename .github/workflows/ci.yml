@@ -11,5 +11,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+      # The TURN interop tests drive a real coturn on 127.0.0.1:7995-7999. They skip with a
+      # printed reason when the binary is missing, so this step is what turns them into real
+      # coverage rather than a no-op.
+      - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop"

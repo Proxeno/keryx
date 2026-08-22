@@ -46,6 +46,11 @@ internal sealed class TurnClientHarness : IDisposable
     private readonly List<(byte[] Data, IPEndPoint Peer)> _received = [];
 
     public TurnClientHarness(TestTurnServer server, TurnClientOptions? options = null, string? password = null)
+        : this(server.EndPoint, server.Username, password ?? server.Password, options)
+    {
+    }
+
+    public TurnClientHarness(IPEndPoint server, string username, string password, TurnClientOptions? options = null)
     {
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         _socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
@@ -53,9 +58,9 @@ internal sealed class TurnClientHarness : IDisposable
 
         options ??= FastOptions();
         Client = new TurnClient(
-            server.EndPoint,
-            server.Username,
-            password ?? server.Password,
+            server,
+            username,
+            password,
             (datagram, destination) => Send(datagram, destination),
             options);
         Client.OnRelayedData += (data, peer) =>
