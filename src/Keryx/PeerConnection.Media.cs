@@ -3,6 +3,7 @@ using Keryx.Core;
 using Keryx.Dtls;
 using Keryx.Ice;
 using Keryx.Rtp;
+using Keryx.Rtp.CongestionControl;
 using Keryx.Rtp.Packetization;
 using Keryx.Rtp.Rtcp;
 using Keryx.Sctp;
@@ -43,6 +44,11 @@ public sealed partial class PeerConnection
     // its stamping identifier are only touched from the send path under _sendLock, so no atomics.
     private byte? _sendTransportCcExtensionId;
     private ushort _transportWideSequenceNumber;
+
+    // The pacing queue that smooths outbound RTP toward the congestion controller's target, or null
+    // when congestion control is disabled — in which case the send path stays immediate. Built in
+    // CreateTrackSenders once the transport is up; only mutated from there and CloseAsync.
+    private PacedRtpSender? _pacedSender;
 
     private long _videoFramesDropped;
     private long _audioFramesDropped;
@@ -517,6 +523,18 @@ public sealed partial class PeerConnection
                 profile.RtpOverhead,
                 transportCcId);
         }
+
+        if (_congestionController is { } controller)
+        {
+            // The pacer drains toward the controller's live target; media and RTX both feed its queue
+            // through SendRtp, and the drain re-encrypts and emits under _sendLock. A single MTU is the
+            // floor so a lone large packet is never wedged behind an empty budget.
+            _pacedSender = new PacedRtpSender(
+                this,
+                new PacketPacer(controller.TargetBitrateBitsPerSecond, _time),
+                _time,
+                profile.RtpOverhead);
+        }
     }
 
     private static SrtpProfile MapSrtpProfile(DtlsSrtpProfile profile) => profile switch
@@ -670,7 +688,12 @@ public sealed partial class PeerConnection
 
             case RtcpTransportCcFeedback twcc:
                 Interlocked.Increment(ref _twccCount);
+                _congestionController?.OnTransportFeedback(twcc);
                 OnTransportCcFeedback?.Invoke(this, new TransportCcEventArgs(twcc));
+                break;
+
+            case RtcpReceiverEstimatedMaxBitrate remb:
+                _congestionController?.OnReceiverEstimatedMaxBitrate(remb);
                 break;
 
             case RtcpReceiverReport report:
@@ -787,6 +810,13 @@ public sealed partial class PeerConnection
             else
             {
                 _audioQuality = quality;
+            }
+
+            // Feed reception-report loss to the loss-based estimator. Video carries the bitrate the
+            // estimator is protecting, so prefer it; fall back to audio only when no video is sent.
+            if (video || _negotiatedVideo is null)
+            {
+                _congestionController?.OnReportedLoss(quality.FractionLost);
             }
         }
     }
@@ -966,6 +996,46 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>
+    /// Routes one assembled, still-plaintext RTP packet to the wire: straight through SRTP when
+    /// congestion control is off, or into the pacing queue when it is on. Called under
+    /// <see cref="_sendLock"/>.
+    /// </summary>
+    private void SendRtp(byte[] buffer, int length)
+    {
+        var paced = _pacedSender;
+        if (paced is not null)
+        {
+            // The pacer copies the plaintext out of the caller's reusable buffer, so the buffer is free
+            // to be reused for the next packet; the drain encrypts and sends each copy in send order.
+            paced.Enqueue(buffer.AsSpan(0, length));
+            return;
+        }
+
+        SendProtectedRtp(buffer, length);
+    }
+
+    /// <summary>Encrypts and sends one paced RTP packet, serialised against every other outbound write.</summary>
+    private void SendProtectedRtpLocked(byte[] buffer, int length)
+    {
+        lock (_sendLock)
+        {
+            SendProtectedRtp(buffer, length);
+        }
+    }
+
+    /// <summary>The current send clock in microseconds, monotonic, for the send-time history.</summary>
+    private long SendTimestampMicroseconds() =>
+        (long)(_time.GetTimestamp() * (1_000_000.0 / _time.TimestampFrequency));
+
+    /// <summary>
+    /// Records that an outbound RTP packet carrying <paramref name="transportSequenceNumber"/> left the
+    /// send path, so returning transport-cc feedback can be paired with its send time. Called under
+    /// <see cref="_sendLock"/> at the point the sequence number is drawn.
+    /// </summary>
+    private void OnTransportRtpSent(ushort transportSequenceNumber, int sizeBytes) =>
+        _congestionController?.OnPacketSent(transportSequenceNumber, SendTimestampMicroseconds(), sizeBytes);
+
+    /// <summary>
     /// One outbound RTP stream: the payloadizer, the sequence/timestamp state, and a single reusable
     /// datagram buffer that the payloadizer fills in place and SRTP encrypts in place. When RFC 4588
     /// retransmission is negotiated it also owns the repair stream and a second buffer for it.
@@ -1032,13 +1102,14 @@ public sealed partial class PeerConnection
             // assembled without a second buffer.
             var payload = _buffer.AsSpan(_headerReserve, length);
             int packetLength;
+            ushort transportSequenceNumber = 0;
+            var stamped = false;
             if (_transportCcExtensionId is { } extensionId)
             {
+                transportSequenceNumber = _owner.NextTransportWideSequenceNumber();
+                stamped = true;
                 Span<byte> extensionBody = stackalloc byte[TransportCcExtension.OneByteBodyLength];
-                TransportCcExtension.WriteOneByteBody(
-                    extensionBody,
-                    extensionId,
-                    _owner.NextTransportWideSequenceNumber());
+                TransportCcExtension.WriteOneByteBody(extensionBody, extensionId, transportSequenceNumber);
                 packetLength = Stream.WritePacket(
                     payload,
                     marker,
@@ -1055,7 +1126,12 @@ public sealed partial class PeerConnection
             // Capture the plaintext before SRTP encrypts the same buffer in place.
             Retransmitter?.History.Store(Stream.LastSequenceNumber, _buffer.AsSpan(0, packetLength));
 
-            _owner.SendProtectedRtp(_buffer, packetLength);
+            if (stamped)
+            {
+                _owner.OnTransportRtpSent(transportSequenceNumber, packetLength);
+            }
+
+            _owner.SendRtp(_buffer, packetLength);
             _packets++;
             _bytes += length;
         }
@@ -1086,21 +1162,31 @@ public sealed partial class PeerConnection
             // A repair packet is an outbound RTP packet like any other, so it draws the next
             // transport-wide sequence number when the TWCC extension is negotiated.
             int length;
-            var result = _transportCcExtensionId is { } extensionId
-                ? rtx.TryRetransmit(
-                    sequenceNumber,
-                    extensionId,
-                    _owner.NextTransportWideSequenceNumber(),
-                    _rtxBuffer,
-                    out length)
-                : rtx.TryRetransmit(sequenceNumber, _rtxBuffer, out length);
+            ushort transportSequenceNumber = 0;
+            var stamped = false;
+            RtxRetransmitResult result;
+            if (_transportCcExtensionId is { } extensionId)
+            {
+                transportSequenceNumber = _owner.NextTransportWideSequenceNumber();
+                stamped = true;
+                result = rtx.TryRetransmit(sequenceNumber, extensionId, transportSequenceNumber, _rtxBuffer, out length);
+            }
+            else
+            {
+                result = rtx.TryRetransmit(sequenceNumber, _rtxBuffer, out length);
+            }
 
             if (result != RtxRetransmitResult.Retransmitted)
             {
                 return false;
             }
 
-            _owner.SendProtectedRtp(_rtxBuffer, length);
+            if (stamped)
+            {
+                _owner.OnTransportRtpSent(transportSequenceNumber, length);
+            }
+
+            _owner.SendRtp(_rtxBuffer, length);
             return true;
         }
 
@@ -1118,5 +1204,147 @@ public sealed partial class PeerConnection
             dropped,
             quality,
             retransmission);
+    }
+
+    /// <summary>
+    /// A leaky-bucket pacing queue for outbound RTP. The send path enqueues copies of assembled,
+    /// plaintext packets; a timer drains them toward the congestion controller's target through a
+    /// <see cref="PacketPacer"/>, encrypting and sending each under the owner's send lock.
+    /// </summary>
+    /// <remarks>
+    /// The send path already holds <see cref="_sendLock"/> when it calls <see cref="Enqueue"/>, and
+    /// <see cref="Enqueue"/> only ever also takes <c>_gate</c>. The drain takes <c>_gate</c> to pull the
+    /// packets the budget admits, releases it, and only then takes <see cref="_sendLock"/> to send — so
+    /// the two locks are never held at once on the drain path and the orderings cannot deadlock.
+    /// </remarks>
+    private sealed class PacedRtpSender : IDisposable
+    {
+        private static readonly TimeSpan MinDrainInterval = TimeSpan.FromMilliseconds(1);
+
+        private readonly PeerConnection _owner;
+        private readonly PacketPacer _pacer;
+        private readonly TimeProvider _time;
+        private readonly int _srtpOverhead;
+        private readonly object _gate = new();
+        private readonly Queue<QueuedPacket> _queue = new();
+        private ITimer? _timer;
+        private bool _timerArmed;
+        private bool _disposed;
+
+        internal PacedRtpSender(PeerConnection owner, PacketPacer pacer, TimeProvider time, int srtpOverhead)
+        {
+            _owner = owner;
+            _pacer = pacer;
+            _time = time;
+            _srtpOverhead = srtpOverhead;
+            _timer = _time.CreateTimer(_ => Drain(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        }
+
+        /// <summary>Retargets the pacer from a congestion-controller change.</summary>
+        internal void SetTargetBitrate(long targetBitrateBitsPerSecond)
+        {
+            lock (_gate)
+            {
+                _pacer.SetTargetBitrate(targetBitrateBitsPerSecond);
+            }
+        }
+
+        /// <summary>Copies one plaintext RTP packet into the queue and wakes the drain. Called under _sendLock.</summary>
+        internal void Enqueue(ReadOnlySpan<byte> packet)
+        {
+            // Pacing is opt-in, so this copy — out of the caller's reusable buffer and into the queue —
+            // only happens when congestion control is enabled. The copy is oversized by the SRTP
+            // overhead so the drain can protect the packet in place, exactly as the direct path does.
+            var copy = new byte[packet.Length + _srtpOverhead];
+            packet.CopyTo(copy);
+            var arm = false;
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _queue.Enqueue(new QueuedPacket(copy, packet.Length));
+                if (!_timerArmed)
+                {
+                    _timerArmed = true;
+                    arm = true;
+                }
+            }
+
+            if (arm)
+            {
+                _timer?.Change(TimeSpan.Zero, Timeout.InfiniteTimeSpan);
+            }
+        }
+
+        private void Drain()
+        {
+            List<QueuedPacket>? ready = null;
+            var wait = Timeout.InfiniteTimeSpan;
+            lock (_gate)
+            {
+                _timerArmed = false;
+                if (_disposed)
+                {
+                    return;
+                }
+
+                while (_queue.Count > 0)
+                {
+                    var head = _queue.Peek();
+                    if (_pacer.TryConsume(head.Length))
+                    {
+                        (ready ??= []).Add(_queue.Dequeue());
+                    }
+                    else
+                    {
+                        wait = _pacer.TimeUntilNextSend(head.Length);
+                        break;
+                    }
+                }
+
+                if (_queue.Count > 0)
+                {
+                    _timerArmed = true;
+                }
+            }
+
+            if (ready is not null)
+            {
+                foreach (var packet in ready)
+                {
+                    _owner.SendProtectedRtpLocked(packet.Buffer, packet.Length);
+                }
+            }
+
+            if (wait != Timeout.InfiniteTimeSpan)
+            {
+                // A zero or negative wait would spin the timer hot; hold it to a 1 ms floor.
+                _timer?.Change(wait < MinDrainInterval ? MinDrainInterval : wait, Timeout.InfiniteTimeSpan);
+            }
+        }
+
+        public void Dispose()
+        {
+            ITimer? timer;
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                _queue.Clear();
+                timer = _timer;
+                _timer = null;
+            }
+
+            timer?.Dispose();
+        }
+
+        private readonly record struct QueuedPacket(byte[] Buffer, int Length);
     }
 }
