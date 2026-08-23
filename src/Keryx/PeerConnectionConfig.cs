@@ -139,6 +139,31 @@ public sealed class PeerConnectionConfig
     public bool EnableTransportWideCc { get; set; } = true;
 
     /// <summary>
+    /// Once the transport-wide congestion-control extension is negotiated, record every inbound packet's
+    /// transport-wide sequence number and arrival time and return transport-cc feedback
+    /// (<c>draft-holmer-rmcat-transport-wide-cc-extensions-01</c> §3.1) to the sender on a feedback
+    /// cadence, so a peer sending media into Keryx has the send-side bandwidth-estimation input its
+    /// encoder rate controller needs. On by default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Gated on <see cref="EnableTransportWideCc"/> actually being negotiated: with no extension there is
+    /// no transport-wide sequence number to report, so the path stays dormant. This is why it defaults on
+    /// where the receive jitter buffer and automatic NACK generation default off — those change the
+    /// delivery contract or spend uplink asking a peer to retransmit, whereas transport-cc feedback is the
+    /// standard, passive telemetry any conformant WebRTC receiver returns whenever the extension is
+    /// negotiated, and a sender that negotiated the extension is expecting it. Without it the peer's
+    /// delay-based estimator starves and its encoder oscillates.
+    /// </para>
+    /// <para>
+    /// The feedback is emitted as reduced-size RTCP (the feedback packet alone, no leading report), on the
+    /// receive loop, at most a few tens of milliseconds after an arrival. Set this false to suppress it
+    /// while still offering and honouring the extension for the send path.
+    /// </para>
+    /// </remarks>
+    public bool EnableReceiverTransportCcFeedback { get; set; } = true;
+
+    /// <summary>
     /// Enable the send-side Google Congestion Control estimator and its leaky-bucket pacer. When set,
     /// inbound transport-wide-cc feedback, reception-report loss and REMB drive a
     /// <see cref="Keryx.Rtp.CongestionControl.GccCongestionController"/> whose target bitrate is
