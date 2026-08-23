@@ -339,6 +339,124 @@ public sealed class IceAgentTests
         offerer.SelectedPair!.Nominated.Should().BeTrue();
     }
 
+    [Fact]
+    public async Task CheckListFormation_UnfreezesOnlyTheRepresentativePairPerFoundation()
+    {
+        var cancellationToken = Timeout();
+        using var agent = new IceAgent(LoopbackOptions(IceRole.Controlling));
+
+        var peerA = new IPEndPoint(IPAddress.Loopback, 41001);
+        var peerB = new IPEndPoint(IPAddress.Loopback, 41002);
+        var peerC = new IPEndPoint(IPAddress.Loopback, 41003);
+
+        // Added before gathering has produced a local candidate, so none of these can form a pair
+        // yet: all three form together in the single check-list rebuild that runs once the local
+        // host candidate appears, which is exactly when the per-foundation, priority-ordered
+        // tie-break (RFC 8445 section 6.1.2.6) has more than one candidate to choose from. peerA and
+        // peerB share a foundation; peerC has a distinct one. Remote credentials are never set, so
+        // TickLocked always bails out before it can start a check, keeping the check list's states
+        // below a pure snapshot of formation with no race against the background check loop.
+        agent.AddRemoteCandidate(new IceCandidate(
+            "grp", 1, "udp", 100u, peerA.Address, peerA.Port, IceCandidateType.Host));
+        agent.AddRemoteCandidate(new IceCandidate(
+            "grp", 1, "udp", 200u, peerB.Address, peerB.Port, IceCandidateType.Host));
+        agent.AddRemoteCandidate(new IceCandidate(
+            "solo", 1, "udp", 50u, peerC.Address, peerC.Port, IceCandidateType.Host));
+
+        await agent.StartGatheringAsync(cancellationToken);
+
+        var pairs = agent.CheckList;
+        pairs.Should().HaveCount(3);
+
+        var grouped = pairs.Where(p => p.Remote.Foundation == "grp").ToList();
+        grouped.Should().HaveCount(2);
+        grouped.Count(p => p.State == IceCandidatePairState.Frozen).Should().Be(1,
+            "only one pair per foundation may start unfrozen");
+        grouped.Single(p => p.State != IceCandidatePairState.Frozen).Remote.EndPoint.Should().Be(peerB,
+            "the higher-priority pair in a tied foundation group becomes the representative");
+
+        var solo = pairs.Single(p => p.Remote.Foundation == "solo");
+        solo.State.Should().Be(IceCandidatePairState.Waiting,
+            "a pair alone in its foundation is its own representative and starts checkable");
+    }
+
+    [Fact]
+    public async Task SuccessfulCheck_UnfreezesAndEventuallyChecksItsFoundationSiblings()
+    {
+        var cancellationToken = Timeout();
+        var options = LoopbackOptions(IceRole.Controlling);
+        options.MaxCheckTransmissions = 2; // fail the unreachable sibling quickly once unfrozen
+
+        using var offerer = new IceAgent(options);
+        using var reachable = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        // Bound but never driven by an ICE agent, so a check sent to it can never get an answer.
+        using var unreachableSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        unreachableSocket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var unreachableEndPoint = (IPEndPoint)unreachableSocket.LocalEndPoint!;
+
+        Trickle(offerer, reachable);
+        offerer.SetRemoteCredentials(reachable.LocalUfrag, reachable.LocalPassword);
+        reachable.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+
+        await offerer.StartGatheringAsync(cancellationToken);
+        await reachable.StartGatheringAsync(cancellationToken);
+
+        var reachableEndPoint = reachable.LocalEndPoint!;
+
+        // Both remote candidates share one foundation. The reachable one has the higher priority, so
+        // it becomes the initial representative and starts Waiting; the unreachable one starts Frozen.
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "grp", 1, "udp", priority: 2_000_000_000u, reachableEndPoint.Address, reachableEndPoint.Port,
+            IceCandidateType.Host));
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "grp", 1, "udp", priority: 500u, unreachableEndPoint.Address, unreachableEndPoint.Port,
+            IceCandidateType.Host));
+
+        offerer.CheckList.Single(p => Equals(p.RemoteEndPoint, unreachableEndPoint)).State
+            .Should().Be(IceCandidatePairState.Frozen);
+
+        (await WaitUntilAsync(
+            () => offerer.CheckList.Any(p =>
+                Equals(p.RemoteEndPoint, reachableEndPoint) && p.State == IceCandidatePairState.Succeeded),
+            ConnectTimeout)).Should().BeTrue();
+
+        // The success must release the Frozen sibling (RFC 8445 section 7.2.5.3.3) so it is actually
+        // scheduled - not just unfrozen and forgotten. It cannot succeed (nothing answers it), so
+        // seeing it reach Failed proves a check was really sent for it.
+        (await WaitUntilAsync(
+            () => offerer.CheckList.Single(p => Equals(p.RemoteEndPoint, unreachableEndPoint)).State
+                == IceCandidatePairState.Failed,
+            ConnectTimeout)).Should().BeTrue("the unfrozen sibling must eventually be checked, even though it can never succeed");
+    }
+
+    [Fact]
+    public async Task SingleFoundationScenario_StartsUnfrozenAndConnectsAsBefore()
+    {
+        var cancellationToken = Timeout();
+        using var offerer = new IceAgent(LoopbackOptions(IceRole.Controlling));
+        using var answerer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        Trickle(offerer, answerer);
+        Trickle(answerer, offerer);
+        offerer.SetRemoteCredentials(answerer.LocalUfrag, answerer.LocalPassword);
+        answerer.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+
+        await offerer.StartGatheringAsync(cancellationToken);
+        await answerer.StartGatheringAsync(cancellationToken);
+
+        // With one local candidate gathered on each side (no STUN/TURN configured), each agent's
+        // check list ends up holding exactly one pair: the sole representative of its own
+        // foundation. It must start checkable - never Frozen - exactly as before freezing existed.
+        (await WaitUntilAsync(() => offerer.CheckList.Count == 1, ConnectTimeout)).Should().BeTrue();
+        offerer.CheckList.Single().State.Should().NotBe(IceCandidatePairState.Frozen);
+
+        (await offerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+        (await answerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+        offerer.State.Should().Be(IceAgentState.Connected);
+        answerer.State.Should().Be(IceAgentState.Connected);
+    }
+
     [Theory]
     [InlineData(1000ul, 2000ul)]
     [InlineData(2000ul, 1000ul)]

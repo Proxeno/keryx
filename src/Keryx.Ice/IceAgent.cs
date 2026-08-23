@@ -50,8 +50,16 @@ namespace Keryx.Ice;
 /// per remote candidate formed against the highest-priority non-relayed local candidate, plus one
 /// per remote candidate for each TURN allocation; pair priorities still follow RFC 8445
 /// section 6.1.2.3, so relayed pairs (type preference 0) are only reached when the direct ones
-/// fail. Candidate pairs are never frozen - with one component
-/// and one stream every pair starts in <see cref="IceCandidatePairState.Waiting"/>.</para>
+/// fail.</para>
+/// <para><b>Freezing.</b> Pairs start <see cref="IceCandidatePairState.Frozen"/> except one
+/// representative per foundation, which starts <see cref="IceCandidatePairState.Waiting"/> so
+/// checking can begin (RFC 8445 section 6.1.2.6); with every candidate this agent produces on
+/// component 1, the spec's "lowest component ID" tie-break never applies, so the representative is
+/// simply the highest-priority pair newly sharing a not-yet-seen foundation. A success on any pair
+/// unfreezes every other pair - present or later trickled in - that shares its foundation (sections
+/// 7.2.5.3.3 and 6.1.4.2). The scheduler still only ever starts a
+/// <see cref="IceCandidatePairState.Waiting"/> pair, so freezing changes the order checks run in,
+/// never whether a pair eventually gets checked.</para>
 /// </remarks>
 public sealed class IceAgent : IDisposable
 {
@@ -66,6 +74,8 @@ public sealed class IceAgent : IDisposable
     private readonly List<IceCandidate> _localCandidates = [];
     private readonly List<IceCandidate> _remoteCandidates = [];
     private readonly List<IceCandidatePair> _pairs = [];
+    private readonly HashSet<string> _foundationsWithRepresentative = [];
+    private readonly HashSet<string> _unfrozenFoundations = [];
     private readonly Dictionary<StunTransactionId, OutstandingCheck> _checks = [];
     private readonly Queue<IceCandidatePair> _triggered = new();
     private readonly List<RelayAllocation> _allocations = [];
@@ -1296,6 +1306,7 @@ public sealed class IceAgent : IDisposable
             }
 
             check.Pair.State = IceCandidatePairState.Succeeded;
+            UnfreezeFoundationLocked(check.Pair.FoundationPair);
             if (ReferenceEquals(check.Pair, _selected))
             {
                 // Consent is fresh only for the pair actually carrying media; a success on some
@@ -1591,6 +1602,7 @@ public sealed class IceAgent : IDisposable
             return;
         }
 
+        HashSet<IceCandidatePair>? newPairs = null;
         foreach (var remote in _remoteCandidates)
         {
             // The direct pair: one per remote candidate, against the highest-priority local
@@ -1611,7 +1623,9 @@ public sealed class IceAgent : IDisposable
 
                 if (local is not null)
                 {
-                    _pairs.Add(new IceCandidatePair(local, remote, _role));
+                    var pair = new IceCandidatePair(local, remote, _role);
+                    _pairs.Add(pair);
+                    (newPairs ??= []).Add(pair);
                 }
             }
 
@@ -1626,11 +1640,66 @@ public sealed class IceAgent : IDisposable
                     continue;
                 }
 
-                _pairs.Add(new IceCandidatePair(relay, remote, _role));
+                var relayedPair = new IceCandidatePair(relay, remote, _role);
+                _pairs.Add(relayedPair);
+                (newPairs ??= []).Add(relayedPair);
             }
         }
 
         _pairs.Sort(static (a, b) => b.Priority.CompareTo(a.Priority));
+
+        if (newPairs is null)
+        {
+            return;
+        }
+
+        // RFC 8445 section 6.1.2.6: assign starting states in priority order so that, among several
+        // pairs newly sharing a not-yet-seen foundation, the highest-priority one becomes the
+        // per-foundation representative that starts Waiting - the spec's "lowest component ID, ties
+        // broken by priority" rule collapses to exactly this because every candidate here is
+        // component 1. _pairs is already sorted by priority above.
+        foreach (var pair in _pairs)
+        {
+            if (newPairs.Contains(pair))
+            {
+                SetInitialPairStateLocked(pair);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Assigns a newly formed pair's starting state (RFC 8445 section 6.1.2.6): Frozen, unless it is
+    /// either the first pair seen for its foundation - which becomes that foundation's Waiting
+    /// representative - or its foundation has already succeeded once, in which case there is nothing
+    /// to gain by freezing it: section 7.2.5.3.3 would unfreeze it the moment it existed anyway.
+    /// </summary>
+    private void SetInitialPairStateLocked(IceCandidatePair pair)
+    {
+        var foundation = pair.FoundationPair;
+        pair.State = _unfrozenFoundations.Contains(foundation) || _foundationsWithRepresentative.Add(foundation)
+            ? IceCandidatePairState.Waiting
+            : IceCandidatePairState.Frozen;
+    }
+
+    /// <summary>
+    /// RFC 8445 sections 7.2.5.3.3 / 6.1.4.2: once a check on any pair succeeds, every other pair
+    /// sharing its foundation - already in the check list or trickled in later - is released from
+    /// Frozen to Waiting instead of waiting for its own turn as a fresh representative.
+    /// </summary>
+    private void UnfreezeFoundationLocked(string foundation)
+    {
+        if (!_unfrozenFoundations.Add(foundation))
+        {
+            return;
+        }
+
+        foreach (var pair in _pairs)
+        {
+            if (pair.State == IceCandidatePairState.Frozen && pair.FoundationPair == foundation)
+            {
+                pair.State = IceCandidatePairState.Waiting;
+            }
+        }
     }
 
     /// <summary>
