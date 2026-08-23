@@ -69,11 +69,19 @@ internal sealed class TestTurnServer : IDisposable
     public bool EnforcePermissions { get; set; } = true;
 
     /// <summary>
-    /// True to prefix the nonce with RFC 8489 section 9.2's "obMatJos2" cookie and set the
-    /// password-algorithms Security Feature bit, which an MD5-only client must refuse rather than
-    /// retry against.
+    /// True to prefix the nonce with RFC 8489 section 9.2's "obMatJos2" cookie, set the
+    /// password-algorithms Security Feature bit, and carry a PASSWORD-ALGORITHMS attribute (built
+    /// from <see cref="OfferedPasswordAlgorithms"/>) on every challenge.
     /// </summary>
     public bool AdvertisePasswordAlgorithms { get; set; }
+
+    /// <summary>
+    /// The RFC 8489 password algorithms offered in PASSWORD-ALGORITHMS, in preferential order, when
+    /// <see cref="AdvertisePasswordAlgorithms"/> is set. Defaults to SHA-256 preferred over MD5, so a
+    /// client that implements the negotiation picks SHA-256.
+    /// </summary>
+    public IReadOnlyList<StunPasswordAlgorithm> OfferedPasswordAlgorithms { get; set; } =
+        [StunPasswordAlgorithm.Sha256, StunPasswordAlgorithm.Md5];
 
     /// <summary>When positive, every authenticated Allocate is refused with this error code.</summary>
     public int RefuseAllocationsWith { get; set; }
@@ -233,15 +241,27 @@ internal sealed class TestTurnServer : IDisposable
             return;
         }
 
-        if (message.Method == StunMethod.Allocate && !message.HasAttribute(StunAttributeType.MessageIntegrity))
+        var hasIntegrity = message.HasAttribute(StunAttributeType.MessageIntegrity)
+            || message.HasAttribute(StunAttributeType.MessageIntegritySha256);
+        if (message.Method == StunMethod.Allocate && !hasIntegrity)
         {
             Interlocked.Increment(ref UnauthenticatedAllocates);
             SendChallenge(message, from, StunErrorCodeAttribute.Unauthorized, "Unauthorized");
             return;
         }
 
-        var key = StunCredentials.LongTermKey(Username, Realm, Password);
-        if (message.Username != Username || !StunMessage.ValidateMessageIntegrity(raw, key))
+        // RFC 8489 section 9.2.4: once the nonce we issued advertised password algorithms, a
+        // request carrying PASSWORD-ALGORITHM is keyed and signed accordingly; anything else - no
+        // PASSWORD-ALGORITHM, or the feature never advertised - is processed as plain MD5/MESSAGE-INTEGRITY.
+        var requestAlgorithm = message.GetAttribute<StunPasswordAlgorithmAttribute>();
+        var useSha256 = AdvertisePasswordAlgorithms && requestAlgorithm is not null;
+        var algorithm = useSha256 ? (StunPasswordAlgorithm)requestAlgorithm!.Algorithm : StunPasswordAlgorithm.Md5;
+
+        var key = StunCredentials.LongTermKey(Username, Realm, Password, algorithm);
+        var integrityValid = useSha256
+            ? StunMessage.ValidateMessageIntegritySha256(raw, key)
+            : StunMessage.ValidateMessageIntegrity(raw, key);
+        if (message.Username != Username || !integrityValid)
         {
             SendChallenge(message, from, StunErrorCodeAttribute.Unauthorized, "Unauthorized");
             return;
@@ -270,30 +290,30 @@ internal sealed class TestTurnServer : IDisposable
         switch (message.Method)
         {
             case StunMethod.Allocate:
-                HandleAllocate(message, from, key);
+                HandleAllocate(message, from, key, useSha256);
                 break;
             case StunMethod.Refresh:
-                HandleRefresh(message, from, key);
+                HandleRefresh(message, from, key, useSha256);
                 break;
             case StunMethod.CreatePermission:
-                HandleCreatePermission(message, from, key);
+                HandleCreatePermission(message, from, key, useSha256);
                 break;
             case StunMethod.ChannelBind:
-                HandleChannelBind(message, from, key);
+                HandleChannelBind(message, from, key, useSha256);
                 break;
             default:
-                Send(StunMessage.CreateErrorResponse(message, StunErrorCodeAttribute.BadRequest, "Bad Request"), from, key);
+                Send(StunMessage.CreateErrorResponse(message, StunErrorCodeAttribute.BadRequest, "Bad Request"), from, key, useSha256);
                 break;
         }
     }
 
-    private void HandleAllocate(StunMessage request, IPEndPoint from, byte[] key)
+    private void HandleAllocate(StunMessage request, IPEndPoint from, byte[] key, bool useSha256)
     {
         Interlocked.Increment(ref AuthenticatedAllocates);
 
         if (RefuseAllocationsWith > 0)
         {
-            Send(StunMessage.CreateErrorResponse(request, RefuseAllocationsWith, "Refused"), from, key);
+            Send(StunMessage.CreateErrorResponse(request, RefuseAllocationsWith, "Refused"), from, key, useSha256);
             return;
         }
 
@@ -302,7 +322,8 @@ internal sealed class TestTurnServer : IDisposable
             Send(
                 StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.UnsupportedTransportProtocol, "Unsupported Transport Protocol"),
                 from,
-                key);
+                key,
+                useSha256);
             return;
         }
 
@@ -311,7 +332,7 @@ internal sealed class TestTurnServer : IDisposable
         {
             if (_relay is not null && _client is not null && !_client.Equals(from))
             {
-                Send(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.AllocationMismatch, "Allocation Mismatch"), from, key);
+                Send(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.AllocationMismatch, "Allocation Mismatch"), from, key, useSha256);
                 return;
             }
 
@@ -331,10 +352,10 @@ internal sealed class TestTurnServer : IDisposable
             .Add(new StunXorRelayedAddressAttribute(relayed))
             .Add(new StunXorMappedAddressAttribute(from))
             .Add(new StunLifetimeAttribute(GrantedLifetime));
-        Send(response, from, key);
+        Send(response, from, key, useSha256);
     }
 
-    private void HandleRefresh(StunMessage request, IPEndPoint from, byte[] key)
+    private void HandleRefresh(StunMessage request, IPEndPoint from, byte[] key, bool useSha256)
     {
         var requested = request.GetAttribute<StunLifetimeAttribute>()?.Seconds ?? (uint)GrantedLifetime.TotalSeconds;
         if (requested == 0)
@@ -349,15 +370,15 @@ internal sealed class TestTurnServer : IDisposable
                 _channelsByPeer.Clear();
             }
 
-            Send(StunMessage.CreateSuccessResponse(request).Add(new StunLifetimeAttribute(0u)), from, key);
+            Send(StunMessage.CreateSuccessResponse(request).Add(new StunLifetimeAttribute(0u)), from, key, useSha256);
             return;
         }
 
         Interlocked.Increment(ref RefreshRequests);
-        Send(StunMessage.CreateSuccessResponse(request).Add(new StunLifetimeAttribute(GrantedLifetime)), from, key);
+        Send(StunMessage.CreateSuccessResponse(request).Add(new StunLifetimeAttribute(GrantedLifetime)), from, key, useSha256);
     }
 
-    private void HandleCreatePermission(StunMessage request, IPEndPoint from, byte[] key)
+    private void HandleCreatePermission(StunMessage request, IPEndPoint from, byte[] key, bool useSha256)
     {
         Interlocked.Increment(ref CreatePermissionRequests);
         var expiry = DateTimeOffset.UtcNow.AddSeconds(StunLifetimeAttribute.PermissionSeconds);
@@ -372,17 +393,17 @@ internal sealed class TestTurnServer : IDisposable
             }
         }
 
-        Send(StunMessage.CreateSuccessResponse(request), from, key);
+        Send(StunMessage.CreateSuccessResponse(request), from, key, useSha256);
     }
 
-    private void HandleChannelBind(StunMessage request, IPEndPoint from, byte[] key)
+    private void HandleChannelBind(StunMessage request, IPEndPoint from, byte[] key, bool useSha256)
     {
         Interlocked.Increment(ref ChannelBindRequests);
         var channel = request.GetAttribute<StunChannelNumberAttribute>();
         var peer = request.GetAttribute<StunXorPeerAddressAttribute>()?.EndPoint;
         if (channel is null || peer is null)
         {
-            Send(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.BadRequest, "Bad Request"), from, key);
+            Send(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.BadRequest, "Bad Request"), from, key, useSha256);
             return;
         }
 
@@ -395,7 +416,7 @@ internal sealed class TestTurnServer : IDisposable
             _permissions[peer.Address] = DateTimeOffset.UtcNow.AddSeconds(StunLifetimeAttribute.PermissionSeconds);
         }
 
-        Send(StunMessage.CreateSuccessResponse(request), from, key);
+        Send(StunMessage.CreateSuccessResponse(request), from, key, useSha256);
     }
 
     private void RelayToPeerByChannel(ushort channelNumber, ReadOnlySpan<byte> payload)
@@ -527,14 +548,25 @@ internal sealed class TestTurnServer : IDisposable
         var response = StunMessage.CreateErrorResponse(request, code, reason)
             .Add(new StunRealmAttribute(Realm))
             .Add(new StunNonceAttribute(nonce));
+
+        if (AdvertisePasswordAlgorithms && OfferedPasswordAlgorithms.Count > 0)
+        {
+            // RFC 8489 section 9.2.4: a challenge whose nonce advertises the password-algorithms
+            // feature must carry PASSWORD-ALGORITHMS so the client has something to negotiate with.
+            // An empty OfferedPasswordAlgorithms models a misbehaving server that sets the nonce
+            // cookie's feature bit but never actually attaches the attribute.
+            response.Add(new StunPasswordAlgorithmsAttribute(
+                OfferedPasswordAlgorithms.Select(a => new StunPasswordAlgorithmEntry(a))));
+        }
+
         Send(response, from, key: null);
     }
 
-    private void Send(StunMessage message, IPEndPoint to, byte[]? key)
+    private void Send(StunMessage message, IPEndPoint to, byte[]? key, bool useSha256 = false)
     {
         try
         {
-            _control.SendTo(message.Encode(key, appendFingerprint: true), SocketFlags.None, to);
+            _control.SendTo(message.Encode(key, appendFingerprint: true, useMessageIntegritySha256: useSha256), SocketFlags.None, to);
         }
         catch (Exception)
         {

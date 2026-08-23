@@ -262,4 +262,20 @@ public sealed class Rfc5769VectorTests
 
         rebuilt.Encode(key).Should().Equal(SampleLongTermRequest);
     }
+
+    [Fact]
+    public void Rfc8489Sha256PasswordAlgorithm_KeyMatchesAnIndependentlyComputedDigest()
+    {
+        // RFC 8489 publishes no worked SHA-256 long-term-key vector the way RFC 5769 does for MD5
+        // (its Appendix B.1 vector is a full encoded message, not a standalone key), so this reuses
+        // the section 2.4 username/realm/password and checks the SHA-256(username ":" realm ":"
+        // password) key against a digest computed independently with `openssl dgst -sha256` and
+        // Python's hashlib, rather than against Keryx's own SHA256.HashData call.
+        var key = StunCredentials.LongTermKey(
+            "マトリックス", "example.org", "TheMatrIX", StunPasswordAlgorithm.Sha256);
+
+        Convert.ToHexStringLower(key).Should().Be(
+            "dd295a613b9058c3c23d6dc7165bda072304d989c9d0af3a8c7e184b4f9bb4a1");
+        key.Should().HaveCount(32);
+    }
 }

@@ -121,7 +121,11 @@ public sealed class StunClient
     /// <param name="request">The request to send; its transaction id must not already be in flight.</param>
     /// <param name="server">The server's transport address.</param>
     /// <param name="integrityKey">
-    /// The HMAC-SHA1 key to sign the request with, or null to send it unauthenticated.
+    /// The key to sign the request with, or null to send it unauthenticated.
+    /// </param>
+    /// <param name="useMessageIntegritySha256">
+    /// True to sign with MESSAGE-INTEGRITY-SHA256 (RFC 8489 section 14.6) instead of the default
+    /// MESSAGE-INTEGRITY, once RFC 8489 password-algorithm negotiation has selected it.
     /// </param>
     /// <param name="cancellationToken">Cancels the transaction.</param>
     /// <returns>The success or error response.</returns>
@@ -130,6 +134,7 @@ public sealed class StunClient
         StunMessage request,
         IPEndPoint server,
         byte[]? integrityKey = null,
+        bool useMessageIntegritySha256 = false,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -140,7 +145,7 @@ public sealed class StunClient
             request.Add(new StunSoftwareAttribute(software));
         }
 
-        var encoded = request.Encode(integrityKey, appendFingerprint: _options.AddFingerprint);
+        var encoded = request.Encode(integrityKey, appendFingerprint: _options.AddFingerprint, useMessageIntegritySha256);
         return await TransactAsync(request.TransactionId, encoded, server, cancellationToken).ConfigureAwait(false);
     }
 

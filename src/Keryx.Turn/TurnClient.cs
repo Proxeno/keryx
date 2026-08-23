@@ -73,6 +73,8 @@ public sealed class TurnClient : IDisposable
     private string? _realm;
     private string? _nonce;
     private byte[]? _key;
+    private StunPasswordAlgorithm? _passwordAlgorithm;
+    private StunPasswordAlgorithmsAttribute? _pendingPasswordAlgorithmsEcho;
     private IPEndPoint? _relayed;
     private IPEndPoint? _mapped;
     private TimeSpan _grantedLifetime;
@@ -196,7 +198,9 @@ public sealed class TurnClient : IDisposable
     /// <summary>
     /// Runs the Allocate transaction, including the RFC 8656 section 9.2 long-term-credential
     /// dance: an unauthenticated Allocate draws a 401 carrying REALM and NONCE, and the request is
-    /// re-sent signed with MESSAGE-INTEGRITY over <c>MD5(username:realm:password)</c>.
+    /// re-sent signed with MESSAGE-INTEGRITY over <c>MD5(username:realm:password)</c> - or, when
+    /// the server negotiates RFC 8489 password algorithms, MESSAGE-INTEGRITY-SHA256 over an MD5- or
+    /// SHA-256-derived key (see <see cref="StunPasswordAlgorithm"/>).
     /// </summary>
     /// <param name="cancellationToken">Cancels the transaction.</param>
     /// <returns>The relayed transport address the server allocated.</returns>
@@ -332,6 +336,7 @@ public sealed class TurnClient : IDisposable
         byte[]? key;
         string? realm;
         string? nonce;
+        StunPasswordAlgorithm? algorithm;
         lock (_lock)
         {
             if (_relayed is null)
@@ -342,6 +347,7 @@ public sealed class TurnClient : IDisposable
             key = _key;
             realm = _realm;
             nonce = _nonce;
+            algorithm = _passwordAlgorithm;
             _relayed = null;
             _mapped = null;
             _permissions.Clear();
@@ -360,9 +366,14 @@ public sealed class TurnClient : IDisposable
             .Add(new StunRealmAttribute(realm))
             .Add(new StunNonceAttribute(nonce));
 
+        if (algorithm is { } selected)
+        {
+            request.Add(new StunPasswordAlgorithmAttribute(selected));
+        }
+
         try
         {
-            _sender(request.Encode(key, appendFingerprint: true), _server);
+            _sender(request.Encode(key, appendFingerprint: true, useMessageIntegritySha256: algorithm is not null), _server);
             _logger.Log(KeryxLogLevel.Debug, $"TURN allocation on {_server} released (fire and forget).");
         }
         catch (SocketException ex)
@@ -673,7 +684,8 @@ public sealed class TurnClient : IDisposable
 
     /// <summary>
     /// True when the challenge advertises RFC 8489's password-algorithms Security Feature, which
-    /// makes the RFC 5389 MD5-only key derivation unusable against that server.
+    /// means the client must negotiate a PASSWORD-ALGORITHM rather than assume the RFC 5389
+    /// MD5-and-HMAC-SHA1 defaults.
     /// </summary>
     private static bool RequiresPasswordAlgorithmNegotiation(StunMessage response)
     {
@@ -722,28 +734,58 @@ public sealed class TurnClient : IDisposable
             string? realm;
             string? nonce;
             byte[]? key;
+            StunPasswordAlgorithm? algorithm;
+            StunPasswordAlgorithmsAttribute? algorithmsEcho;
             lock (_lock)
             {
                 realm = _realm;
                 nonce = _nonce;
                 key = _key;
+                algorithm = _passwordAlgorithm;
+                algorithmsEcho = _pendingPasswordAlgorithmsEcho;
+
+                // The echo is one-shot: RFC 8489 section 9.2.5 only requires it on the retry that
+                // immediately answers the challenge which offered it, not on every request after.
+                _pendingPasswordAlgorithmsEcho = null;
             }
 
             var request = factory();
             if (key is not null && realm is not null && nonce is not null)
             {
                 // RFC 8656 section 9.2: an authenticated request repeats the USERNAME, REALM and
-                // NONCE from the challenge, and MESSAGE-INTEGRITY keys on MD5(username:realm:password).
+                // NONCE from the challenge, and message integrity keys on the negotiated password
+                // algorithm's key (RFC 5389 MD5 by default, or RFC 8489 PASSWORD-ALGORITHM).
                 request.Add(new StunUsernameAttribute(_username))
                     .Add(new StunRealmAttribute(realm))
                     .Add(new StunNonceAttribute(nonce));
+
+                if (algorithm is { } selected)
+                {
+                    // RFC 8489 section 9.2.3.2: every request after negotiation names the algorithm
+                    // the key was derived with.
+                    request.Add(new StunPasswordAlgorithmAttribute(selected));
+                }
+
+                if (algorithmsEcho is not null)
+                {
+                    // RFC 8489 section 9.2.5: echo PASSWORD-ALGORITHMS back unmodified so the server
+                    // can detect a bid-down attacker having tampered with the list in transit.
+                    request.Add(algorithmsEcho);
+                }
             }
 
-            var response = await _stun.RequestAsync(request, _server, key, cancellationToken).ConfigureAwait(false);
+            // RFC 8489 section 9.2.5: once a response has carried PASSWORD-ALGORITHMS, every request
+            // from then on is authenticated with MESSAGE-INTEGRITY-SHA256 instead of MESSAGE-INTEGRITY
+            // - independent of which PASSWORD-ALGORITHM ended up selected for the key itself.
+            var useSha256Integrity = algorithm is not null;
+            var response = await _stun.RequestAsync(request, _server, key, useSha256Integrity, cancellationToken)
+                .ConfigureAwait(false);
 
             if (response.Class == StunClass.SuccessResponse)
             {
-                if (key is not null && !response.ValidateMessageIntegrity(key))
+                var validated = key is null
+                    || (useSha256Integrity ? response.ValidateMessageIntegritySha256(key) : response.ValidateMessageIntegrity(key));
+                if (!validated)
                 {
                     throw new StunFormatException(
                         $"The {request.Method} success response from {_server} failed MESSAGE-INTEGRITY validation.");
@@ -760,15 +802,29 @@ public sealed class TurnClient : IDisposable
             // and nonce to use; 438 says the nonce we used has aged out and carries a fresh one.
             // Both are answered by adopting what the response carries and re-sending once.
             var isChallenge = code is StunErrorCodeAttribute.Unauthorized or StunErrorCodeAttribute.StaleNonce;
+
+            var negotiatedAlgorithm = algorithm;
+            StunPasswordAlgorithmsAttribute? offeredAlgorithms = null;
             if (isChallenge && RequiresPasswordAlgorithmNegotiation(response))
             {
-                // RFC 8489 section 9.2.5: when the nonce advertises the password-algorithms feature
-                // the client must echo PASSWORD-ALGORITHMS and pick a PASSWORD-ALGORITHM, and MUST
-                // NOT retry if it cannot. Keryx keys long-term credentials the RFC 5389 way, with
-                // MD5 and HMAC-SHA1, which RFC 8489 still permits and which is all coturn accepts -
-                // so this is a clean refusal rather than a retry loop.
-                throw new StunFormatException(
-                    $"The TURN server at {_server} requires the RFC 8489 password-algorithm negotiation, which Keryx does not implement.");
+                offeredAlgorithms = response.GetAttribute<StunPasswordAlgorithmsAttribute>();
+                if (offeredAlgorithms is null)
+                {
+                    // RFC 8489 section 9.2.5: the nonce cookie advertises the feature but the
+                    // response carries no PASSWORD-ALGORITHMS - the client MUST NOT retry.
+                    throw new StunFormatException(
+                        $"The {code} response from {_server} advertised RFC 8489 password algorithms in its NONCE but carried no PASSWORD-ALGORITHMS attribute.");
+                }
+
+                negotiatedAlgorithm = SelectPasswordAlgorithm(offeredAlgorithms);
+                if (negotiatedAlgorithm is null)
+                {
+                    // RFC 8489 section 9.2.5: none of the offered algorithms are ones the client
+                    // supports - the client MUST NOT retry.
+                    throw new StunFormatException(
+                        $"The TURN server at {_server} only offered RFC 8489 password algorithms Keryx does not implement: "
+                        + string.Join(", ", offeredAlgorithms.Algorithms) + ".");
+                }
             }
 
             // RFC 8489 section 9.2.5: a 401 answering a request that was already authenticated means
@@ -777,7 +833,7 @@ public sealed class TurnClient : IDisposable
             // realm justifies another attempt; anything else would be an infinite challenge loop.
             var isStaleNonce = code == StunErrorCodeAttribute.StaleNonce;
             var isFirstChallenge = key is null;
-            var realmChanged = response.Realm is { } offered && !string.Equals(offered, realm, StringComparison.Ordinal);
+            var realmChanged = response.Realm is { } offeredRealm && !string.Equals(offeredRealm, realm, StringComparison.Ordinal);
             if (isChallenge && !(isStaleNonce || isFirstChallenge || realmChanged))
             {
                 throw new StunErrorResponseException(code, reason);
@@ -795,17 +851,39 @@ public sealed class TurnClient : IDisposable
                 {
                     _realm = freshRealm;
                     _nonce = freshNonce;
-                    _key = StunCredentials.LongTermKey(_username, freshRealm, _credential);
+                    _passwordAlgorithm = negotiatedAlgorithm;
+                    _key = StunCredentials.LongTermKey(
+                        _username, freshRealm, _credential, negotiatedAlgorithm ?? StunPasswordAlgorithm.Md5);
+                    _pendingPasswordAlgorithmsEcho = offeredAlgorithms;
                 }
 
                 _logger.Log(
                     KeryxLogLevel.Debug,
-                    $"TURN {request.Method} to {_server} answered {code}; retrying with realm '{freshRealm}'.");
+                    $"TURN {request.Method} to {_server} answered {code}; retrying with realm '{freshRealm}'"
+                    + (negotiatedAlgorithm is { } picked ? $" using RFC 8489 password algorithm {picked}." : "."));
                 continue;
             }
 
             throw new StunErrorResponseException(code, reason);
         }
+    }
+
+    /// <summary>
+    /// Picks the first algorithm in <paramref name="offered"/> that Keryx implements, preserving the
+    /// server's preference order (RFC 8489 section 9.2.5: "the first algorithm supported on the
+    /// list"). Null when none of the offered algorithms are supported.
+    /// </summary>
+    private static StunPasswordAlgorithm? SelectPasswordAlgorithm(StunPasswordAlgorithmsAttribute offered)
+    {
+        foreach (var code in offered.Algorithms)
+        {
+            if (code is (ushort)StunPasswordAlgorithm.Md5 or (ushort)StunPasswordAlgorithm.Sha256)
+            {
+                return (StunPasswordAlgorithm)code;
+            }
+        }
+
+        return null;
     }
 
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
