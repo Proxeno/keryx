@@ -162,45 +162,16 @@ public sealed class SubscriberEgressTests
                 return;
             }
 
-            if (rtxPayloadType is { } rtxPt && info.PayloadType == rtxPt)
+            // The subscriber decapsulates RFC 4588 RTX itself: a repair arrives here as ordinary media
+            // on its original sequence number, never as a raw rtx-payload-type packet. A sequence number
+            // the link dropped on the forwarded media stream can therefore only reach the handler as a
+            // decapsulated repair, so its arrival is ground-truth proof the RTX was reconstructed.
+            arrived.Add(info.SequenceNumber);
+            if (dropped.Contains(info.SequenceNumber))
             {
-                // RFC 4588 §4: reconstruct the original packet from the repair, as any receiver must.
-                Span<byte> rtxPacket = stackalloc byte[2048];
-                Span<byte> original = stackalloc byte[2048];
-                var header = new RtpHeader
-                {
-                    Version = RtpHeader.SupportedVersion,
-                    Marker = info.Marker,
-                    PayloadType = info.PayloadType,
-                    SequenceNumber = info.SequenceNumber,
-                    Timestamp = info.Timestamp,
-                    Ssrc = info.Ssrc,
-                };
-
-                if (payload.Length + RtpHeader.FixedLength > rtxPacket.Length
-                    || !header.TryWriteTo(rtxPacket, out var headerLength))
-                {
-                    return;
-                }
-
-                payload.CopyTo(rtxPacket[headerLength..]);
-                if (RtxPacket.TryDecapsulate(
-                        rtxPacket[..(headerLength + payload.Length)],
-                        Volatile.Read(ref mediaSsrc),
-                        mediaPayloadType,
-                        original,
-                        out var length,
-                        out var originalSequenceNumber)
-                    && RtpPacket.TryParse(original[..length], out var reconstructed)
-                    && reconstructed.Header.SequenceNumber == originalSequenceNumber)
-                {
-                    recovered.Add(originalSequenceNumber);
-                }
-
-                return;
+                recovered.Add(info.SequenceNumber);
             }
 
-            arrived.Add(info.SequenceNumber);
             if (Interlocked.CompareExchange(ref haveWindow, 1, 0) == 0)
             {
                 first = info.SequenceNumber;

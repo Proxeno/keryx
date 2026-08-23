@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
 using FluentAssertions;
-using Keryx.Rtp;
 using Keryx.Sdp;
 using Xunit.Abstractions;
 
@@ -216,8 +215,6 @@ internal sealed class LossReport
 /// </remarks>
 internal static class LossRecoveryHarness
 {
-    private const int MaxDatagram = 2048;
-
     /// <summary>Runs one experiment end to end.</summary>
     /// <param name="scenario">What to impair and how much media to push.</param>
     /// <param name="output">Where the report is written.</param>
@@ -305,7 +302,6 @@ internal static class LossRecoveryHarness
         await sender.SetRemoteDescriptionAsync(answer, SdpType.Answer, cancellationToken);
 
         var rtxPayloadType = sender.NegotiatedVideoRtxPayloadType;
-        var mediaPayloadType = MediaPayloadType(offer);
 
         receiver.OnRtpPacketReceived += (in RtpPacketInfo info, ReadOnlySpan<byte> payload) =>
         {
@@ -314,51 +310,16 @@ internal static class LossRecoveryHarness
                 return;
             }
 
-            if (rtxPayloadType is { } rtxPt && info.PayloadType == rtxPt)
-            {
-                // RFC 4588 §4: reconstruct the original packet from the repair, exactly as a receiver
-                // must before handing it to the jitter buffer.
-                Span<byte> rtxPacket = stackalloc byte[MaxDatagram];
-                Span<byte> original = stackalloc byte[MaxDatagram];
-                var header = new RtpHeader
-                {
-                    Version = RtpHeader.SupportedVersion,
-                    Marker = info.Marker,
-                    PayloadType = info.PayloadType,
-                    SequenceNumber = info.SequenceNumber,
-                    Timestamp = info.Timestamp,
-                    Ssrc = info.Ssrc,
-                };
-
-                if (payload.Length + RtpHeader.FixedLength > MaxDatagram
-                    || !header.TryWriteTo(rtxPacket, out var headerLength))
-                {
-                    Interlocked.Increment(ref malformedRepairs);
-                    return;
-                }
-
-                payload.CopyTo(rtxPacket[headerLength..]);
-                if (!RtxPacket.TryDecapsulate(
-                        rtxPacket[..(headerLength + payload.Length)],
-                        Volatile.Read(ref mediaSsrc),
-                        mediaPayloadType,
-                        original,
-                        out var length,
-                        out var originalSequenceNumber)
-                    || !RtpPacket.TryParse(original[..length], out var reconstructed)
-                    || reconstructed.Header.SequenceNumber != originalSequenceNumber
-                    || reconstructed.Header.Ssrc != Volatile.Read(ref mediaSsrc)
-                    || reconstructed.Header.PayloadType != mediaPayloadType)
-                {
-                    Interlocked.Increment(ref malformedRepairs);
-                    return;
-                }
-
-                recovered.Add(originalSequenceNumber);
-                return;
-            }
-
+            // The receiver now decapsulates RFC 4588 RTX itself: a repair arrives here as an ordinary
+            // media packet on its original SSRC, sequence number and payload type — never as a raw
+            // rtx-payload-type packet — exactly as a directly received packet would. A sequence number
+            // the link dropped on the media stream can therefore only reach the handler as a repair, so
+            // its arrival here is ground-truth proof the RTX was reconstructed and delivered.
             arrived.Add(info.SequenceNumber);
+            if (dropped.Contains(info.SequenceNumber))
+            {
+                recovered.Add(info.SequenceNumber);
+            }
 
             if (Interlocked.CompareExchange(ref haveWindow, 1, 0) == 0)
             {
@@ -528,13 +489,14 @@ internal static class LossRecoveryHarness
                 continue;
             }
 
-            if (arrived.Contains(sequenceNumber))
+            if (recovered.Contains(sequenceNumber))
+            {
+                // Dropped on the media stream, so its arrival can only be a decapsulated repair.
+                repaired++;
+            }
+            else if (arrived.Contains(sequenceNumber))
             {
                 direct++;
-            }
-            else if (recovered.Contains(sequenceNumber))
-            {
-                repaired++;
             }
             else
             {
@@ -649,29 +611,4 @@ internal static class LossRecoveryHarness
     /// <returns>A value in -32768..32767.</returns>
     private static int Distance(ushort sequenceNumber, ushort anchor) =>
         unchecked((short)(sequenceNumber - anchor));
-
-    /// <summary>Reads the primary video payload type out of the offer the sender built.</summary>
-    private static byte MediaPayloadType(string offerSdp)
-    {
-        var offer = SessionDescription.Parse(offerSdp);
-        foreach (var media in offer.MediaDescriptions)
-        {
-            if (!string.Equals(media.Media, "video", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            foreach (var payloadType in media.GetPayloadTypes())
-            {
-                var rtpMap = media.GetRtpMap(payloadType);
-                if (rtpMap is not null
-                    && !string.Equals(rtpMap.EncodingName, "rtx", StringComparison.OrdinalIgnoreCase))
-                {
-                    return (byte)payloadType;
-                }
-            }
-        }
-
-        throw new InvalidOperationException("The offer carries no video codec.");
-    }
 }

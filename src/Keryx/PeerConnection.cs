@@ -1169,11 +1169,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
         string? ufrag = null;
         string? password = null;
         var routes = new Dictionary<byte, RtpRoute>();
+        var rtxToMedia = new Dictionary<uint, uint>();
 
         foreach (var media in offer.MediaDescriptions)
         {
             ufrag ??= media.IceUfrag ?? offer.IceUfrag;
             password ??= media.IcePwd ?? offer.IcePwd;
+            CollectFidAssociations(media.GetSsrcGroups(), rtxToMedia);
 
             lock (_lock)
             {
@@ -1214,7 +1216,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
                             && routes.ContainsKey((byte)apt))
                         {
                             routes[(byte)payloadType] = new RtpRoute(
-                                media.Mid ?? string.Empty, kind, (uint)rtpMap.ClockRate, IsRtx: true);
+                                media.Mid ?? string.Empty,
+                                kind,
+                                (uint)rtpMap.ClockRate,
+                                IsRtx: true,
+                                AptPayloadType: (byte)apt);
                         }
 
                         continue;
@@ -1242,6 +1248,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         Volatile.Write(ref _routes, routes);
+        Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);
         Volatile.Write(ref _simulcastByMid, BuildSimulcastTrackers(offer));
         _logger.Log(
             KeryxLogLevel.Info,
@@ -1318,11 +1325,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
         string? password = null;
         byte? transportCcExtensionId = null;
         var routes = new Dictionary<byte, RtpRoute>();
+        var rtxToMedia = new Dictionary<uint, uint>();
 
         foreach (var media in result.Media)
         {
             ufrag ??= media.IceUfrag;
             password ??= media.IcePwd;
+            CollectFidAssociations(media.Answered.GetSsrcGroups(), rtxToMedia);
 
             // The extension is transport-wide across the BUNDLE, so the first section that kept it fixes
             // the id the send path stamps. An id outside the one-byte range disables stamping.
@@ -1401,7 +1410,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     {
                         rtxPayloadType = (byte)rtx.PayloadType;
                         routes[(byte)rtx.PayloadType] = new RtpRoute(
-                            media.Mid ?? string.Empty, kind, (uint)rtx.ClockRate, IsRtx: true);
+                            media.Mid ?? string.Empty,
+                            kind,
+                            (uint)rtx.ClockRate,
+                            IsRtx: true,
+                            AptPayloadType: (byte)chosen.PayloadType);
                     }
                     else
                     {
@@ -1431,6 +1444,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _sendTransportCcExtensionId = transportCcExtensionId;
 
         Volatile.Write(ref _routes, routes);
+        Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);
         _logger.Log(
             KeryxLogLevel.Info,
             $"Applied answer; local DTLS role {LocalDtlsRole}, video pt {_negotiatedVideo?.PayloadType}"
@@ -1445,6 +1459,23 @@ public sealed partial class PeerConnection : IAsyncDisposable
         SdpSetupRole.Passive => DtlsRole.Server,
         _ => DtlsRole.Server,
     };
+
+    /// <summary>
+    /// Folds a section's <c>a=ssrc-group:FID</c> lines (RFC 5576 §4.2) into a repair-SSRC → media-SSRC
+    /// map, so an inbound RFC 4588 RTX packet can be decapsulated onto the media source it repairs. The
+    /// media source is listed first in an FID group and the repair source second.
+    /// </summary>
+    private static void CollectFidAssociations(IReadOnlyList<SsrcGroup> groups, Dictionary<uint, uint> rtxToMedia)
+    {
+        foreach (var group in groups)
+        {
+            if (string.Equals(group.Semantics, SsrcGroup.FidSemantics, StringComparison.Ordinal)
+                && group.Ssrcs.Count >= 2)
+            {
+                rtxToMedia[group.Ssrcs[1]] = group.Ssrcs[0];
+            }
+        }
+    }
 
     private static MediaKind ToMediaKind(string mediaType) => mediaType switch
     {
@@ -1464,9 +1495,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <summary>
     /// The inbound demux entry for one payload type: the m-section it belongs to, its media kind, the
     /// RTP clock rate its timestamps run at (for the RFC 3550 jitter estimate), and whether it is an RFC
-    /// 4588 repair stream (which is reported on through the media stream it repairs, not on its own).
+    /// 4588 repair stream (which is reported on through the media stream it repairs, not on its own). For
+    /// a repair stream, <paramref name="AptPayloadType"/> carries the media payload type its <c>apt</c>
+    /// names, so a decapsulated packet can be routed back onto the media stream it reconstructs.
     /// </summary>
-    private readonly record struct RtpRoute(string Mid, MediaKind Kind, uint ClockRate = 0, bool IsRtx = false);
+    private readonly record struct RtpRoute(
+        string Mid,
+        MediaKind Kind,
+        uint ClockRate = 0,
+        bool IsRtx = false,
+        byte AptPayloadType = 0);
 
     /// <summary>
     /// What the answer settled on for one media kind. <paramref name="RtxPayloadType"/> is null when
