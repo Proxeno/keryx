@@ -9,3 +9,7 @@ TestResults/
 BenchmarkDotNet.Artifacts/
 node_modules/
 *.binlog
+
+# Compiled pion interop peer (built by CI / the PionPeer test helper)
+tests/interop/pion/pion-peer
+tests/interop/pion/pion-peer.exe
