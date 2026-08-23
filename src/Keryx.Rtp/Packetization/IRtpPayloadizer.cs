@@ -59,13 +59,18 @@ public interface IRtpPayloadizer
     /// <paramref name="writer"/> in transmission order.
     /// </summary>
     /// <param name="frame">One encoded frame, in the format's natural container.</param>
+    /// <param name="rtpTimestamp">
+    /// The RTP timestamp the caller stamps into this frame's packets, in <see cref="ClockRate"/> ticks.
+    /// Audio payload formats use it to detect a talkspurt start from a media-clock gap; video formats
+    /// whose marker bit means end-of-access-unit ignore it.
+    /// </param>
     /// <param name="maxPayloadSize">
     /// Largest RTP payload the transport accepts, i.e. the path MTU less IP, UDP, RTP header and SRTP
     /// authentication-tag overhead.
     /// </param>
     /// <param name="writer">Receives the payloads.</param>
     /// <returns>The number of RTP packets produced.</returns>
-    int Packetize(ReadOnlySpan<byte> frame, int maxPayloadSize, IRtpPayloadWriter writer);
+    int Packetize(ReadOnlySpan<byte> frame, uint rtpTimestamp, int maxPayloadSize, IRtpPayloadWriter writer);
 }
 
 /// <summary>One payload produced by a packetizer, together with the marker bit it should carry.</summary>

@@ -1,3 +1,5 @@
+using System.Linq;
+using System.Threading;
 using FluentAssertions;
 using Keryx.Rtp.Packetization;
 using Xunit;
@@ -7,6 +9,11 @@ namespace Keryx.Rtp.Tests.Packetization;
 /// <summary>Coverage for the Opus payload format (RFC 7587) over the shared packetizer seam.</summary>
 public class OpusPacketizerTests
 {
+    // A CELT fullband 20 ms packet: TOC config 31, code 0. RFC 6716 §3.1 gives it a 960-tick duration
+    // at the 48 kHz Opus clock, so it is a convenient "one frame" for media-clock gap assertions.
+    private const byte Toc20Ms = 0xF8;
+    private const uint Frame20MsTicks = 960;
+
     [Fact]
     public void Clock_rate_is_forty_eight_kilohertz()
     {
@@ -15,17 +22,77 @@ public class OpusPacketizerTests
     }
 
     [Fact]
-    public void One_opus_packet_becomes_one_rtp_payload_with_no_marker()
+    public void One_opus_packet_becomes_one_rtp_payload()
     {
         // RFC 7587 §4.2: the payload is the Opus packet itself; no aggregation or fragmentation.
         byte[] frame = [0xF8, 0x01, 0x02, 0x03, 0x04];
         var writer = new CollectingRtpPayloadWriter();
 
-        new OpusPacketizer().Packetize(frame, 1200, writer).Should().Be(1);
+        new OpusPacketizer().Packetize(frame, rtpTimestamp: 0, 1200, writer).Should().Be(1);
 
         writer.Payloads.Should().ContainSingle();
         writer.Payloads[0].Data.Should().Equal(frame);
-        writer.Payloads[0].Marker.Should().BeFalse();
+    }
+
+    [Fact]
+    public void The_first_packet_of_a_stream_opens_a_talkspurt_and_is_marked()
+    {
+        // RFC 7587 §4.2: the very first packet of a stream is a talkspurt start, so marker = 1.
+        byte[] frame = [Toc20Ms, 0x01, 0x02];
+        var writer = new CollectingRtpPayloadWriter();
+
+        new OpusPacketizer().Packetize(frame, rtpTimestamp: 12_345, 1200, writer);
+
+        writer.Payloads[0].Marker.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Contiguous_frames_are_marked_only_on_the_first()
+    {
+        // Back-to-back frames advance the RTP timestamp by exactly one frame's duration each, so only
+        // the opening packet carries the talkspurt marker.
+        byte[] frame = [Toc20Ms, 0xAA, 0xBB];
+        var packetizer = new OpusPacketizer();
+        var writer = new CollectingRtpPayloadWriter();
+
+        packetizer.Packetize(frame, rtpTimestamp: 0, 1200, writer);
+        packetizer.Packetize(frame, rtpTimestamp: Frame20MsTicks, 1200, writer);
+        packetizer.Packetize(frame, rtpTimestamp: 2 * Frame20MsTicks, 1200, writer);
+
+        writer.Payloads.Select(p => p.Marker).Should().Equal(true, false, false);
+    }
+
+    [Fact]
+    public void A_timestamp_jump_past_one_frame_duration_marks_the_talkspurt_start()
+    {
+        // A silence/DTX gap shows up as an RTP timestamp that has advanced by more than one frame's
+        // worth of ticks: that packet reopens a talkspurt and is marked.
+        byte[] frame = [Toc20Ms, 0xAA, 0xBB];
+        var packetizer = new OpusPacketizer();
+        var writer = new CollectingRtpPayloadWriter();
+
+        packetizer.Packetize(frame, rtpTimestamp: 0, 1200, writer);
+        packetizer.Packetize(frame, rtpTimestamp: Frame20MsTicks, 1200, writer);
+        // Skip a frame: the next contiguous timestamp would be 2 × 960; arriving at 3 × 960 is a gap.
+        packetizer.Packetize(frame, rtpTimestamp: 3 * Frame20MsTicks, 1200, writer);
+
+        writer.Payloads.Select(p => p.Marker).Should().Equal(true, false, true);
+    }
+
+    [Fact]
+    public void The_marker_ignores_elapsed_wall_clock_time()
+    {
+        // The decision rests on the media clock alone: a long real pause between calls (mimicking a GC
+        // or scheduling stall) must NOT be mistaken for silence when the RTP timestamps stay contiguous.
+        byte[] frame = [Toc20Ms, 0xAA, 0xBB];
+        var packetizer = new OpusPacketizer();
+        var writer = new CollectingRtpPayloadWriter();
+
+        packetizer.Packetize(frame, rtpTimestamp: 0, 1200, writer);
+        Thread.Sleep(60);
+        packetizer.Packetize(frame, rtpTimestamp: Frame20MsTicks, 1200, writer);
+
+        writer.Payloads.Select(p => p.Marker).Should().Equal(true, false);
     }
 
     [Theory]
@@ -67,7 +134,7 @@ public class OpusPacketizerTests
     public void An_empty_frame_produces_nothing()
     {
         var writer = new CollectingRtpPayloadWriter();
-        new OpusPacketizer().Packetize([], 1200, writer).Should().Be(0);
+        new OpusPacketizer().Packetize([], rtpTimestamp: 0, 1200, writer).Should().Be(0);
         writer.Payloads.Should().BeEmpty();
         new OpusPacketizer().GetTimestampIncrement([]).Should().Be(0);
     }
@@ -78,7 +145,7 @@ public class OpusPacketizerTests
         // RFC 7587 §4.2 gives no fragmentation mechanism, so this is a configuration error.
         var writer = new CollectingRtpPayloadWriter();
         var frame = new byte[1300];
-        var act = () => new OpusPacketizer().Packetize(frame, 1200, writer);
+        var act = () => new OpusPacketizer().Packetize(frame, rtpTimestamp: 0, 1200, writer);
         act.Should().Throw<ArgumentException>();
     }
 
@@ -90,9 +157,9 @@ public class OpusPacketizerTests
         var writer = new CollectingRtpPayloadWriter();
 
         byte[] frame = [0xF8, 0xAA, 0xBB];
-        packetizer.Packetize(frame, 1200, writer);
+        packetizer.Packetize(frame, sender.Timestamp, 1200, writer);
         sender.AdvanceTimestamp(packetizer.GetTimestampIncrement(frame));
-        packetizer.Packetize(frame, 1200, writer);
+        packetizer.Packetize(frame, sender.Timestamp, 1200, writer);
 
         writer.Payloads.Should().HaveCount(2);
         sender.Timestamp.Should().Be(960);
