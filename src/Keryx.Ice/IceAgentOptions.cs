@@ -45,6 +45,13 @@ public sealed class IceAgentOptions
     /// </summary>
     public IceRole Role { get; set; } = IceRole.Controlling;
 
+    /// <summary>
+    /// How a controlling agent nominates the selected pair. Defaults to
+    /// <see cref="IceNominationMode.Regular"/>, which freezes the selection after nominating so a
+    /// later higher-priority success never flaps live media; controlled agents ignore this.
+    /// </summary>
+    public IceNominationMode NominationMode { get; set; } = IceNominationMode.Regular;
+
     /// <summary>The local username fragment; generated when null.</summary>
     public string? LocalUfrag { get; set; }
 

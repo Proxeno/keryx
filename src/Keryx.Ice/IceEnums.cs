@@ -10,6 +10,25 @@ public enum IceRole
     Controlled,
 }
 
+/// <summary>How a controlling agent nominates the pair that will carry media (RFC 8445 section 8.1.1).</summary>
+public enum IceNominationMode
+{
+    /// <summary>
+    /// The controlling agent picks the best valid pair, sends USE-CANDIDATE on it once, then
+    /// freezes the selection: a later, higher-priority success does not replace the nominated
+    /// pair, so live media never flaps. Only a failure of the nominated pair re-opens selection.
+    /// This is the browser-interop default (RFC 8445 section 8.1.1.1).
+    /// </summary>
+    Regular,
+
+    /// <summary>
+    /// The controlling agent sets USE-CANDIDATE on every check, so the first pair to succeed is
+    /// nominated and each higher-priority success re-selects (RFC 8445 section 8.1.1.2). One round
+    /// trip to connect, but the selected pair can move mid-session.
+    /// </summary>
+    Aggressive,
+}
+
 /// <summary>How a candidate's transport address was learned (RFC 8445 section 5.1.1).</summary>
 public enum IceCandidateType
 {

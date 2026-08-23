@@ -40,6 +40,22 @@ public sealed class IceAgentTests
     private static void Trickle(IceAgent from, IceAgent to)
         => from.OnLocalCandidate += (_, candidate) => to.AddRemoteCandidate(candidate.ToSdpLine());
 
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (condition())
+            {
+                return true;
+            }
+
+            await Task.Delay(20);
+        }
+
+        return condition();
+    }
+
     [Fact]
     public async Task TwoLoopbackAgents_ConnectAndCarryDatagramsBothWays()
     {
@@ -75,12 +91,14 @@ public sealed class IceAgentTests
         offerer.State.Should().Be(IceAgentState.Connected);
         answerer.State.Should().Be(IceAgentState.Connected);
 
-        // Aggressive nomination: the first pair to succeed is already nominated.
-        offerer.SelectedPair.Should().NotBeNull();
-        offerer.SelectedPair!.Nominated.Should().BeTrue();
-        offerer.SelectedPair.State.Should().Be(IceCandidatePairState.Succeeded);
+        // Regular nomination: the controlling agent nominates one pair and both agents converge on
+        // it. Nomination follows connection by a check, so wait for it rather than assume it.
+        (await WaitUntilAsync(() => offerer.SelectedPair is { Nominated: true }, ConnectTimeout))
+            .Should().BeTrue();
+        (await WaitUntilAsync(() => answerer.SelectedPair is not null, ConnectTimeout))
+            .Should().BeTrue();
+        offerer.SelectedPair!.State.Should().Be(IceCandidatePairState.Succeeded);
         offerer.SelectedPair.RemoteEndPoint.Should().Be(answerer.LocalEndPoint);
-        answerer.SelectedPair.Should().NotBeNull();
         answerer.SelectedPair!.RemoteEndPoint.Should().Be(offerer.LocalEndPoint);
 
         // A DTLS-shaped record (first byte 20-63) and an RTP-shaped packet (128-191) must both
@@ -151,6 +169,174 @@ public sealed class IceAgentTests
             seen.Should().ContainInOrder(
                 IceAgentState.Connected, IceAgentState.Disconnected, IceAgentState.Failed);
         }
+    }
+
+    [Fact]
+    public async Task RegularNomination_FreezesTheSelectedPair_WhenAHigherPriorityPairSucceedsLater()
+    {
+        var cancellationToken = Timeout();
+        using var offerer = new IceAgent(LoopbackOptions(IceRole.Controlling));
+        using var answerer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        // Only the answerer trickles nothing back automatically: the offerer's remote candidates are
+        // injected by hand so this test controls exactly which pairs exist and their priorities.
+        Trickle(offerer, answerer);
+        offerer.SetRemoteCredentials(answerer.LocalUfrag, answerer.LocalPassword);
+        answerer.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+
+        await offerer.StartGatheringAsync(cancellationToken);
+        await answerer.StartGatheringAsync(cancellationToken);
+
+        var selectedChanges = 0;
+        offerer.OnSelectedPairChanged += (_, _) => Interlocked.Increment(ref selectedChanges);
+
+        var answererEndPoint = answerer.LocalEndPoint!;
+
+        // A low-priority host pair to the answerer. It is the only pair, so the controlling agent
+        // nominates it and freezes.
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "low", 1, "udp", priority: 500u, answererEndPoint.Address, answererEndPoint.Port, IceCandidateType.Host));
+
+        (await WaitUntilAsync(() => offerer.SelectedPair is { Nominated: true }, ConnectTimeout))
+            .Should().BeTrue();
+        var nominated = offerer.SelectedPair!;
+        nominated.Remote.Type.Should().Be(IceCandidateType.Host);
+        var changesAfterNomination = Volatile.Read(ref selectedChanges);
+
+        // Now a far higher-priority pair to the same answerer appears and succeeds. Under aggressive
+        // nomination this would re-point live media; regular nomination must keep the frozen pair.
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "high", 1, "udp", priority: 2_000_000_000u, answererEndPoint.Address, answererEndPoint.Port,
+            IceCandidateType.ServerReflexive, IPAddress.Loopback, offerer.LocalEndPoint!.Port));
+
+        var higher = await WaitUntilAsync(
+            () => offerer.CheckList.Any(p =>
+                p.Remote.Type == IceCandidateType.ServerReflexive && p.State == IceCandidatePairState.Succeeded),
+            ConnectTimeout);
+        higher.Should().BeTrue("the higher-priority pair must actually succeed for the freeze to mean anything");
+
+        // Give any (incorrect) re-selection a chance to happen before asserting it did not.
+        await Task.Delay(300, cancellationToken);
+
+        offerer.SelectedPair.Should().BeSameAs(nominated);
+        offerer.SelectedPair!.Nominated.Should().BeTrue();
+        var higherPair = offerer.CheckList.Single(p => p.Remote.Type == IceCandidateType.ServerReflexive);
+        higherPair.Priority.Should().BeGreaterThan(nominated.Priority);
+        higherPair.Nominated.Should().BeFalse();
+        Volatile.Read(ref selectedChanges).Should().Be(changesAfterNomination, "the frozen selection must not change");
+    }
+
+    [Fact]
+    public async Task RegularNomination_FailsOverToAnotherValidPair_WhenTheNominatedPairGoesDead()
+    {
+        var cancellationToken = Timeout();
+        var options = LoopbackOptions(IceRole.Controlling);
+        options.KeepaliveInterval = TimeSpan.FromMilliseconds(100);
+        options.DisconnectedTimeout = TimeSpan.FromMilliseconds(400);
+        options.ConsentTimeout = TimeSpan.FromSeconds(5);
+
+        // The offerer authenticates every check with the one remote password it was told, so both
+        // peers must present the same credentials for the offerer's checks to reach either of them.
+        var sharedOptionsFor = (Func<IceAgentOptions>)(() =>
+        {
+            var peerOptions = LoopbackOptions(IceRole.Controlled);
+            peerOptions.LocalUfrag = "peershare";
+            peerOptions.LocalPassword = "sharedpasswordsharedpassword";
+            return peerOptions;
+        });
+
+        using var offerer = new IceAgent(options);
+        var primary = new IceAgent(sharedOptionsFor());
+        using var backup = new IceAgent(sharedOptionsFor());
+
+        // Both peers can answer the offerer's checks, but only the offerer's manually injected
+        // remote candidates decide which endpoints it pairs with and in what priority order.
+        Trickle(offerer, primary);
+        Trickle(offerer, backup);
+        offerer.SetRemoteCredentials(primary.LocalUfrag, primary.LocalPassword);
+        primary.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+        backup.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+
+        await offerer.StartGatheringAsync(cancellationToken);
+        await primary.StartGatheringAsync(cancellationToken);
+        await backup.StartGatheringAsync(cancellationToken);
+
+        var primaryEndPoint = primary.LocalEndPoint!;
+        var backupEndPoint = backup.LocalEndPoint!;
+
+        // Add only the high-priority pair first so it is the one that gets nominated.
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "high", 1, "udp", priority: 2_000_000_000u, primaryEndPoint.Address, primaryEndPoint.Port,
+            IceCandidateType.Host));
+
+        (await WaitUntilAsync(
+            () => offerer.SelectedPair is { Nominated: true } s && Equals(s.RemoteEndPoint, primaryEndPoint),
+            ConnectTimeout)).Should().BeTrue();
+
+        // Now add the lower-priority backup pair and let it succeed so it is available to fail over to.
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "low", 1, "udp", priority: 500u, backupEndPoint.Address, backupEndPoint.Port, IceCandidateType.Host));
+
+        (await WaitUntilAsync(
+            () => offerer.CheckList.Any(p =>
+                Equals(p.RemoteEndPoint, backupEndPoint) && p.State == IceCandidatePairState.Succeeded),
+            ConnectTimeout)).Should().BeTrue();
+
+        var everFailed = false;
+        offerer.OnStateChanged += (_, state) =>
+        {
+            if (state is IceAgentState.Failed)
+            {
+                everFailed = true;
+            }
+        };
+
+        // Kill the nominated peer. Consent on the selected pair lapses, and regular nomination must
+        // fail over to the still-valid backup pair instead of tearing the session down.
+        primary.Dispose();
+
+        (await WaitUntilAsync(
+            () => offerer.SelectedPair is { Nominated: true } s && Equals(s.RemoteEndPoint, backupEndPoint),
+            TimeSpan.FromSeconds(8))).Should().BeTrue();
+
+        offerer.State.Should().Be(IceAgentState.Connected);
+        everFailed.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task AggressiveNomination_ReSelectsAHigherPriorityPairThatSucceedsLater()
+    {
+        var cancellationToken = Timeout();
+        var options = LoopbackOptions(IceRole.Controlling);
+        options.NominationMode = IceNominationMode.Aggressive;
+
+        using var offerer = new IceAgent(options);
+        using var answerer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        Trickle(offerer, answerer);
+        offerer.SetRemoteCredentials(answerer.LocalUfrag, answerer.LocalPassword);
+        answerer.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
+
+        await offerer.StartGatheringAsync(cancellationToken);
+        await answerer.StartGatheringAsync(cancellationToken);
+
+        var answererEndPoint = answerer.LocalEndPoint!;
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "low", 1, "udp", priority: 500u, answererEndPoint.Address, answererEndPoint.Port, IceCandidateType.Host));
+
+        (await WaitUntilAsync(() => offerer.SelectedPair is { Nominated: true }, ConnectTimeout))
+            .Should().BeTrue();
+
+        offerer.AddRemoteCandidate(new IceCandidate(
+            "high", 1, "udp", priority: 2_000_000_000u, answererEndPoint.Address, answererEndPoint.Port,
+            IceCandidateType.ServerReflexive, IPAddress.Loopback, offerer.LocalEndPoint!.Port));
+
+        // Aggressive nomination deliberately re-selects: the higher-priority pair becomes selected
+        // once it succeeds. This is the behaviour regular nomination exists to avoid.
+        (await WaitUntilAsync(
+            () => offerer.SelectedPair!.Remote.Type == IceCandidateType.ServerReflexive, ConnectTimeout))
+            .Should().BeTrue();
+        offerer.SelectedPair!.Nominated.Should().BeTrue();
     }
 
     [Theory]

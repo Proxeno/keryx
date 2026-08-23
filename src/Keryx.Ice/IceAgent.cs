@@ -35,9 +35,15 @@ namespace Keryx.Ice;
 /// relayed datagrams are unwrapped and fed back through exactly the same demultiplexing path as
 /// direct ones - so a relayed ICE check is handled like any other check, and relayed media reaches
 /// <see cref="IDatagramTransport.OnReceived"/> without DTLS or SRTP knowing a relay is involved.</para>
-/// <para><b>Simplifications in this version.</b> Aggressive nomination: a controlling agent sets
-/// USE-CANDIDATE on every check, so the first pair to succeed is the selected one; this is
-/// permitted by RFC 8445 section 8.1.1.2 and keeps setup to a single round trip. Host and
+/// <para><b>Nomination.</b> The controlling agent defaults to regular nomination (RFC 8445
+/// section 8.1.1.1): it picks the best valid pair, sends USE-CANDIDATE on that one pair, and then
+/// freezes the selection, so a later higher-priority success does not silently re-point live media
+/// (the flapping that pure aggressive nomination causes). The selection re-opens only if the
+/// nominated pair goes dead, when the agent fails over to the next best valid pair and nominates
+/// again. Aggressive nomination (USE-CANDIDATE on every check, first success wins, each higher
+/// success re-selects; RFC 8445 section 8.1.1.2) stays available via
+/// <see cref="IceAgentOptions.NominationMode"/>.</para>
+/// <para><b>Simplifications in this version.</b> Host and
 /// server-reflexive candidates of both address families are gathered over one dual-stack socket and
 /// only ever paired with a remote candidate of the same family. Because a single bundled socket
 /// sends every check, the check list holds one pair
@@ -77,9 +83,10 @@ public sealed class IceAgent : IDisposable
     private string? _remotePassword;
     private byte[]? _remoteKey;
     private IceCandidatePair? _selected;
+    private IceCandidatePair? _nominee;
     private long _checksStartedAt;
     private long _lastKeepaliveAt;
-    private long _lastValidResponseAt;
+    private long _selectedValidAt;
     private int _prflxCounter;
     private bool _disposed;
 
@@ -1059,7 +1066,8 @@ public sealed class IceAgent : IDisposable
             case StunClass.Indication:
                 lock (_lock)
                 {
-                    _lastValidResponseAt = Environment.TickCount64;
+                    // A peer keepalive indication refreshes consent on the pair carrying media.
+                    _selectedValidAt = Environment.TickCount64;
                 }
 
                 break;
@@ -1226,8 +1234,13 @@ public sealed class IceAgent : IDisposable
                 return;
             }
 
-            _lastValidResponseAt = Environment.TickCount64;
             check.Pair.State = IceCandidatePairState.Succeeded;
+            if (ReferenceEquals(check.Pair, _selected))
+            {
+                // Consent is fresh only for the pair actually carrying media; a success on some
+                // other pair must not keep a dead selected pair alive.
+                _selectedValidAt = Environment.TickCount64;
+            }
 
             if (check.UseCandidate || check.Pair.NominateOnSuccess)
             {
@@ -1236,6 +1249,7 @@ public sealed class IceAgent : IDisposable
             else
             {
                 UpdateSelectedLocked();
+                StartRegularNominationLocked();
             }
 
             if (_state is IceAgentState.Gathering or IceAgentState.Checking or IceAgentState.Disconnected or IceAgentState.New)
@@ -1306,7 +1320,18 @@ public sealed class IceAgent : IDisposable
         var next = DequeueTriggeredLocked() ?? NextWaitingLocked();
         if (next is not null)
         {
-            pending.Add(BuildCheckLocked(next, now, isKeepalive: false));
+            pending.Add(BuildCheckLocked(next, now, isKeepalive: false, useCandidate: IsAggressiveControllingLocked));
+        }
+
+        // Regular nomination: keep sending USE-CANDIDATE on the one chosen pair until it is
+        // nominated. The pair is already Succeeded, so this rides the keepalive path (no state
+        // reset) rather than a triggered check, which skips succeeded pairs.
+        if (_nominee is { Nominated: false } nominee
+            && _role == IceRole.Controlling
+            && _options.NominationMode == IceNominationMode.Regular
+            && !HasOutstandingCheckLocked(nominee))
+        {
+            pending.Add(BuildCheckLocked(nominee, now, isKeepalive: true, useCandidate: true));
         }
 
         if (_selected is { } selected
@@ -1314,7 +1339,7 @@ public sealed class IceAgent : IDisposable
             && now - _lastKeepaliveAt >= (long)_options.KeepaliveInterval.TotalMilliseconds)
         {
             _lastKeepaliveAt = now;
-            pending.Add(BuildCheckLocked(selected, now, isKeepalive: true));
+            pending.Add(BuildCheckLocked(selected, now, isKeepalive: true, useCandidate: false));
         }
 
         EvaluateTimeoutsLocked(now);
@@ -1385,12 +1410,11 @@ public sealed class IceAgent : IDisposable
         return null;
     }
 
-    private (byte[] Datagram, IceCandidatePair Pair) BuildCheckLocked(IceCandidatePair pair, long now, bool isKeepalive)
+    private (byte[] Datagram, IceCandidatePair Pair) BuildCheckLocked(IceCandidatePair pair, long now, bool isKeepalive, bool useCandidate)
     {
         // RFC 8445 section 7.1.1: PRIORITY carries the priority the peer-reflexive candidate the
         // peer may discover from this check would have.
         var prflxPriority = IcePriority.Compute(IceCandidateType.PeerReflexive, pair.Local.LocalPreference, pair.Local.Component);
-        var useCandidate = _role == IceRole.Controlling;
 
         var request = new StunMessage(StunClass.Request, StunMethod.Binding)
             .Add(new StunUsernameAttribute($"{_remoteUfrag}:{LocalUfrag}"))
@@ -1401,8 +1425,8 @@ public sealed class IceAgent : IDisposable
 
         if (useCandidate)
         {
-            // Aggressive nomination (RFC 8445 section 8.1.1.2): every check from the controlling
-            // agent carries USE-CANDIDATE, so the first success is also the nomination.
+            // USE-CANDIDATE nominates the pair once the check succeeds. In aggressive mode every
+            // check carries it; in regular mode only the check on the chosen nominee does.
             request.Add(StunUseCandidateAttribute.Instance);
         }
 
@@ -1433,11 +1457,19 @@ public sealed class IceAgent : IDisposable
                 SetStateLocked(IceAgentState.Failed);
                 break;
 
-            case IceAgentState.Connected when now - _lastValidResponseAt > (long)_options.DisconnectedTimeout.TotalMilliseconds:
-                SetStateLocked(IceAgentState.Disconnected);
+            case IceAgentState.Connected when _selected is not null
+                    && now - _selectedValidAt > (long)_options.DisconnectedTimeout.TotalMilliseconds:
+                // The nominated pair has gone silent. Regular nomination fails over to the next
+                // best valid pair rather than tearing the session down; if none survives, the
+                // agent drops to Disconnected and, later, Failed.
+                if (!TryFailoverLocked(now))
+                {
+                    SetStateLocked(IceAgentState.Disconnected);
+                }
+
                 break;
 
-            case IceAgentState.Disconnected when now - _lastValidResponseAt > (long)_options.ConsentTimeout.TotalMilliseconds:
+            case IceAgentState.Disconnected when now - _selectedValidAt > (long)_options.ConsentTimeout.TotalMilliseconds:
                 _logger.Log(KeryxLogLevel.Error, "ICE consent expired on the selected pair.");
                 SetStateLocked(IceAgentState.Failed);
                 break;
@@ -1585,11 +1617,43 @@ public sealed class IceAgent : IDisposable
     {
         pair.Nominated = true;
         pair.NominateOnSuccess = false;
+
+        // A controlling agent stops nominating once its chosen pair is nominated; a controlled
+        // agent adopts whatever pair the peer nominated as its frozen selection.
+        if (ReferenceEquals(pair, _nominee))
+        {
+            _nominee = null;
+        }
+
         UpdateSelectedLocked();
+    }
+
+    /// <summary>
+    /// Regular nomination (RFC 8445 section 8.1.1.1): once a controlling agent has a valid pair it
+    /// picks the best one as the single nominee. <see cref="TickLocked"/> then sends USE-CANDIDATE
+    /// on that pair until it is nominated, after which the selection is frozen.
+    /// </summary>
+    private void StartRegularNominationLocked()
+    {
+        if (!IsRegularControllingLocked || _nominee is not null || _selected is { Nominated: true })
+        {
+            return;
+        }
+
+        _nominee = BestUsablePairLocked();
     }
 
     private void UpdateSelectedLocked()
     {
+        // Freeze: under regular nomination a nominated, still-succeeding pair is never displaced by
+        // a later higher-priority success. That is the whole point - it stops live media flapping
+        // onto a newly validated pair. Failover (a dead selected pair) clears this before re-selecting.
+        if (_options.NominationMode == IceNominationMode.Regular
+            && _selected is { Nominated: true, State: IceCandidatePairState.Succeeded })
+        {
+            return;
+        }
+
         var best = BestUsablePairLocked();
         if (best is null || ReferenceEquals(best, _selected))
         {
@@ -1597,8 +1661,60 @@ public sealed class IceAgent : IDisposable
         }
 
         _selected = best;
+        _selectedValidAt = Environment.TickCount64;
         _logger.Log(KeryxLogLevel.Info, $"ICE selected pair {best}.");
         _events.Enqueue(() => OnSelectedPairChanged?.Invoke(this, best));
+    }
+
+    /// <summary>
+    /// The nominated pair stopped answering. Retire it and, if another valid pair survives, nominate
+    /// that one instead of failing the session. Returns false when nothing usable remains.
+    /// </summary>
+    private bool TryFailoverLocked(long now)
+    {
+        if (!IsRegularControllingLocked || _selected is null)
+        {
+            return false;
+        }
+
+        var dead = _selected;
+        dead.State = IceCandidatePairState.Failed;
+        dead.Nominated = false;
+        _selected = null;
+        _nominee = null;
+
+        var next = BestUsablePairLocked();
+        if (next is null)
+        {
+            return false;
+        }
+
+        // Give the replacement a fresh consent window, provisionally select it so media keeps
+        // flowing, and let TickLocked drive a fresh USE-CANDIDATE check to nominate it.
+        _selectedValidAt = now;
+        _nominee = next;
+        UpdateSelectedLocked();
+        _logger.Log(KeryxLogLevel.Warning, $"ICE failed over to {next} after the nominated pair went dead.");
+        return true;
+    }
+
+    private bool IsRegularControllingLocked
+        => _role == IceRole.Controlling && _options.NominationMode == IceNominationMode.Regular;
+
+    private bool IsAggressiveControllingLocked
+        => _role == IceRole.Controlling && _options.NominationMode == IceNominationMode.Aggressive;
+
+    private bool HasOutstandingCheckLocked(IceCandidatePair pair)
+    {
+        foreach (var check in _checks.Values)
+        {
+            if (ReferenceEquals(check.Pair, pair) && check.UseCandidate)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private IceCandidatePair? BestUsablePairLocked()
