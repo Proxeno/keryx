@@ -1,3 +1,4 @@
+using System.Net.Security;
 using System.Net.Sockets;
 using Keryx.Core;
 using Keryx.Stun;
@@ -56,6 +57,14 @@ public sealed class TurnClientOptions
 
     /// <summary>Retransmission settings for the Allocate, Refresh, CreatePermission and ChannelBind transactions.</summary>
     public StunClientOptions? StunClientOptions { get; set; }
+
+    /// <summary>
+    /// Validates the server's certificate on a <see cref="TurnClientTransport.Tls"/> connection.
+    /// Null - the default - applies the platform's standard chain-and-name validation. Supply a
+    /// callback only to pin a certificate or trust a private CA; it is never used to disable
+    /// validation wholesale.
+    /// </summary>
+    public RemoteCertificateValidationCallback? TlsCertificateValidationCallback { get; set; }
 
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }

@@ -54,8 +54,10 @@ public static class TurnChannelData
     /// Writes a ChannelData message into <paramref name="destination"/>.
     /// </summary>
     /// <remarks>
-    /// No padding is added: RFC 8656 section 12.4 requires four-byte padding only over TCP and
-    /// TLS-over-TCP, and Keryx allocations are UDP.
+    /// No padding is added here: RFC 8656 section 12.4 requires four-byte padding only over TCP and
+    /// TLS-over-TCP, and over UDP there is none. On a TURN TCP/TLS connection the padding is added
+    /// by the connection's framing when the message is written, so the encoded message stays the
+    /// same either way.
     /// </remarks>
     /// <param name="destination">The buffer to write into.</param>
     /// <param name="channelNumber">The bound channel number; must be in 0x4000-0x4FFF.</param>

@@ -1,15 +1,19 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using Keryx.Stun;
 using Keryx.Turn;
 
 namespace Keryx.Turn.Tests;
 
 /// <summary>
-/// A deliberately small but genuine TURN server (RFC 8656) over UDP loopback: long-term
-/// authentication with a 401 challenge, one allocation on a real second socket, permissions,
-/// channel bindings, ChannelData and Send/Data indications.
+/// A deliberately small but genuine TURN server (RFC 8656) over loopback: long-term authentication
+/// with a 401 challenge, one allocation on a real second socket, permissions, channel bindings,
+/// ChannelData and Send/Data indications. The client-to-server leg is UDP by default, or TCP / TLS
+/// (RFC 5766 section 2.1) when constructed with that transport - the peer-facing relay is always UDP.
 /// </summary>
 /// <remarks>
 /// It exists so the relay can be *observed*: every relayed datagram is counted, the relayed
@@ -18,9 +22,13 @@ namespace Keryx.Turn.Tests;
 /// </remarks>
 internal sealed class TestTurnServer : IDisposable
 {
-    private readonly Socket _control;
+    private readonly TurnClientTransport _transport;
+    private readonly Socket? _control;
+    private readonly Socket? _listener;
+    private readonly X509Certificate2? _certificate;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _lock = new();
+    private readonly object _streamWriteLock = new();
     private readonly Dictionary<IPAddress, DateTimeOffset> _permissions = [];
     private readonly Dictionary<ushort, IPEndPoint> _channels = [];
     private readonly Dictionary<IPEndPoint, ushort> _channelsByPeer = [];
@@ -28,24 +36,48 @@ internal sealed class TestTurnServer : IDisposable
 
     private Socket? _relay;
     private IPEndPoint? _client;
+    private Stream? _clientStream;
     private string _nonce = NewNonce();
     private int _noncesIssued;
     private bool _disposed;
 
-    public TestTurnServer(string username = "keryx", string password = "keryxpass", string realm = "keryx.test")
+    public TestTurnServer(
+        string username = "keryx",
+        string password = "keryxpass",
+        string realm = "keryx.test",
+        TurnClientTransport transport = TurnClientTransport.Udp)
     {
         Username = username;
         Password = password;
         Realm = realm;
+        _transport = transport;
 
-        _control = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        _control.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        EndPoint = (IPEndPoint)_control.LocalEndPoint!;
-        lock (_lock)
+        if (transport == TurnClientTransport.Udp)
         {
-            _loops.Add(Task.Run(() => ControlLoopAsync(_cts.Token)));
+            _control = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            _control.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            EndPoint = (IPEndPoint)_control.LocalEndPoint!;
+            lock (_lock)
+            {
+                _loops.Add(Task.Run(() => ControlLoopAsync(_cts.Token)));
+            }
+        }
+        else
+        {
+            _certificate = transport == TurnClientTransport.Tls ? CreateSelfSignedCertificate(realm) : null;
+            _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            _listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            _listener.Listen(1);
+            EndPoint = (IPEndPoint)_listener.LocalEndPoint!;
+            lock (_lock)
+            {
+                _loops.Add(Task.Run(() => AcceptLoopAsync(_cts.Token)));
+            }
         }
     }
+
+    /// <summary>The self-signed certificate a TLS server presents, so a test can pin it in validation.</summary>
+    public X509Certificate2? Certificate => _certificate;
 
     public string Username { get; }
 
@@ -156,7 +188,7 @@ internal sealed class TestTurnServer : IDisposable
         }
     }
 
-    public TurnServerOptions ToOptions() => new(EndPoint, Username, Password);
+    public TurnServerOptions ToOptions() => new(EndPoint, Username, Password) { ClientTransport = _transport };
 
     public void Dispose()
     {
@@ -167,12 +199,24 @@ internal sealed class TestTurnServer : IDisposable
 
         _disposed = true;
         _cts.Cancel();
-        _control.Close();
+        _control?.Close();
+        _listener?.Close();
         Task[] loops;
+        Stream? clientStream;
         lock (_lock)
         {
             _relay?.Close();
+            clientStream = _clientStream;
             loops = [.. _loops];
+        }
+
+        try
+        {
+            clientStream?.Dispose();
+        }
+        catch (Exception)
+        {
+            // The stream is being torn down.
         }
 
         try
@@ -184,8 +228,10 @@ internal sealed class TestTurnServer : IDisposable
             // The loops only ever fault because their socket was closed above.
         }
 
-        _control.Dispose();
+        _control?.Dispose();
+        _listener?.Dispose();
         _relay?.Dispose();
+        _certificate?.Dispose();
         _cts.Dispose();
     }
 
@@ -209,7 +255,7 @@ internal sealed class TestTurnServer : IDisposable
             SocketReceiveFromResult result;
             try
             {
-                result = await _control.ReceiveFromAsync(buffer, SocketFlags.None, any, cancellationToken);
+                result = await _control!.ReceiveFromAsync(buffer, SocketFlags.None, any, cancellationToken);
             }
             catch (Exception)
             {
@@ -508,12 +554,10 @@ internal sealed class TestTurnServer : IDisposable
             var peer = (IPEndPoint)result.RemoteEndPoint;
             var payload = buffer.AsSpan(0, result.ReceivedBytes);
 
-            Socket? control;
             IPEndPoint? client;
             ushort? channel = null;
             lock (_lock)
             {
-                control = _control;
                 client = _client;
                 if (EnforcePermissions && !_permissions.ContainsKey(peer.Address))
                 {
@@ -527,7 +571,7 @@ internal sealed class TestTurnServer : IDisposable
                 }
             }
 
-            if (control is null || client is null)
+            if (client is null)
             {
                 continue;
             }
@@ -546,14 +590,9 @@ internal sealed class TestTurnServer : IDisposable
                 length = indication.EncodeTo(outbound);
             }
 
-            try
+            if (DeliverToClient(outbound.AsSpan(0, length), client))
             {
-                control.SendTo(outbound.AsSpan(0, length), SocketFlags.None, client);
                 Interlocked.Increment(ref RelayedToClient);
-            }
-            catch (Exception)
-            {
-                // The control socket is closing.
             }
         }
     }
@@ -590,13 +629,178 @@ internal sealed class TestTurnServer : IDisposable
 
     private void Send(StunMessage message, IPEndPoint to, byte[]? key, bool useSha256 = false)
     {
+        var encoded = message.Encode(key, appendFingerprint: true, useMessageIntegritySha256: useSha256);
+        DeliverToClient(encoded, to);
+    }
+
+    /// <summary>
+    /// Writes one framed STUN or ChannelData message to the client over whichever transport is in
+    /// use: a UDP datagram, or a stream write padded to a four-byte boundary (RFC 5766 section 11.5).
+    /// </summary>
+    private bool DeliverToClient(ReadOnlySpan<byte> framed, IPEndPoint to)
+    {
+        if (_transport == TurnClientTransport.Udp)
+        {
+            try
+            {
+                _control!.SendTo(framed, SocketFlags.None, to);
+                return true;
+            }
+            catch (Exception)
+            {
+                // The server is shutting down.
+                return false;
+            }
+        }
+
+        Stream? stream;
+        lock (_lock)
+        {
+            stream = _clientStream;
+        }
+
+        if (stream is null)
+        {
+            return false;
+        }
+
+        var padded = (framed.Length + 3) & ~3;
         try
         {
-            _control.SendTo(message.Encode(key, appendFingerprint: true, useMessageIntegritySha256: useSha256), SocketFlags.None, to);
+            lock (_streamWriteLock)
+            {
+                stream.Write(framed);
+                if (padded > framed.Length)
+                {
+                    Span<byte> pad = stackalloc byte[4];
+                    pad.Clear();
+                    stream.Write(pad[..(padded - framed.Length)]);
+                }
+
+                stream.Flush();
+            }
+
+            return true;
         }
         catch (Exception)
         {
-            // The server is shutting down.
+            // The connection is closing.
+            return false;
         }
+    }
+
+    private async Task AcceptLoopAsync(CancellationToken cancellationToken)
+    {
+        Socket accepted;
+        try
+        {
+            accepted = await _listener!.AcceptAsync(cancellationToken);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        accepted.NoDelay = true;
+        Stream stream = new NetworkStream(accepted, ownsSocket: true);
+        try
+        {
+            if (_transport == TurnClientTransport.Tls)
+            {
+                var tls = new SslStream(stream, leaveInnerStreamOpen: false);
+                await tls.AuthenticateAsServerAsync(
+                    new SslServerAuthenticationOptions
+                    {
+                        ServerCertificate = _certificate,
+                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    },
+                    cancellationToken);
+                stream = tls;
+            }
+        }
+        catch (Exception)
+        {
+            stream.Dispose();
+            return;
+        }
+
+        var client = (IPEndPoint)accepted.RemoteEndPoint!;
+        lock (_lock)
+        {
+            _clientStream = stream;
+            _client = client;
+        }
+
+        await StreamReadLoopAsync(stream, client, cancellationToken);
+    }
+
+    private async Task StreamReadLoopAsync(Stream stream, IPEndPoint client, CancellationToken cancellationToken)
+    {
+        var reassembler = new TurnStreamReassembler();
+        var buffer = new byte[8192];
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            int read;
+            try
+            {
+                read = await stream.ReadAsync(buffer, cancellationToken);
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            if (read == 0)
+            {
+                return;
+            }
+
+            reassembler.Append(buffer.AsSpan(0, read));
+            while (true)
+            {
+                ReadOnlySpan<byte> message;
+                try
+                {
+                    if (!reassembler.TryReadMessage(out message))
+                    {
+                        break;
+                    }
+                }
+                catch (Exception)
+                {
+                    return;
+                }
+
+                if (TurnChannelData.TryDecode(message, out var channelNumber, out var payload))
+                {
+                    Interlocked.Increment(ref ChannelDataFromClient);
+                    RelayToPeerByChannel(channelNumber, payload);
+                    continue;
+                }
+
+                if (StunMessage.TryDecode(message, out var stun))
+                {
+                    HandleMessage(stun, message.ToArray(), client);
+                }
+            }
+        }
+    }
+
+    private static X509Certificate2 CreateSelfSignedCertificate(string commonName)
+    {
+        using var rsa = RSA.Create(2048);
+        var request = new CertificateRequest($"CN={commonName}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var subjectAlternativeName = new SubjectAlternativeNameBuilder();
+        subjectAlternativeName.AddDnsName(commonName);
+        subjectAlternativeName.AddIpAddress(IPAddress.Loopback);
+        request.CertificateExtensions.Add(subjectAlternativeName.Build());
+
+        var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+        // Re-import through a PFX so the private key is usable for SslStream server authentication
+        // across platforms, where the ephemeral key from CreateSelfSigned is not always accepted.
+        var exported = certificate.Export(X509ContentType.Pfx);
+        certificate.Dispose();
+        return X509CertificateLoader.LoadPkcs12(exported, password: null);
     }
 }
