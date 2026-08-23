@@ -396,6 +396,16 @@ public class DtlsHandshakeLoopbackTests
 
         await Task.WhenAll(server.HandshakeAsync(), client.HandshakeAsync()).WaitAsync(Patience);
 
+        // OnStateChanged is dispatched from Pump(), which runs independently of the
+        // _handshakeCompletion continuation observed above, so the Connected notification can
+        // still be in flight when HandshakeAsync returns. Wait for it deterministically instead
+        // of sampling the queue immediately.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (states.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(20);
+        }
+
         states.Should().Equal(DtlsTransportState.Connecting, DtlsTransportState.Connected);
 
         left.Dispose();
