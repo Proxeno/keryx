@@ -76,9 +76,9 @@ public sealed class TrackIntrospectionTests
         (await answerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
 
         // ---------------------------------------------------------------- negotiated PT + local SSRC
-        // The offerer is the side that sends media, so it is the side that resolves a negotiated
-        // codec/payload type; the answerer path never sends (see CreateAnswerAsync's remarks) and so
-        // never resolves one.
+        // The offerer offers sendonly here, so it is the side that sends media and resolves a
+        // negotiated codec/payload type; the answerer answers recvonly for a sendonly offer, so it
+        // sets up no send track (an answerer only sends against a recvonly offer).
         var negotiatedVideoPt = offerer.GetNegotiatedPayloadType(MediaKind.Video);
         var negotiatedAudioPt = offerer.GetNegotiatedPayloadType(MediaKind.Audio);
         negotiatedVideoPt.Should().NotBeNull("the answer settled on a video codec");
