@@ -203,10 +203,16 @@ public sealed class TurnClient : IDisposable
     /// SHA-256-derived key (see <see cref="StunPasswordAlgorithm"/>).
     /// </summary>
     /// <param name="cancellationToken">Cancels the transaction.</param>
-    /// <returns>The relayed transport address the server allocated.</returns>
+    /// <returns>
+    /// The relayed transport address the server allocated - IPv4 unless
+    /// <see cref="TurnClientOptions.RequestedAddressFamily"/> asks for IPv6.
+    /// </returns>
     /// <exception cref="StunErrorResponseException">The server refused the allocation.</exception>
     /// <exception cref="StunTimeoutException">The server did not answer.</exception>
-    /// <exception cref="StunFormatException">The success response was not a usable Allocate response.</exception>
+    /// <exception cref="StunFormatException">
+    /// The success response was not a usable Allocate response, or allocated a relayed address from
+    /// a family other than the one requested.
+    /// </exception>
     public async Task<IPEndPoint> AllocateAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -215,16 +221,30 @@ public sealed class TurnClient : IDisposable
         try
         {
             var response = await AuthenticatedRequestAsync(
-                () => new StunMessage(StunClass.Request, StunMethod.Allocate)
-                    .Add(new StunRequestedTransportAttribute(TurnTransportProtocol.Udp))
-                    .Add(new StunLifetimeAttribute(_options.RequestedLifetime)),
+                () =>
+                {
+                    var request = new StunMessage(StunClass.Request, StunMethod.Allocate)
+                        .Add(new StunRequestedTransportAttribute(TurnTransportProtocol.Udp))
+                        .Add(new StunLifetimeAttribute(_options.RequestedLifetime));
+
+                    if (_options.RequestedAddressFamily is { } family)
+                    {
+                        // RFC 8656 section 18.6: omitting REQUESTED-ADDRESS-FAMILY asks for the
+                        // server's default (an IPv4 relayed address, section 6.1); naming a family
+                        // asks for a relayed address from that family specifically.
+                        request.Add(new StunRequestedAddressFamilyAttribute(family));
+                    }
+
+                    return request;
+                },
                 cancellationToken).ConfigureAwait(false);
 
             var relayed = response.RelayedAddress
                           ?? throw new StunFormatException("The Allocate success response carried no XOR-RELAYED-ADDRESS.");
-            if (relayed.AddressFamily != AddressFamily.InterNetwork)
+            if (_options.RequestedAddressFamily is { } requestedFamily && relayed.AddressFamily != requestedFamily)
             {
-                throw new StunFormatException($"Keryx only uses IPv4 relayed addresses; the server allocated {relayed}.");
+                throw new StunFormatException(
+                    $"Requested a {requestedFamily} relayed address but the server allocated {relayed}.");
             }
 
             var granted = response.GetAttribute<StunLifetimeAttribute>()?.Lifetime
@@ -402,7 +422,7 @@ public sealed class TurnClient : IDisposable
         var seen = new HashSet<IPAddress>();
         foreach (var peer in peers)
         {
-            if (peer.AddressFamily == AddressFamily.InterNetwork && seen.Add(peer.Address))
+            if (peer.AddressFamily is (AddressFamily.InterNetwork or AddressFamily.InterNetworkV6) && seen.Add(peer.Address))
             {
                 wanted.Add(peer);
             }
@@ -470,9 +490,9 @@ public sealed class TurnClient : IDisposable
         ArgumentNullException.ThrowIfNull(peer);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (peer.AddressFamily != AddressFamily.InterNetwork)
+        if (peer.AddressFamily is not (AddressFamily.InterNetwork or AddressFamily.InterNetworkV6))
         {
-            throw new ArgumentException("Keryx only binds channels for IPv4 peers.", nameof(peer));
+            throw new ArgumentException("A TURN channel peer must be an IPv4 or IPv6 transport address.", nameof(peer));
         }
 
         await _transactionGate.WaitAsync(cancellationToken).ConfigureAwait(false);

@@ -155,12 +155,19 @@ internal sealed class TurnClientHarness : IDisposable
 internal sealed class TestPeer : IDisposable
 {
     private readonly Socket _socket;
+    private readonly EndPoint _any;
 
-    public TestPeer()
+    /// <param name="family">
+    /// The peer's address family; defaults to IPv4. Pass <see cref="AddressFamily.InterNetworkV6"/>
+    /// to stand in for a peer behind an IPv6 TURN relay.
+    /// </param>
+    public TestPeer(AddressFamily family = AddressFamily.InterNetwork)
     {
-        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        _socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var loopback = family == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
+        _socket = new Socket(family, SocketType.Dgram, ProtocolType.Udp);
+        _socket.Bind(new IPEndPoint(loopback, 0));
         EndPoint = (IPEndPoint)_socket.LocalEndPoint!;
+        _any = family == AddressFamily.InterNetworkV6 ? new IPEndPoint(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
     }
 
     public IPEndPoint EndPoint { get; }
@@ -172,8 +179,7 @@ internal sealed class TestPeer : IDisposable
     public async Task<(byte[] Data, IPEndPoint From)> ReceiveAsync(CancellationToken cancellationToken)
     {
         var buffer = new byte[4096];
-        EndPoint any = new IPEndPoint(IPAddress.Any, 0);
-        var result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, any, cancellationToken);
+        var result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, _any, cancellationToken);
         return (buffer.AsSpan(0, result.ReceivedBytes).ToArray(), (IPEndPoint)result.RemoteEndPoint);
     }
 

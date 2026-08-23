@@ -1,3 +1,4 @@
+using System.Net.Sockets;
 using Keryx.Core;
 using Keryx.Stun;
 
@@ -43,6 +44,16 @@ public sealed class TurnClientOptions
     /// </summary>
     public bool UseChannelData { get; set; } = true;
 
+    /// <summary>
+    /// The address family to request for the relayed address, sent as REQUESTED-ADDRESS-FAMILY
+    /// (RFC 8656 section 18.6). Null - the default - omits the attribute, which is today's wire
+    /// behaviour and asks the server for its own default, an IPv4 relayed address (section 6.1).
+    /// Set to <see cref="AddressFamily.InterNetworkV6"/> to request an IPv6 relay instead; only
+    /// <see cref="AddressFamily.InterNetwork"/> and <see cref="AddressFamily.InterNetworkV6"/> are
+    /// valid.
+    /// </summary>
+    public AddressFamily? RequestedAddressFamily { get; set; }
+
     /// <summary>Retransmission settings for the Allocate, Refresh, CreatePermission and ChannelBind transactions.</summary>
     public StunClientOptions? StunClientOptions { get; set; }
 
@@ -57,6 +68,12 @@ public sealed class TurnClientOptions
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(PermissionRefreshInterval, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(ChannelRefreshInterval, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MaintenanceInterval, TimeSpan.Zero);
+        if (RequestedAddressFamily is { } family && family is not (AddressFamily.InterNetwork or AddressFamily.InterNetworkV6))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(RequestedAddressFamily), family, "Only InterNetwork and InterNetworkV6 can be requested.");
+        }
+
         return this;
     }
 }
