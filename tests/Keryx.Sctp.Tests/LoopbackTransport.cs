@@ -138,13 +138,13 @@ internal sealed class LoopbackTransport : IDatagramTransport, IDisposable
         return (a, b);
     }
 
-    /// <summary>True when any chunk in the datagram is a DATA chunk.</summary>
+    /// <summary>True when any chunk in the datagram is a DATA or I-DATA chunk.</summary>
     private static bool ContainsData(byte[] packet)
     {
         var offset = 12;
         while (packet.Length - offset >= 4)
         {
-            if (packet[offset] == (byte)SctpChunkType.Data)
+            if (packet[offset] == (byte)SctpChunkType.Data || packet[offset] == (byte)SctpChunkType.IData)
             {
                 return true;
             }

@@ -61,6 +61,17 @@ public sealed class SctpAssociation : IDisposable
     private readonly Dictionary<int, DataChannel> _channels = new();
     private readonly Dictionary<ushort, List<ReassembledMessage>> _orphanMessages = new();
 
+    // RFC 8260 user-message interleaving (I-DATA). Send-side MID counters are kept per stream and
+    // per ordering namespace; receive-side reassembly keys on (stream, ordered/unordered, MID) and
+    // orders fragments by FSN, with a TSN->key index so FORWARD TSN and stream resets can evict the
+    // partial fragments they abandon.
+    private readonly Dictionary<ushort, uint> _sendOrderedMid = new();
+    private readonly Dictionary<ushort, uint> _sendUnorderedMid = new();
+    private readonly Dictionary<IDataKey, IDataReassembly> _iDataReassembly = new();
+    private readonly Dictionary<uint, (IDataKey Key, uint Fsn)> _iDataTsnIndex = new();
+    private readonly Dictionary<ushort, IDataReceiveStream> _iDataReceiveStreams = new();
+    private int _iDataBufferedFragments;
+
     // RFC 6525 stream reconfiguration (RE-CONFIG). Stream ids freed by a completed reset are
     // held here so a later channel reuses them instead of exhausting the id space; the queue
     // holds ids whose channels have closed and are waiting for an outgoing reset to be driven.
@@ -87,6 +98,7 @@ public sealed class SctpAssociation : IDisposable
     private ushort _inboundStreams;
     private bool _peerSupportsForwardTsn;
     private bool _peerSupportsReconfig;
+    private bool _peerSupportsInterleaving;
     private int _nextMessageId;
     private int _nextStreamId;
     private long _receiveBufferBytes;
@@ -247,8 +259,23 @@ public sealed class SctpAssociation : IDisposable
     }
 
     /// <summary>Largest user payload, in bytes, that fits in a single DATA chunk on this transport.</summary>
+    /// <remarks>
+    /// When RFC 8260 interleaving has been negotiated, data travels in I-DATA chunks whose fixed
+    /// header is four bytes larger, so the per-chunk payload budget shrinks accordingly.
+    /// </remarks>
     public int MaxPayloadPerChunk =>
-        Math.Max(4, (_lower.MaxDatagramSize - SctpPacket.CommonHeaderLength - 4 - SctpDataChunk.FixedHeaderLength) & ~3);
+        Math.Max(
+            4,
+            (_lower.MaxDatagramSize
+                - SctpPacket.CommonHeaderLength
+                - 4
+                - (UseInterleaving ? SctpIDataChunk.FixedHeaderLength : SctpDataChunk.FixedHeaderLength)) & ~3);
+
+    /// <summary>
+    /// True once both endpoints have advertised RFC 8260 I-DATA: this endpoint must be configured to
+    /// enable it and the peer must have advertised it. Until both hold, data travels as classic DATA.
+    /// </summary>
+    private bool UseInterleaving => _config.EnableInterleaving && _peerSupportsInterleaving;
 
     private long InitialCongestionWindow
     {
@@ -484,8 +511,11 @@ public sealed class SctpAssociation : IDisposable
     private void FreeStreamId(ushort streamId)
     {
         _sendSequence.Remove(streamId);
+        _sendOrderedMid.Remove(streamId);
+        _sendUnorderedMid.Remove(streamId);
         _receiveStreams.Remove(streamId);
         _orphanMessages.Remove(streamId);
+        ResetIDataStream(streamId);
 
         // Only identifiers this endpoint owns (matching its allocation parity) may be handed back
         // to AllocateStreamId; the peer allocates the other parity.
@@ -600,6 +630,9 @@ public sealed class SctpAssociation : IDisposable
             case SctpDataChunk data:
                 HandleData(data);
                 break;
+            case SctpIDataChunk idata:
+                HandleIData(idata);
+                break;
             case SctpSackChunk sack:
                 HandleSack(sack);
                 break;
@@ -666,9 +699,7 @@ public sealed class SctpAssociation : IDisposable
         };
         initAck.Parameters.Add(new SctpParameter(SctpParameterType.StateCookie, cookie));
         initAck.Parameters.Add(new SctpParameter(SctpParameterType.ForwardTsnSupported, Array.Empty<byte>()));
-        initAck.Parameters.Add(new SctpParameter(
-            SctpParameterType.SupportedExtensions,
-            new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig }));
+        initAck.Parameters.Add(new SctpParameter(SctpParameterType.SupportedExtensions, SupportedExtensions()));
 
         SendImmediate(init.InitiateTag, initAck);
         _log.Log(KeryxLogLevel.Debug, "Answered INIT with a stateless INIT ACK.");
@@ -695,7 +726,8 @@ public sealed class SctpAssociation : IDisposable
             Math.Min(_config.OutboundStreams, initAck.NumberOfInboundStreams),
             Math.Min(_config.InboundStreams, initAck.NumberOfOutboundStreams),
             initAck.ForwardTsnSupported,
-            initAck.ReconfigSupported);
+            initAck.ReconfigSupported,
+            initAck.InterleavingSupported);
 
         _pendingInit = null;
         _pendingCookieEcho = new SctpCookieEchoChunk(cookie);
@@ -707,7 +739,7 @@ public sealed class SctpAssociation : IDisposable
 
     private void HandleCookieEcho(SctpCookieEchoChunk cookieEcho)
     {
-        if (!TryReadCookie(cookieEcho.Cookie, out var peerTag, out var peerInitialTsn, out var peerRwnd, out var outbound, out var inbound, out var forwardTsn, out var reconfig))
+        if (!TryReadCookie(cookieEcho.Cookie, out var peerTag, out var peerInitialTsn, out var peerRwnd, out var outbound, out var inbound, out var forwardTsn, out var reconfig, out var interleaving))
         {
             _log.Log(KeryxLogLevel.Warning, "Rejecting COOKIE ECHO: cookie failed validation.");
             var abort = MakeAbort(SctpErrorCauseCode.StaleCookieError, "invalid or expired state cookie");
@@ -722,7 +754,7 @@ public sealed class SctpAssociation : IDisposable
             return;
         }
 
-        AdoptPeerParameters(peerTag, peerInitialTsn, peerRwnd, outbound, inbound, forwardTsn, reconfig);
+        AdoptPeerParameters(peerTag, peerInitialTsn, peerRwnd, outbound, inbound, forwardTsn, reconfig, interleaving);
         _controlQueue.Add(new SctpCookieAckChunk());
         Establish();
     }
@@ -739,7 +771,7 @@ public sealed class SctpAssociation : IDisposable
         Establish();
     }
 
-    private void AdoptPeerParameters(uint peerTag, uint peerInitialTsn, uint peerRwnd, ushort outbound, ushort inbound, bool forwardTsn, bool reconfig)
+    private void AdoptPeerParameters(uint peerTag, uint peerInitialTsn, uint peerRwnd, ushort outbound, ushort inbound, bool forwardTsn, bool reconfig, bool interleaving)
     {
         _peerTag = peerTag;
         _peerReceiveWindow = peerRwnd;
@@ -747,6 +779,7 @@ public sealed class SctpAssociation : IDisposable
         _inboundStreams = inbound;
         _peerSupportsForwardTsn = forwardTsn;
         _peerSupportsReconfig = reconfig;
+        _peerSupportsInterleaving = interleaving;
         _cumulativeTsnReceived = unchecked(peerInitialTsn - 1);
         _reconfigNextExpectedRemoteSeq = peerInitialTsn;
     }
@@ -757,6 +790,7 @@ public sealed class SctpAssociation : IDisposable
         _congestionWindow = InitialCongestionWindow;
         _slowStartThreshold = Math.Max(_peerReceiveWindow, InitialCongestionWindow);
         _partialBytesAcked = 0;
+        RestampQueuedForInterleaving();
         _log.Log(KeryxLogLevel.Info, $"SCTP association established (peer tag 0x{_peerTag:X8}, forward-TSN {_peerSupportsForwardTsn}).");
 
         var source = _connectSource;
@@ -765,6 +799,48 @@ public sealed class SctpAssociation : IDisposable
             OnAssociated?.Invoke();
             source?.TrySetResult();
         });
+    }
+
+    /// <summary>
+    /// Converts data queued before the handshake completed to the negotiated transmission mode.
+    /// Channels may be created (and their DCEP OPEN queued) before <see cref="ConnectAsync"/>, at
+    /// which point interleaving is not yet known; once it is, any not-yet-transmitted chunk is
+    /// re-stamped as I-DATA with a freshly allocated MID so the whole association speaks one wire
+    /// format rather than mixing classic DATA with I-DATA.
+    /// </summary>
+    private void RestampQueuedForInterleaving()
+    {
+        if (!UseInterleaving)
+        {
+            return;
+        }
+
+        var currentMessageId = int.MinValue;
+        uint mid = 0;
+        uint fsn = 0;
+        foreach (var chunk in _out)
+        {
+            if (chunk.Interleaved || chunk.Transmits > 0 || chunk.Acked || chunk.Abandoned)
+            {
+                continue;
+            }
+
+            // Fragments of a message keep their enqueue order in _out, so a change of message id
+            // marks a new message: allocate its MID and restart the fragment sequence number.
+            if (chunk.MessageId != currentMessageId)
+            {
+                currentMessageId = chunk.MessageId;
+                var midMap = chunk.Unordered ? _sendUnorderedMid : _sendOrderedMid;
+                midMap.TryGetValue(chunk.StreamId, out mid);
+                midMap[chunk.StreamId] = unchecked(mid + 1);
+                fsn = 0;
+            }
+
+            chunk.Interleaved = true;
+            chunk.MessageIdentifier = mid;
+            chunk.FragmentSequenceNumber = fsn;
+            fsn = unchecked(fsn + 1);
+        }
     }
 
     private void HandleAbort(SctpAbortChunk abort)
@@ -1020,6 +1096,230 @@ public sealed class SctpAssociation : IDisposable
         }
 
         return stream;
+    }
+
+    /// <summary>
+    /// Handles an inbound RFC 8260 I-DATA chunk. The out-of-order/duplicate/flow-control bookkeeping
+    /// is identical to <see cref="HandleData"/> — the TSN space, the cumulative acknowledgement and
+    /// the receive-buffer caps are shared — but fragments are collected by (stream, MID) and ordered
+    /// by FSN rather than by a contiguous TSN run, so an interleaved fragment stream reassembles
+    /// correctly and a large message never blocks small messages arriving on other streams.
+    /// </summary>
+    private void HandleIData(SctpIDataChunk data)
+    {
+        if (_state is SctpAssociationState.Closed or SctpAssociationState.CookieWait)
+        {
+            return;
+        }
+
+        _sackPending = true;
+
+        if (Serial.Lte(data.Tsn, _cumulativeTsnReceived) || _received.Contains(data.Tsn))
+        {
+            if (_duplicateTsns.Count < 32)
+            {
+                _duplicateTsns.Add(data.Tsn);
+            }
+
+            return;
+        }
+
+        if (data.StreamId >= _inboundStreams)
+        {
+            _log.Log(KeryxLogLevel.Warning, $"Discarding I-DATA for out-of-range stream {data.StreamId}.");
+            return;
+        }
+
+        var advancesCumulative = data.Tsn == unchecked(_cumulativeTsnReceived + 1);
+        if (!advancesCumulative && WouldExceedReceiveBuffer(data.Payload.Length))
+        {
+            _log.Log(
+                KeryxLogLevel.Warning,
+                $"Dropping out-of-order I-DATA (TSN {data.Tsn}): receive buffer at hard cap " +
+                $"({_receiveBufferBytes} bytes / {_iDataBufferedFragments} fragments, cap {ReceiveBufferHardCap}).");
+            return;
+        }
+
+        _received.Add(data.Tsn);
+        AdvanceCumulativeReceive();
+        BufferIData(data);
+        ProcessDeferredIncomingResets();
+
+        if (_receiveBufferBytes > (long)ReceiveBufferHardCap || _iDataBufferedFragments > MaxBufferedChunks)
+        {
+            _log.Log(
+                KeryxLogLevel.Warning,
+                $"Aborting association: out-of-order I-DATA receive buffer exceeded hard cap " +
+                $"({_receiveBufferBytes} bytes / {_iDataBufferedFragments} fragments, cap {ReceiveBufferHardCap}).");
+            AbortInternal(SctpErrorCauseCode.OutOfResource, "receive buffer exhausted");
+        }
+    }
+
+    private void BufferIData(SctpIDataChunk data)
+    {
+        var key = new IDataKey(data.StreamId, data.Unordered, data.MessageIdentifier);
+        if (!_iDataReassembly.TryGetValue(key, out var entry))
+        {
+            entry = new IDataReassembly();
+            _iDataReassembly[key] = entry;
+        }
+
+        // The beginning fragment has an implicit FSN of zero and carries the PPID in place of the FSN.
+        var fsn = data.Beginning ? 0u : data.FragmentSequenceNumber;
+        if (!entry.Fragments.ContainsKey(fsn))
+        {
+            entry.Fragments[fsn] = (data.Payload, data.Tsn);
+            entry.ByteCount += data.Payload.Length;
+            _iDataTsnIndex[data.Tsn] = (key, fsn);
+            _iDataBufferedFragments++;
+            _receiveBufferBytes += data.Payload.Length;
+        }
+
+        if (data.Beginning)
+        {
+            entry.HasBeginning = true;
+            entry.PayloadProtocolId = data.PayloadProtocolId;
+        }
+
+        if (data.Ending)
+        {
+            entry.HasEnd = true;
+            entry.EndFsn = fsn;
+        }
+
+        TryReassembleIData(key, entry);
+    }
+
+    private void TryReassembleIData(IDataKey key, IDataReassembly entry)
+    {
+        if (!entry.IsComplete)
+        {
+            return;
+        }
+
+        var total = entry.ByteCount;
+        var ppid = entry.PayloadProtocolId;
+        EvictIDataEntry(key, entry);
+
+        if ((uint)total > _config.MaxMessageSize)
+        {
+            _log.Log(KeryxLogLevel.Warning, $"Dropping oversized inbound message of {total} bytes on stream {key.StreamId}.");
+            return;
+        }
+
+        var payload = new byte[total];
+        var offset = 0;
+        foreach (var fragment in entry.Fragments.Values)
+        {
+            fragment.Payload.CopyTo(payload, offset);
+            offset += fragment.Payload.Length;
+        }
+
+        var message = new ReassembledMessage
+        {
+            StreamId = key.StreamId,
+            PayloadProtocolId = ppid,
+            Payload = payload,
+        };
+
+        if (key.Unordered)
+        {
+            DeliverMessage(message);
+            return;
+        }
+
+        var stream = GetIDataReceiveStream(key.StreamId);
+        if (key.MessageId == stream.NextMessageId)
+        {
+            DeliverMessage(message);
+            stream.NextMessageId = unchecked(stream.NextMessageId + 1);
+            DrainIDataOrdered(stream);
+        }
+        else if (Serial.Gt(key.MessageId, stream.NextMessageId))
+        {
+            stream.Buffered[key.MessageId] = message;
+        }
+    }
+
+    private void DrainIDataOrdered(IDataReceiveStream stream)
+    {
+        while (stream.Buffered.Remove(stream.NextMessageId, out var next))
+        {
+            DeliverMessage(next);
+            stream.NextMessageId = unchecked(stream.NextMessageId + 1);
+        }
+    }
+
+    /// <summary>Removes an I-DATA reassembly entry and releases the receive-buffer it charged.</summary>
+    private void EvictIDataEntry(IDataKey key, IDataReassembly entry)
+    {
+        foreach (var fragment in entry.Fragments.Values)
+        {
+            _iDataTsnIndex.Remove(fragment.Tsn);
+        }
+
+        _receiveBufferBytes -= entry.ByteCount;
+        _iDataBufferedFragments -= entry.Fragments.Count;
+        _iDataReassembly.Remove(key);
+    }
+
+    private IDataReceiveStream GetIDataReceiveStream(ushort streamId)
+    {
+        if (!_iDataReceiveStreams.TryGetValue(streamId, out var stream))
+        {
+            stream = new IDataReceiveStream();
+            _iDataReceiveStreams[streamId] = stream;
+        }
+
+        return stream;
+    }
+
+    /// <summary>
+    /// Discards a single buffered I-DATA fragment whose TSN a FORWARD TSN has skipped past, freeing
+    /// the receive-buffer it charged. When this empties a partially reassembled message the whole
+    /// entry is dropped, since its remaining fragments can never form a complete message.
+    /// </summary>
+    private void DropIDataFragmentByTsn(uint tsn)
+    {
+        if (!_iDataTsnIndex.Remove(tsn, out var located))
+        {
+            return;
+        }
+
+        if (!_iDataReassembly.TryGetValue(located.Key, out var entry)
+            || !entry.Fragments.Remove(located.Fsn, out var fragment))
+        {
+            return;
+        }
+
+        _receiveBufferBytes -= fragment.Payload.Length;
+        _iDataBufferedFragments--;
+        entry.ByteCount -= fragment.Payload.Length;
+
+        if (entry.Fragments.Count == 0)
+        {
+            _iDataReassembly.Remove(located.Key);
+        }
+    }
+
+    /// <summary>Drops every buffered I-DATA fragment and ordered-delivery state for a stream.</summary>
+    private void ResetIDataStream(ushort streamId)
+    {
+        _iDataReceiveStreams.Remove(streamId);
+
+        var keys = new List<IDataKey>();
+        foreach (var key in _iDataReassembly.Keys)
+        {
+            if (key.StreamId == streamId)
+            {
+                keys.Add(key);
+            }
+        }
+
+        foreach (var key in keys)
+        {
+            EvictIDataEntry(key, _iDataReassembly[key]);
+        }
     }
 
     private void DeliverMessage(ReassembledMessage message)
@@ -1374,6 +1674,8 @@ public sealed class SctpAssociation : IDisposable
             stream.Buffered.Clear();
         }
 
+        ResetIDataStream(streamId);
+
         if (!peerInitiated)
         {
             return;
@@ -1477,6 +1779,8 @@ public sealed class SctpAssociation : IDisposable
                 {
                     _receiveBufferBytes -= removed.Payload.Length;
                 }
+
+                DropIDataFragmentByTsn(t);
             }
 
             _cumulativeTsnReceived = forward.NewCumulativeTsn;
@@ -1534,8 +1838,20 @@ public sealed class SctpAssociation : IDisposable
         DataChannel? channel,
         int bufferedBytes)
     {
+        var interleaved = UseInterleaving;
+
+        // Classic DATA carries a 16-bit per-fragment stream sequence number for ordered messages;
+        // I-DATA replaces it with a 32-bit message identifier drawn from a per-stream, per-ordering
+        // namespace that doubles as the ordered-delivery sequence.
         ushort sequence = 0;
-        if (ordered)
+        uint messageIdentifier = 0;
+        if (interleaved)
+        {
+            var midMap = ordered ? _sendOrderedMid : _sendUnorderedMid;
+            midMap.TryGetValue(streamId, out messageIdentifier);
+            midMap[streamId] = unchecked(messageIdentifier + 1);
+        }
+        else if (ordered)
         {
             _sendSequence.TryGetValue(streamId, out sequence);
             _sendSequence[streamId] = unchecked((ushort)(sequence + 1));
@@ -1545,6 +1861,7 @@ public sealed class SctpAssociation : IDisposable
         var maxPayload = MaxPayloadPerChunk;
         var offset = 0;
         var remainingBuffered = bufferedBytes;
+        uint fsn = 0;
 
         do
         {
@@ -1565,6 +1882,9 @@ public sealed class SctpAssociation : IDisposable
                 Beginning = offset == 0,
                 Ending = isLast,
                 Unordered = !ordered,
+                Interleaved = interleaved,
+                MessageIdentifier = messageIdentifier,
+                FragmentSequenceNumber = fsn,
                 MessageId = messageId,
                 MaxRetransmits = maxRetransmits,
                 Channel = channel,
@@ -1572,6 +1892,7 @@ public sealed class SctpAssociation : IDisposable
             });
 
             _nextTsn = unchecked(_nextTsn + 1);
+            fsn = unchecked(fsn + 1);
             offset += length;
         }
         while (offset < body.Length);
@@ -1643,7 +1964,7 @@ public sealed class SctpAssociation : IDisposable
             }
 
             var window = Math.Min(_congestionWindow, (long)_peerReceiveWindow);
-            foreach (var chunk in _out)
+            foreach (var chunk in NewDataInSendOrder())
             {
                 if (chunk.Transmits > 0 || chunk.Acked || chunk.Abandoned)
                 {
@@ -1682,6 +2003,77 @@ public sealed class SctpAssociation : IDisposable
         }
     }
 
+    /// <summary>
+    /// The never-transmitted chunks in the order they should be handed to the wire. With classic
+    /// DATA this is simply TSN order, so a message's fragments occupy a contiguous TSN run (the
+    /// receiver reassembles by walking adjacent TSNs). With RFC 8260 interleaving negotiated the
+    /// chunks are dealt out round-robin across streams — one fragment per stream per round — so a
+    /// large message on one stream never blocks small messages queued on others; the receiver
+    /// reassembles by (stream, MID) using FSN, which tolerates the interleaved TSNs this produces.
+    /// </summary>
+    private IEnumerable<OutgoingChunk> NewDataInSendOrder()
+    {
+        if (!UseInterleaving)
+        {
+            return _out;
+        }
+
+        var perStream = new Dictionary<ushort, Queue<OutgoingChunk>>();
+        var order = new List<ushort>();
+        foreach (var chunk in _out)
+        {
+            if (chunk.Transmits > 0 || chunk.Acked || chunk.Abandoned)
+            {
+                continue;
+            }
+
+            if (!perStream.TryGetValue(chunk.StreamId, out var queue))
+            {
+                queue = new Queue<OutgoingChunk>();
+                perStream[chunk.StreamId] = queue;
+                order.Add(chunk.StreamId);
+            }
+
+            queue.Enqueue(chunk);
+        }
+
+        if (order.Count <= 1)
+        {
+            return _out;
+        }
+
+        var interleaved = new List<OutgoingChunk>();
+        var drained = true;
+        while (drained)
+        {
+            drained = false;
+            foreach (var streamId in order)
+            {
+                if (perStream[streamId].TryDequeue(out var chunk))
+                {
+                    interleaved.Add(chunk);
+                    drained = true;
+                }
+            }
+        }
+
+        return interleaved;
+    }
+
+    /// <summary>
+    /// The Supported Extensions chunk-type list advertised in INIT and INIT ACK. I-DATA is offered
+    /// only when this endpoint is configured to enable interleaving (RFC 8260 §3).
+    /// </summary>
+    private byte[] SupportedExtensions()
+    {
+        if (_config.EnableInterleaving)
+        {
+            return new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig, (byte)SctpChunkType.IData };
+        }
+
+        return new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig };
+    }
+
     private void SendInit()
     {
         var init = new SctpInitChunk(SctpChunkType.Init)
@@ -1693,9 +2085,7 @@ public sealed class SctpAssociation : IDisposable
             InitialTsn = _localInitialTsn,
         };
         init.Parameters.Add(new SctpParameter(SctpParameterType.ForwardTsnSupported, Array.Empty<byte>()));
-        init.Parameters.Add(new SctpParameter(
-            SctpParameterType.SupportedExtensions,
-            new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig }));
+        init.Parameters.Add(new SctpParameter(SctpParameterType.SupportedExtensions, SupportedExtensions()));
 
         _pendingInit = init;
         _state = SctpAssociationState.CookieWait;
@@ -2053,7 +2443,10 @@ public sealed class SctpAssociation : IDisposable
         var skips = new Dictionary<ushort, ushort>();
         foreach (var chunk in _out)
         {
-            if (!chunk.Abandoned || chunk.Unordered || Serial.Gt(chunk.Tsn, _advancedPeerAckPoint))
+            // Interleaved (I-DATA) ordered messages are sequenced by 32-bit MID, which a classic
+            // FORWARD TSN stream entry (16-bit SSN) cannot represent, so only the cumulative TSN is
+            // advanced for them; the SSN skip list applies to classic DATA only.
+            if (!chunk.Abandoned || chunk.Unordered || chunk.Interleaved || Serial.Gt(chunk.Tsn, _advancedPeerAckPoint))
             {
                 continue;
             }
@@ -2249,7 +2642,8 @@ public sealed class SctpAssociation : IDisposable
         writer.WriteU16(inbound);
         writer.WriteU8(init.ForwardTsnSupported ? (byte)1 : (byte)0);
         writer.WriteU8(init.ReconfigSupported ? (byte)1 : (byte)0);
-        writer.WriteU16(0);
+        writer.WriteU8(init.InterleavingSupported ? (byte)1 : (byte)0);
+        writer.WriteU8(0);
 
         var mac = HMACSHA256.HashData(_cookieKey, cookie.AsSpan(0, CookieMacOffset));
         mac.CopyTo(cookie.AsSpan(CookieMacOffset));
@@ -2264,7 +2658,8 @@ public sealed class SctpAssociation : IDisposable
         out ushort outbound,
         out ushort inbound,
         out bool forwardTsn,
-        out bool reconfig)
+        out bool reconfig,
+        out bool interleaving)
     {
         peerTag = 0;
         peerInitialTsn = 0;
@@ -2273,6 +2668,7 @@ public sealed class SctpAssociation : IDisposable
         inbound = 0;
         forwardTsn = false;
         reconfig = false;
+        interleaving = false;
 
         if (cookie.Length != CookieLength)
         {
@@ -2306,6 +2702,7 @@ public sealed class SctpAssociation : IDisposable
         inbound = reader.ReadU16();
         forwardTsn = reader.ReadU8() != 0;
         reconfig = reader.ReadU8() != 0;
+        interleaving = reader.ReadU8() != 0;
         return peerTag != 0;
     }
 
@@ -2346,6 +2743,10 @@ public sealed class SctpAssociation : IDisposable
         _fragments.Clear();
         _received.Clear();
         _duplicateTsns.Clear();
+        _iDataReassembly.Clear();
+        _iDataTsnIndex.Clear();
+        _iDataReceiveStreams.Clear();
+        _iDataBufferedFragments = 0;
         _receiveBufferBytes = 0;
 
         var channels = _channels.Values.ToArray();

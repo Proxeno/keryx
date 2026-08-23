@@ -77,6 +77,87 @@ public class SctpCodecTests
     }
 
     [Fact]
+    public void IDataFirstFragmentCarriesPpidAndMid()
+    {
+        var payload = new byte[] { 10, 20, 30, 40, 50 };
+        var chunk = new SctpIDataChunk(
+            tsn: 0x0A0B0C0D,
+            streamId: 7,
+            messageIdentifier: 0x11223344,
+            payloadProtocolId: SctpPpid.String,
+            fragmentSequenceNumber: 0,
+            payload: payload,
+            beginning: true,
+            ending: false,
+            unordered: false);
+
+        // 4-byte chunk header + 16-byte I-DATA header + 5-byte payload, padded to 28.
+        chunk.Length.Should().Be(4 + 16 + 5);
+        chunk.PaddedLength.Should().Be(28);
+        chunk.Flags.Should().Be(SctpDataChunk.BeginningFlag);
+
+        var parsed = (SctpIDataChunk)RoundTrip(chunk).Chunks[0];
+        parsed.Type.Should().Be(SctpChunkType.IData);
+        parsed.Tsn.Should().Be(0x0A0B0C0D);
+        parsed.StreamId.Should().Be(7);
+        parsed.MessageIdentifier.Should().Be(0x11223344);
+        parsed.Beginning.Should().BeTrue();
+        parsed.Ending.Should().BeFalse();
+
+        // On the first fragment the fourth word is the PPID; the FSN is implicitly zero.
+        parsed.PayloadProtocolId.Should().Be(SctpPpid.String);
+        parsed.FragmentSequenceNumber.Should().Be(0);
+        parsed.Payload.Should().Equal(payload);
+    }
+
+    [Fact]
+    public void IDataContinuationFragmentCarriesFsn()
+    {
+        var payload = new byte[] { 99, 98, 97 };
+        var chunk = new SctpIDataChunk(
+            tsn: 500,
+            streamId: 3,
+            messageIdentifier: 42,
+            payloadProtocolId: SctpPpid.Binary,
+            fragmentSequenceNumber: 6,
+            payload: payload,
+            beginning: false,
+            ending: true,
+            unordered: true);
+
+        chunk.Flags.Should().Be(SctpDataChunk.EndingFlag | SctpDataChunk.UnorderedFlag);
+
+        var parsed = (SctpIDataChunk)RoundTrip(chunk).Chunks[0];
+        parsed.MessageIdentifier.Should().Be(42);
+        parsed.Beginning.Should().BeFalse();
+        parsed.Ending.Should().BeTrue();
+        parsed.Unordered.Should().BeTrue();
+
+        // On a continuation fragment the fourth word is the FSN; no PPID is present on the wire.
+        parsed.FragmentSequenceNumber.Should().Be(6);
+        parsed.PayloadProtocolId.Should().Be(0);
+        parsed.Payload.Should().Equal(payload);
+    }
+
+    [Fact]
+    public void InitAdvertisesInterleavingInSupportedExtensions()
+    {
+        var init = new SctpInitChunk(SctpChunkType.Init) { InitiateTag = 1 };
+        init.Parameters.Add(new SctpParameter(
+            SctpParameterType.SupportedExtensions,
+            new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig, (byte)SctpChunkType.IData }));
+
+        var parsed = (SctpInitChunk)RoundTrip(init).Chunks[0];
+        parsed.InterleavingSupported.Should().BeTrue();
+
+        var withoutIData = new SctpInitChunk(SctpChunkType.Init) { InitiateTag = 1 };
+        withoutIData.Parameters.Add(new SctpParameter(
+            SctpParameterType.SupportedExtensions,
+            new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig }));
+        ((SctpInitChunk)RoundTrip(withoutIData).Chunks[0]).InterleavingSupported.Should().BeFalse();
+    }
+
+    [Fact]
     public void InitAndInitAckRoundTripWithParameters()
     {
         var init = new SctpInitChunk(SctpChunkType.Init)

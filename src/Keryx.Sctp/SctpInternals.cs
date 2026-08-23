@@ -35,6 +35,19 @@ internal sealed class OutgoingChunk
 
     internal required bool Unordered { get; init; }
 
+    /// <summary>
+    /// When true this chunk is transmitted as an RFC 8260 I-DATA chunk carrying
+    /// <see cref="MessageIdentifier"/>/<see cref="FragmentSequenceNumber"/>; when false it is a
+    /// classic DATA chunk carrying <see cref="StreamSequence"/> and a per-fragment PPID.
+    /// </summary>
+    internal bool Interleaved { get; set; }
+
+    /// <summary>RFC 8260 message identifier (MID); used only when <see cref="Interleaved"/> is true.</summary>
+    internal uint MessageIdentifier { get; set; }
+
+    /// <summary>RFC 8260 fragment sequence number (FSN); used only on continuation I-DATA fragments.</summary>
+    internal uint FragmentSequenceNumber { get; set; }
+
     internal required int MessageId { get; init; }
 
     internal required ushort? MaxRetransmits { get; init; }
@@ -61,10 +74,14 @@ internal sealed class OutgoingChunk
     internal bool BufferReleased { get; set; }
 
     /// <summary>Wire size of the encoded chunk, used for flight-size and congestion accounting.</summary>
-    internal int WireSize => 4 + SctpDataChunk.FixedHeaderLength + Payload.Length;
+    internal int WireSize =>
+        4 + (Interleaved ? SctpIDataChunk.FixedHeaderLength : SctpDataChunk.FixedHeaderLength) + Payload.Length;
 
-    internal SctpDataChunk ToChunk() =>
-        new(Tsn, StreamId, StreamSequence, PayloadProtocolId, Payload, Beginning, Ending, Unordered);
+    internal SctpChunk ToChunk() =>
+        Interleaved
+            ? new SctpIDataChunk(
+                Tsn, StreamId, MessageIdentifier, PayloadProtocolId, FragmentSequenceNumber, Payload, Beginning, Ending, Unordered)
+            : new SctpDataChunk(Tsn, StreamId, StreamSequence, PayloadProtocolId, Payload, Beginning, Ending, Unordered);
 }
 
 /// <summary>An outgoing RFC 6525 RE-CONFIG request awaiting a Re-configuration Response.</summary>
@@ -98,4 +115,42 @@ internal sealed class ReassembledMessage
     internal required uint PayloadProtocolId { get; init; }
 
     internal required byte[] Payload { get; init; }
+}
+
+/// <summary>
+/// Identifies an RFC 8260 message under reassembly. Ordered and unordered messages occupy separate
+/// MID namespaces on a stream, so the ordering flag is part of the key.
+/// </summary>
+internal readonly record struct IDataKey(ushort StreamId, bool Unordered, uint MessageId);
+
+/// <summary>
+/// Reassembly state for one in-progress I-DATA message, collecting fragments by fragment sequence
+/// number until the beginning fragment, the ending fragment and every FSN in between have arrived.
+/// </summary>
+internal sealed class IDataReassembly
+{
+    internal bool HasBeginning { get; set; }
+
+    internal bool HasEnd { get; set; }
+
+    internal uint EndFsn { get; set; }
+
+    internal uint PayloadProtocolId { get; set; }
+
+    internal int ByteCount { get; set; }
+
+    /// <summary>Fragment payloads and their transmission sequence numbers, keyed by FSN.</summary>
+    internal SortedDictionary<uint, (byte[] Payload, uint Tsn)> Fragments { get; } = new();
+
+    /// <summary>True once the beginning, the end and every intervening fragment are present.</summary>
+    internal bool IsComplete =>
+        HasBeginning && HasEnd && Fragments.Count == unchecked((int)(EndFsn + 1));
+}
+
+/// <summary>Per-stream ordered-delivery state for RFC 8260 I-DATA, sequenced by 32-bit MID.</summary>
+internal sealed class IDataReceiveStream
+{
+    internal uint NextMessageId { get; set; }
+
+    internal Dictionary<uint, ReassembledMessage> Buffered { get; } = new();
 }

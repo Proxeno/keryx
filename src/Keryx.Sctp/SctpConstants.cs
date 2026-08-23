@@ -51,7 +51,7 @@ public enum SctpChunkType : byte
     /// <summary>Authentication chunk (AUTH, RFC 4895). Not implemented by Keryx.</summary>
     Auth = 15,
 
-    /// <summary>Interleaved payload data (I-DATA, RFC 8260). Not implemented by Keryx.</summary>
+    /// <summary>Interleaved payload data (I-DATA, RFC 8260).</summary>
     IData = 64,
 
     /// <summary>Address configuration acknowledgement (ASCONF ACK). Not implemented by Keryx.</summary>
