@@ -82,22 +82,23 @@ internal static class CipherSuites
     private const int ChaChaOverhead = 16;
 
     /// <summary>
-    /// The suites Keryx offers as a client, and prefers as a server, most preferred first. AES-256-GCM
-    /// and ChaCha20-Poly1305 sit above AES-128-GCM; ECDSA suites are used with an ECDSA certificate and
-    /// the RSA suites with an RSA certificate.
+    /// The suites Keryx offers as a client, and prefers as a server, most preferred first. AES-128-GCM
+    /// is the proven, browser-interop-validated default; AES-256-GCM and ChaCha20-Poly1305 are still
+    /// offered below it as fallbacks for a peer that requires them. ECDSA suites are used with an ECDSA
+    /// certificate and the RSA suites with an RSA certificate.
     /// </summary>
     public static ushort[] PreferenceFor(bool ecdsaCertificate) => ecdsaCertificate
         ?
         [
+            TlsEcdheEcdsaWithAes128GcmSha256,
             TlsEcdheEcdsaWithAes256GcmSha384,
             TlsEcdheEcdsaWithChaCha20Poly1305Sha256,
-            TlsEcdheEcdsaWithAes128GcmSha256,
         ]
         :
         [
+            TlsEcdheRsaWithAes128GcmSha256,
             TlsEcdheRsaWithAes256GcmSha384,
             TlsEcdheRsaWithChaCha20Poly1305Sha256,
-            TlsEcdheRsaWithAes128GcmSha256,
         ];
 
     public static bool IsSupported(ushort suite) => Describe(suite) is not null;
@@ -148,10 +149,11 @@ internal static class NamedGroups
     public const ushort X25519 = 29;
 
     /// <summary>
-    /// The elliptic-curve groups Keryx supports for ECDHE, most preferred first. P-384 sits above
-    /// P-256; both are exposed by <see cref="System.Security.Cryptography.ECDiffieHellman"/>.
+    /// The elliptic-curve groups Keryx supports for ECDHE, most preferred first. P-256 is the proven,
+    /// browser-interop-validated default; P-384 is still offered below it as a fallback for a peer that
+    /// requires it. Both are exposed by <see cref="System.Security.Cryptography.ECDiffieHellman"/>.
     /// </summary>
-    public static ushort[] Preference => [Secp384r1, Secp256r1];
+    public static ushort[] Preference => [Secp256r1, Secp384r1];
 
     public static bool IsSupported(ushort group) => group is Secp256r1 or Secp384r1;
 }
