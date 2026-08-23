@@ -23,8 +23,11 @@ public class DtlsHandshakeLoopbackTests
 
         fixture.Client.State.Should().Be(DtlsTransportState.Connected);
         fixture.Server.State.Should().Be(DtlsTransportState.Connected);
-        fixture.Client.NegotiatedCipherSuite.Should().Be("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256");
-        fixture.Server.NegotiatedCipherSuite.Should().Be("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256");
+
+        // Two default Keryx peers negotiate the strongest mutually supported suite and curve: with
+        // ECDSA certificates that is AES-256-GCM (SHA-384 PRF) over P-384.
+        fixture.Client.NegotiatedCipherSuite.Should().Be("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384");
+        fixture.Server.NegotiatedCipherSuite.Should().Be("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384");
         fixture.Client.UsedExtendedMasterSecret.Should().BeTrue("Keryx offers RFC 7627 EMS and both sides are Keryx");
         fixture.Server.UsedExtendedMasterSecret.Should().BeTrue();
     }

@@ -18,13 +18,19 @@ namespace Keryx.Dtls;
 /// <c>seq_num(8) || type(1) || version(2) || plaintext_length(2)</c>, where for DTLS
 /// <c>seq_num</c> is <c>epoch || sequence_number</c>.
 /// </para>
+/// <para>
+/// The same construction covers both AES-128-GCM and AES-256-GCM: the two suites differ only in the
+/// length of <c>key</c> (16 or 32 bytes), which <see cref="AesGcm"/> takes directly.
+/// </para>
 /// <para>The AES-GCM primitive itself is <see cref="AesGcm"/> from the BCL.</para>
 /// </remarks>
-internal sealed class AeadRecordCipher : IDisposable
+internal sealed class AeadRecordCipher : IRecordProtection
 {
     public const int SaltLength = 4;
     public const int ExplicitNonceLength = 8;
     public const int TagLength = 16;
+
+    /// <summary>The AES-128-GCM key length; AES-256-GCM uses a 32-byte key with the same framing.</summary>
     public const int KeyLength = 16;
     public const int Overhead = ExplicitNonceLength + TagLength;
     private const int AadLength = 13;
@@ -45,6 +51,9 @@ internal sealed class AeadRecordCipher : IDisposable
 
     /// <summary>Number of bytes <see cref="Encrypt"/> writes for a plaintext of <paramref name="plaintextLength"/>.</summary>
     public static int CiphertextLength(int plaintextLength) => plaintextLength + Overhead;
+
+    /// <inheritdoc />
+    public int ProtectedLength(int plaintextLength) => CiphertextLength(plaintextLength);
 
     /// <summary>
     /// Encrypts one record body. <paramref name="destination"/> receives

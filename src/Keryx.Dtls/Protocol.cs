@@ -40,23 +40,87 @@ internal static class ProtocolVersions
     public const ushort Dtls12 = 0xFEFD;
 }
 
+/// <summary>The AEAD primitive a cipher suite protects records with.</summary>
+internal enum AeadAlgorithm
+{
+    /// <summary>AES-GCM (RFC 5288 / RFC 5289): 4-byte fixed IV plus an 8-byte explicit nonce.</summary>
+    AesGcm,
+
+    /// <summary>ChaCha20-Poly1305 (RFC 7905): a 12-byte fixed IV XORed with the record sequence number.</summary>
+    ChaCha20Poly1305,
+}
+
+/// <summary>
+/// The parameters of one DTLS 1.2 AEAD cipher suite: its record protection primitive, key/IV sizes,
+/// per-record overhead, PRF hash, and which certificate key type authenticates it.
+/// </summary>
+internal readonly record struct CipherSuiteDescription(
+    ushort Id,
+    string Name,
+    bool RequiresEcdsaCertificate,
+    AeadAlgorithm Aead,
+    int KeyLength,
+    int FixedIvLength,
+    int RecordOverhead,
+    byte PrfHash);
+
 internal static class CipherSuites
 {
     public const ushort TlsEcdheEcdsaWithAes128GcmSha256 = 0xC02B;
     public const ushort TlsEcdheRsaWithAes128GcmSha256 = 0xC02F;
+    public const ushort TlsEcdheEcdsaWithAes256GcmSha384 = 0xC02C;
+    public const ushort TlsEcdheRsaWithAes256GcmSha384 = 0xC030;
+    public const ushort TlsEcdheEcdsaWithChaCha20Poly1305Sha256 = 0xCCA9;
+    public const ushort TlsEcdheRsaWithChaCha20Poly1305Sha256 = 0xCCA8;
 
     /// <summary>TLS_EMPTY_RENEGOTIATION_INFO_SCSV — a signalling suite, never selectable.</summary>
     public const ushort EmptyRenegotiationInfoScsv = 0x00FF;
 
-    public static bool IsSupported(ushort suite) =>
-        suite is TlsEcdheEcdsaWithAes128GcmSha256 or TlsEcdheRsaWithAes128GcmSha256;
+    // AES-GCM: 4-byte fixed IV + 8-byte explicit nonce + 16-byte tag => 24 bytes of record overhead.
+    // ChaCha20-Poly1305 (RFC 7905): a 12-byte fixed IV, no explicit nonce, 16-byte tag => 16 bytes.
+    private const int GcmOverhead = 8 + 16;
+    private const int ChaChaOverhead = 16;
 
-    public static string Name(ushort suite) => suite switch
+    /// <summary>
+    /// The suites Keryx offers as a client, and prefers as a server, most preferred first. AES-256-GCM
+    /// and ChaCha20-Poly1305 sit above AES-128-GCM; ECDSA suites are used with an ECDSA certificate and
+    /// the RSA suites with an RSA certificate.
+    /// </summary>
+    public static ushort[] PreferenceFor(bool ecdsaCertificate) => ecdsaCertificate
+        ?
+        [
+            TlsEcdheEcdsaWithAes256GcmSha384,
+            TlsEcdheEcdsaWithChaCha20Poly1305Sha256,
+            TlsEcdheEcdsaWithAes128GcmSha256,
+        ]
+        :
+        [
+            TlsEcdheRsaWithAes256GcmSha384,
+            TlsEcdheRsaWithChaCha20Poly1305Sha256,
+            TlsEcdheRsaWithAes128GcmSha256,
+        ];
+
+    public static bool IsSupported(ushort suite) => Describe(suite) is not null;
+
+    /// <summary>The parameters of <paramref name="suite"/>, or null when Keryx does not implement it.</summary>
+    public static CipherSuiteDescription? Describe(ushort suite) => suite switch
     {
-        TlsEcdheEcdsaWithAes128GcmSha256 => "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-        TlsEcdheRsaWithAes128GcmSha256 => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-        _ => $"0x{suite:X4}",
+        TlsEcdheEcdsaWithAes128GcmSha256 => new CipherSuiteDescription(
+            suite, "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", true, AeadAlgorithm.AesGcm, 16, 4, GcmOverhead, HashAlgorithms.Sha256),
+        TlsEcdheRsaWithAes128GcmSha256 => new CipherSuiteDescription(
+            suite, "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", false, AeadAlgorithm.AesGcm, 16, 4, GcmOverhead, HashAlgorithms.Sha256),
+        TlsEcdheEcdsaWithAes256GcmSha384 => new CipherSuiteDescription(
+            suite, "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", true, AeadAlgorithm.AesGcm, 32, 4, GcmOverhead, HashAlgorithms.Sha384),
+        TlsEcdheRsaWithAes256GcmSha384 => new CipherSuiteDescription(
+            suite, "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", false, AeadAlgorithm.AesGcm, 32, 4, GcmOverhead, HashAlgorithms.Sha384),
+        TlsEcdheEcdsaWithChaCha20Poly1305Sha256 => new CipherSuiteDescription(
+            suite, "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", true, AeadAlgorithm.ChaCha20Poly1305, 32, 12, ChaChaOverhead, HashAlgorithms.Sha256),
+        TlsEcdheRsaWithChaCha20Poly1305Sha256 => new CipherSuiteDescription(
+            suite, "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", false, AeadAlgorithm.ChaCha20Poly1305, 32, 12, ChaChaOverhead, HashAlgorithms.Sha256),
+        _ => null,
     };
+
+    public static string Name(ushort suite) => Describe(suite)?.Name ?? $"0x{suite:X4}";
 }
 
 internal static class ExtensionTypes
@@ -71,11 +135,25 @@ internal static class ExtensionTypes
 
 internal static class NamedGroups
 {
-    /// <summary>secp256r1 / NIST P-256 — the only group Keryx offers; the BCL has no X25519 agreement.</summary>
+    /// <summary>secp256r1 / NIST P-256 — the universally supported WebRTC curve.</summary>
     public const ushort Secp256r1 = 23;
 
+    /// <summary>secp384r1 / NIST P-384.</summary>
     public const ushort Secp384r1 = 24;
+
+    /// <summary>
+    /// x25519 (29) is deliberately NOT offered: the .NET 10 BCL exposes no X25519 key agreement in
+    /// <c>System.Security.Cryptography</c>, and Keryx never hand-rolls a curve.
+    /// </summary>
     public const ushort X25519 = 29;
+
+    /// <summary>
+    /// The elliptic-curve groups Keryx supports for ECDHE, most preferred first. P-384 sits above
+    /// P-256; both are exposed by <see cref="System.Security.Cryptography.ECDiffieHellman"/>.
+    /// </summary>
+    public static ushort[] Preference => [Secp384r1, Secp256r1];
+
+    public static bool IsSupported(ushort group) => group is Secp256r1 or Secp384r1;
 }
 
 internal static class EcCurveTypes

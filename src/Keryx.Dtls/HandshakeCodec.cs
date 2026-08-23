@@ -275,6 +275,7 @@ internal static class HandshakeCodec
         ReadOnlySpan<byte> random,
         ReadOnlySpan<byte> cookie,
         IReadOnlyList<ushort> cipherSuites,
+        IReadOnlyList<ushort> namedGroups,
         IReadOnlyList<SrtpProtectionProfile> srtpProfiles)
     {
         var buffer = new byte[BuildBufferSize];
@@ -297,7 +298,7 @@ internal static class HandshakeCodec
         var extensionsLengthOffset = writer.Reserve(2);
         var extensionsStart = writer.Position;
 
-        WriteSupportedGroups(ref writer);
+        WriteSupportedGroups(ref writer, namedGroups);
         WriteEcPointFormats(ref writer);
         WriteSignatureAlgorithms(ref writer);
         WriteExtension(ref writer, ExtensionTypes.ExtendedMasterSecret, []);
@@ -530,10 +531,19 @@ internal static class HandshakeCodec
         writer.WriteBytes(data);
     }
 
-    private static void WriteSupportedGroups(ref ByteWriter writer)
+    private static void WriteSupportedGroups(ref ByteWriter writer, IReadOnlyList<ushort> groups)
     {
-        // Only secp256r1: the BCL exposes no X25519 key agreement, and every browser supports P-256.
-        byte[] data = [0x00, 0x02, (byte)(NamedGroups.Secp256r1 >> 8), (byte)NamedGroups.Secp256r1];
+        // Most preferred first (by default secp384r1 then secp256r1). The BCL exposes no X25519 key
+        // agreement, so x25519 is not offered; every browser supports P-256 and P-384.
+        var data = new byte[2 + (groups.Count * 2)];
+        data[0] = 0x00;
+        data[1] = (byte)(groups.Count * 2);
+        for (var i = 0; i < groups.Count; i++)
+        {
+            data[2 + (i * 2)] = (byte)(groups[i] >> 8);
+            data[3 + (i * 2)] = (byte)groups[i];
+        }
+
         WriteExtension(ref writer, ExtensionTypes.SupportedGroups, data);
     }
 
