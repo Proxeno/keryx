@@ -569,7 +569,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
             Interlocked.Read(ref _nackCount),
             Interlocked.Read(ref _twccCount),
             Interlocked.Read(ref _receiverReportCount),
-            Interlocked.Read(ref _receiverNacksSent)),
+            Interlocked.Read(ref _receiverNacksSent),
+            Interlocked.Read(ref _receiverTransportCcFeedbacksSent)),
         Interlocked.Read(ref _rtpReceived),
         Interlocked.Read(ref _rtcpReceived),
         Interlocked.Read(ref _srtpFailures),
@@ -1014,9 +1015,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 // the extension is negotiated symmetrically across the BUNDLE.
                 foreach (var extMap in offered.GetExtMaps())
                 {
-                    if (extMap.IsTransportWideCc)
+                    if (extMap.IsTransportWideCc && extMap.Id is >= 1 and <= 14)
                     {
                         section.HeaderExtensions.Add(SdpExtMap.TransportWideCc(extMap.Id));
+
+                        // Record the negotiated id for the receive path regardless of media direction: a
+                        // receive-only answer still parses inbound transport-wide sequence numbers and
+                        // returns feedback, even though it never stamps (that is _sendTransportCcExtensionId).
+                        _negotiatedTransportCcExtensionId ??= (byte)extMap.Id;
                         break;
                     }
                 }
@@ -1456,6 +1462,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         _sendTransportCcExtensionId = transportCcExtensionId;
+        _negotiatedTransportCcExtensionId = transportCcExtensionId;
 
         Volatile.Write(ref _routes, routes);
         Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);

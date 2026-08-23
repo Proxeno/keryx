@@ -79,6 +79,16 @@ public sealed partial class PeerConnection
     private readonly List<ushort> _receiverNackScratch = [];
     private long _receiverNacksSent;
 
+    // Receive-side transport-wide-cc feedback: an arrival recorder that periodically drives the
+    // RtcpTransportCcFeedback builder. Built in CreateTrackSenders only when the extension was
+    // negotiated and PeerConnectionConfig.EnableReceiverTransportCcFeedback is set; published there
+    // (volatile) and thereafter touched only from the single ICE receive loop that drives HandleRtp, so
+    // it needs no further synchronisation. The parsing id it reads was written before the volatile
+    // publish, so the acquiring read of the generator makes it visible. Null disables the whole path.
+    private volatile TransportCcFeedbackGenerator? _receiverTransportCc;
+    private byte _receiverTransportCcExtensionId;
+    private long _receiverTransportCcFeedbacksSent;
+
     private Timer? _rtcpTimer;
     private int _firSequence;
 
@@ -86,6 +96,11 @@ public sealed partial class PeerConnection
     // its stamping identifier are only touched from the send path under _sendLock, so no atomics.
     private byte? _sendTransportCcExtensionId;
     private ushort _transportWideSequenceNumber;
+
+    // The negotiated transport-wide-cc extmap id, set whenever the extension is negotiated regardless of
+    // media direction — unlike _sendTransportCcExtensionId, which a receive-only answerer leaves null
+    // because it never stamps. This is the id the receive path reads to parse inbound sequence numbers.
+    private byte? _negotiatedTransportCcExtensionId;
 
     // The pacing queue that smooths outbound RTP toward the congestion controller's target, or null
     // when congestion control is disabled — in which case the send path stays immediate. Built in
@@ -827,6 +842,21 @@ public sealed partial class PeerConnection
                 SendProtectedRtpLocked,
                 _logger);
         }
+
+        // Once the transport-wide-cc extension is negotiated, a peer sending media into Keryx expects
+        // transport-cc feedback back to feed its send-side estimator. The receive path reads the
+        // direction-independent negotiated id (a receive-only answerer never stamps, so it has no send
+        // id). Publish the generator last (volatile) so the receive loop sees the parsing id set above it.
+        if (_negotiatedTransportCcExtensionId is { } extensionId && _config.EnableReceiverTransportCcFeedback)
+        {
+            _receiverTransportCcExtensionId = extensionId;
+            _receiverTransportCc = new TransportCcFeedbackGenerator(
+                TransportCcFeedbackGenerator.DefaultFeedbackInterval,
+                TransportCcFeedbackGenerator.DefaultMaxReportedPacketsPerFeedback);
+            _logger.Log(
+                KeryxLogLevel.Info,
+                $"Receiver transport-cc feedback enabled on extmap {extensionId}.");
+        }
     }
 
     private static SrtpProfile MapSrtpProfile(DtlsSrtpProfile profile) => profile switch
@@ -906,6 +936,11 @@ public sealed partial class PeerConnection
         }
 
         Interlocked.Increment(ref _rtpReceived);
+
+        // Record the transport-wide sequence number off the raw wire packet — before the RFC 4588 RTX
+        // branch, since the sender stamps the extension on media and repair packets alike and the
+        // transport-wide sequence space spans both — then emit feedback when the cadence is due.
+        RecordTransportCcArrival(in packet);
 
         var routes = Volatile.Read(ref _routes);
         var route = routes.TryGetValue(packet.Header.PayloadType, out var found)
@@ -1642,8 +1677,43 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>The current send clock in microseconds, monotonic, for the send-time history.</summary>
-    private long SendTimestampMicroseconds() =>
+    private long SendTimestampMicroseconds() => MonotonicMicroseconds();
+
+    /// <summary>A monotonic microsecond clock, shared by the send-time history and the receive-time
+    /// recording transport-cc feedback reports arrivals against.</summary>
+    private long MonotonicMicroseconds() =>
         (long)(_time.GetTimestamp() * (1_000_000.0 / _time.TimestampFrequency));
+
+    /// <summary>
+    /// Records one inbound packet's transport-wide sequence number and arrival time against the receiver
+    /// transport-cc generator, then flushes a feedback packet back to the sender when the draft's cadence
+    /// is due. No-op unless the extension was negotiated and receiver feedback is enabled. Runs on the
+    /// single ICE receive loop, so the generator needs no locking; the flush itself sends under the send
+    /// lock through <see cref="SendRtcpCompound"/>.
+    /// </summary>
+    private void RecordTransportCcArrival(in RtpPacket packet)
+    {
+        var generator = _receiverTransportCc;
+        if (generator is null
+            || !TransportCcExtension.TryRead(packet.Header, _receiverTransportCcExtensionId, out var transportSequenceNumber))
+        {
+            return;
+        }
+
+        var now = MonotonicMicroseconds();
+        generator.OnPacketReceived(transportSequenceNumber, now);
+
+        // The feedback's media source SSRC names the stream whose arrivals it is reporting on. TWCC is
+        // transport-wide, so the most recently observed inbound SSRC is a valid choice and matches what
+        // browsers put on the field.
+        if (generator.ShouldBuildFeedback(now)
+            && generator.TryBuildFeedback(_rtcpSenderSsrc, packet.Header.Ssrc, out var feedback)
+            && feedback is not null
+            && SendRtcpCompound([feedback]))
+        {
+            Interlocked.Increment(ref _receiverTransportCcFeedbacksSent);
+        }
+    }
 
     /// <summary>
     /// Records that an outbound RTP packet carrying <paramref name="transportSequenceNumber"/> left the
