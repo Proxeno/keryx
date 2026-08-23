@@ -735,7 +735,8 @@ public sealed partial class PeerConnection
                     request.Label,
                     request.Ordered,
                     request.MaxRetransmits,
-                    request.Protocol));
+                    request.Protocol,
+                    request.MaxPacketLifetime));
             }
             catch (Exception ex)
             {

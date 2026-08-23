@@ -90,6 +90,15 @@ public sealed class DcepOpenMessage
             ? (ushort)Math.Min(ReliabilityParameter, ushort.MaxValue)
             : null;
 
+    /// <summary>
+    /// The maximum message lifetime in milliseconds when the channel type is a lifetime-limited
+    /// profile, otherwise null.
+    /// </summary>
+    public ushort? MaxPacketLifetime =>
+        ((byte)ChannelType & 0x7F) == (byte)DcepChannelType.PartialReliableTimed
+            ? (ushort)Math.Min(ReliabilityParameter, ushort.MaxValue)
+            : null;
+
     /// <summary>Encodes the message.</summary>
     /// <returns>The wire representation, to be sent with PPID 50.</returns>
     public byte[] Encode()
@@ -136,15 +145,29 @@ public sealed class DcepOpenMessage
     /// <returns>A fresh one-byte array.</returns>
     public static byte[] EncodeAck() => new[] { (byte)DcepMessageType.DataChannelAck };
 
-    /// <summary>Maps ordering and retransmission settings onto a DCEP channel type.</summary>
+    /// <summary>Maps ordering and reliability settings onto a DCEP channel type.</summary>
     /// <param name="ordered">Whether the channel preserves message order.</param>
     /// <param name="maxRetransmits">Retransmission limit, or null for full reliability.</param>
+    /// <param name="maxPacketLifetime">
+    /// Message lifetime in milliseconds, or null. Mutually exclusive with
+    /// <paramref name="maxRetransmits"/> — RFC 8832's channel type is a single value that cannot
+    /// select both a retransmit limit and a lifetime limit at once.
+    /// </param>
     /// <returns>The channel type to advertise.</returns>
-    public static DcepChannelType ChannelTypeFor(bool ordered, ushort? maxRetransmits)
+    /// <exception cref="ArgumentException">Both <paramref name="maxRetransmits"/> and <paramref name="maxPacketLifetime"/> are set.</exception>
+    public static DcepChannelType ChannelTypeFor(bool ordered, ushort? maxRetransmits, ushort? maxPacketLifetime = null)
     {
+        if (maxRetransmits.HasValue && maxPacketLifetime.HasValue)
+        {
+            throw new ArgumentException(
+                "maxRetransmits and maxPacketLifetime are mutually exclusive; RFC 8832 channel types cannot select both.");
+        }
+
         var baseType = maxRetransmits.HasValue
             ? DcepChannelType.PartialReliableRexmit
-            : DcepChannelType.Reliable;
+            : maxPacketLifetime.HasValue
+                ? DcepChannelType.PartialReliableTimed
+                : DcepChannelType.Reliable;
         return ordered ? baseType : (DcepChannelType)((byte)baseType | 0x80);
     }
 }

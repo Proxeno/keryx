@@ -61,6 +61,31 @@ public class DcepTests
     }
 
     [Fact]
+    public void OpenMessageWithPacketLifetimeRoundTrips()
+    {
+        // RFC 8832 §5.1 layout, channel type 0x82 (PARTIAL_RELIABLE_TIMED_UNORDERED), reliability
+        // parameter = maxPacketLifetime in milliseconds.
+        var expected = new byte[]
+        {
+            0x03, 0x82,
+            0x00, 0x00,
+            0x00, 0x00, 0x01, 0xF4,
+            0x00, 0x09,
+            0x00, 0x00,
+            (byte)'t', (byte)'e', (byte)'l', (byte)'e', (byte)'m', (byte)'e', (byte)'t', (byte)'r', (byte)'y',
+        };
+
+        var message = new DcepOpenMessage(DcepChannelType.PartialReliableTimedUnordered, "telemetry", reliabilityParameter: 500);
+        message.Encode().Should().Equal(expected);
+
+        var parsed = DcepOpenMessage.Parse(expected);
+        parsed.ChannelType.Should().Be(DcepChannelType.PartialReliableTimedUnordered);
+        parsed.Unordered.Should().BeTrue();
+        parsed.MaxRetransmits.Should().BeNull();
+        parsed.MaxPacketLifetime.Should().Be(500);
+    }
+
+    [Fact]
     public void OpenMessageRoundTripsWithUnicodeLabel()
     {
         var message = new DcepOpenMessage(DcepChannelType.Reliable, "kanál-π", "sub");
@@ -69,6 +94,7 @@ public class DcepTests
         parsed.Protocol.Should().Be("sub");
         parsed.Unordered.Should().BeFalse();
         parsed.MaxRetransmits.Should().BeNull();
+        parsed.MaxPacketLifetime.Should().BeNull();
     }
 
     [Fact]
@@ -80,13 +106,22 @@ public class DcepTests
     }
 
     [Theory]
-    [InlineData(true, null, DcepChannelType.Reliable)]
-    [InlineData(false, null, DcepChannelType.ReliableUnordered)]
-    [InlineData(true, (ushort)0, DcepChannelType.PartialReliableRexmit)]
-    [InlineData(false, (ushort)0, DcepChannelType.PartialReliableRexmitUnordered)]
-    public void ChannelTypeMapping(bool ordered, ushort? maxRetransmits, DcepChannelType expected)
+    [InlineData(true, null, null, DcepChannelType.Reliable)]
+    [InlineData(false, null, null, DcepChannelType.ReliableUnordered)]
+    [InlineData(true, (ushort)0, null, DcepChannelType.PartialReliableRexmit)]
+    [InlineData(false, (ushort)0, null, DcepChannelType.PartialReliableRexmitUnordered)]
+    [InlineData(true, null, (ushort)3000, DcepChannelType.PartialReliableTimed)]
+    [InlineData(false, null, (ushort)3000, DcepChannelType.PartialReliableTimedUnordered)]
+    public void ChannelTypeMapping(bool ordered, ushort? maxRetransmits, ushort? maxPacketLifetime, DcepChannelType expected)
     {
-        DcepOpenMessage.ChannelTypeFor(ordered, maxRetransmits).Should().Be(expected);
+        DcepOpenMessage.ChannelTypeFor(ordered, maxRetransmits, maxPacketLifetime).Should().Be(expected);
+    }
+
+    [Fact]
+    public void ChannelTypeForRejectsBothReliabilityLimitsAtOnce()
+    {
+        var act = () => DcepOpenMessage.ChannelTypeFor(true, maxRetransmits: 0, maxPacketLifetime: 500);
+        act.Should().Throw<ArgumentException>();
     }
 
     [Fact]

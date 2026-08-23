@@ -275,6 +275,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// transmit-once-and-forget behaviour a controller channel wants.
     /// </param>
     /// <param name="protocol">Optional sub-protocol name.</param>
+    /// <param name="maxPacketLifetime">
+    /// Message lifetime in milliseconds, or null for full reliability. A message still
+    /// unacknowledged after this many milliseconds is abandoned (RFC 3758 timed PR-SCTP). Mutually
+    /// exclusive with <paramref name="maxRetransmits"/>.
+    /// </param>
     /// <returns>
     /// A task completing with the channel. It completes synchronously once SCTP is up; before that it
     /// completes when the association is created, which is the earliest point at which a stream
@@ -282,14 +287,22 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// not known until the remote description arrives.
     /// </returns>
     /// <exception cref="ObjectDisposedException">The connection is closed.</exception>
+    /// <exception cref="ArgumentException">Both <paramref name="maxRetransmits"/> and <paramref name="maxPacketLifetime"/> are set.</exception>
     public Task<DataChannel> CreateDataChannel(
         string label,
         bool ordered = true,
         ushort? maxRetransmits = null,
-        string protocol = "")
+        string protocol = "",
+        ushort? maxPacketLifetime = null)
     {
         ArgumentNullException.ThrowIfNull(label);
         ArgumentNullException.ThrowIfNull(protocol);
+        if (maxRetransmits.HasValue && maxPacketLifetime.HasValue)
+        {
+            throw new ArgumentException(
+                "maxRetransmits and maxPacketLifetime are mutually exclusive; RFC 8832 channel types cannot select both.",
+                nameof(maxPacketLifetime));
+        }
 
         SctpAssociation? association;
         lock (_lock)
@@ -303,13 +316,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     ordered,
                     maxRetransmits,
                     protocol,
+                    maxPacketLifetime,
                     new TaskCompletionSource<DataChannel>(TaskCreationOptions.RunContinuationsAsynchronously));
                 _pendingChannels.Add(pending);
                 return pending.Completion.Task;
             }
         }
 
-        return Task.FromResult(association.CreateChannel(label, ordered, maxRetransmits, protocol));
+        return Task.FromResult(association.CreateChannel(label, ordered, maxRetransmits, protocol, maxPacketLifetime));
     }
 
     /// <summary>
@@ -1490,6 +1504,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         bool Ordered,
         ushort? MaxRetransmits,
         string Protocol,
+        ushort? MaxPacketLifetime,
         TaskCompletionSource<DataChannel> Completion);
 
     /// <summary>
