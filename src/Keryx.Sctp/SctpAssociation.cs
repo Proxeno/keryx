@@ -29,6 +29,18 @@ public sealed class SctpAssociation : IDisposable
     private const int CookieLength = 64;
     private const int CookieMacOffset = 32;
 
+    // Out-of-order DATA that cannot be reassembled yet is held in _received/_fragments.
+    // The advertised a_rwnd (see LocalReceiveWindow) only asks a well-behaved peer to
+    // stop; a hostile peer can ignore it and flood us with a never-filling gap or an
+    // endless run of B-fragments whose E-fragment never arrives. To avoid an OOM we
+    // enforce a hard ceiling on that buffering here, independent of the advertised hint.
+
+    // A peer sending many tiny (or empty) DATA chunks costs little payload per chunk but
+    // a full map entry in both _received and _fragments; assume at least this many bytes
+    // per buffered chunk to derive a companion cap on the entry count, so the byte cap
+    // cannot be side-stepped with a flood of near-empty chunks.
+    private const int MinChunkBufferCharge = 256;
+
     private readonly object _lock = new();
     private readonly IDatagramTransport _lower;
     private readonly SctpAssociationConfig _config;
@@ -188,6 +200,30 @@ public sealed class SctpAssociation : IDisposable
                 LocalReceiveWindow(),
                 _rto,
                 _smoothedRtt);
+        }
+    }
+
+    /// <summary>Bytes currently pinned in the out-of-order receive buffer. Test observability only.</summary>
+    internal long ReceiveBufferBytes
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _receiveBufferBytes;
+            }
+        }
+    }
+
+    /// <summary>Number of out-of-order DATA chunks currently buffered. Test observability only.</summary>
+    internal int BufferedChunkCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return Math.Max(_fragments.Count, _received.Count);
+            }
         }
     }
 
@@ -717,11 +753,82 @@ public sealed class SctpAssociation : IDisposable
             return;
         }
 
+        // A chunk that fills the immediate gap (TSN == cumulative + 1) always makes forward
+        // progress: it advances the cumulative TSN and lets buffered fragments drain, so it
+        // is never subject to the hard cap even when the buffer is momentarily full. Every
+        // other out-of-order chunk only extends a gap; if buffering it would breach the hard
+        // cap we drop it (do not buffer, do not ack). A compliant peer honours the zero a_rwnd
+        // we advertise long before this and will retransmit once the window reopens; a hostile
+        // peer flooding a never-filling gap is bounded to the cap instead of exhausting memory.
+        var advancesCumulative = data.Tsn == unchecked(_cumulativeTsnReceived + 1);
+        if (!advancesCumulative && WouldExceedReceiveBuffer(data.Payload.Length))
+        {
+            _log.Log(
+                KeryxLogLevel.Warning,
+                $"Dropping out-of-order DATA (TSN {data.Tsn}): receive buffer at hard cap " +
+                $"({_receiveBufferBytes} bytes / {_fragments.Count} chunks, cap {ReceiveBufferHardCap}).");
+            return;
+        }
+
         _received.Add(data.Tsn);
         _fragments[data.Tsn] = data;
         _receiveBufferBytes += data.Payload.Length;
         AdvanceCumulativeReceive();
         TryReassemble(data.Tsn);
+
+        // Even in-order chunks can pin memory without bound when a message never terminates
+        // (a run of B/continuation fragments whose E-fragment never arrives): the cumulative
+        // TSN advances but _fragments never drains. If the buffer stays above the hard cap
+        // after attempting reassembly there is no legitimate way to recover it, so abort with
+        // an Out-of-Resource cause rather than let a hostile peer OOM the host.
+        if (_receiveBufferBytes > (long)ReceiveBufferHardCap || _fragments.Count > MaxBufferedChunks)
+        {
+            _log.Log(
+                KeryxLogLevel.Warning,
+                $"Aborting association: out-of-order receive buffer exceeded hard cap " +
+                $"({_receiveBufferBytes} bytes / {_fragments.Count} chunks, cap {ReceiveBufferHardCap}).");
+            AbortInternal(SctpErrorCauseCode.OutOfResource, "receive buffer exhausted");
+        }
+    }
+
+    /// <summary>
+    /// The hard ceiling on out-of-order receive buffering. <see cref="LocalReceiveWindow"/>
+    /// advertises a shrinking a_rwnd as a hint, but a hostile peer can ignore it, so this
+    /// caps the memory a peer can pin. We take the larger of the configured receive window
+    /// and the maximum message size so a single legitimately fragmented message can still be
+    /// reassembled even when the window is configured smaller than one message.
+    /// </summary>
+    internal ulong ReceiveBufferHardCap =>
+        Math.Max(_config.ReceiveWindow, _config.MaxMessageSize);
+
+    /// <summary>
+    /// Companion cap on the number of buffered out-of-order chunks, derived from the byte cap
+    /// assuming a minimum charge per chunk. Bounds _received/_fragments against a flood of
+    /// tiny or empty DATA chunks that barely move the byte total but each cost a map entry.
+    /// </summary>
+    internal int MaxBufferedChunks =>
+        (int)Math.Min((ulong)int.MaxValue, ReceiveBufferHardCap / (ulong)MinChunkBufferCharge);
+
+    /// <summary>
+    /// Returns <c>true</c> when buffering another out-of-order chunk of
+    /// <paramref name="incomingLength"/> bytes would breach the hard cap on either buffered
+    /// bytes or buffered chunk count.
+    /// </summary>
+    private bool WouldExceedReceiveBuffer(int incomingLength) =>
+        (ulong)(_receiveBufferBytes + incomingLength) > ReceiveBufferHardCap
+        || _received.Count >= MaxBufferedChunks
+        || _fragments.Count >= MaxBufferedChunks;
+
+    /// <summary>Sends an ABORT with the given cause and tears the association down locally.</summary>
+    private void AbortInternal(SctpErrorCauseCode cause, string detail)
+    {
+        if (_state == SctpAssociationState.Closed)
+        {
+            return;
+        }
+
+        SendImmediate(_peerTag, MakeAbort(cause, detail));
+        CloseInternal(new InvalidOperationException($"Association aborted: {detail}."));
     }
 
     private void AdvanceCumulativeReceive()
@@ -1834,6 +1941,13 @@ public sealed class SctpAssociation : IDisposable
         _pendingCookieEcho = null;
         _controlQueue.Clear();
         _out.Clear();
+
+        // Release any out-of-order receive buffering so a teardown (including an abort
+        // triggered by that buffer overflowing) does not leave the memory pinned.
+        _fragments.Clear();
+        _received.Clear();
+        _duplicateTsns.Clear();
+        _receiveBufferBytes = 0;
 
         var channels = _channels.Values.ToArray();
         _channels.Clear();
