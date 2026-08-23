@@ -48,7 +48,11 @@ public sealed partial class PeerConnection
     // false until the corresponding send track is negotiated.
     private RtpForwarderHandle _videoForwarder = null!;
     private RtpForwarderHandle _audioForwarder = null!;
-    private Dictionary<byte, RtpRoute> _routes = [];
+
+    // The inbound RTP demux table, resolving each received packet to its m-section route mid-first
+    // (MID header extension, then remote-SDP SSRC, then payload type). Volatile-published from the
+    // negotiation path; only read from the single ICE receive loop that drives HandleRtp.
+    private RouteTable _routeTable = RouteTable.Empty;
 
     // Maps a remote RFC 4588 repair SSRC to the media SSRC it repairs, learned from the peer's
     // a=ssrc-group:FID lines (RFC 5576 §4.2). An inbound RTX packet is decapsulated onto this media
@@ -333,6 +337,13 @@ public sealed partial class PeerConnection
         MediaKind.Audio => (uint?)_remoteAudioSsrc,
         _ => null,
     };
+
+    /// <summary>
+    /// The current inbound demux table, published from the last applied remote description. Exposed to
+    /// the test assembly only (via <c>InternalsVisibleTo</c>) so the mid-first resolution can be
+    /// exercised directly; not part of the public API.
+    /// </summary>
+    internal RouteTable InboundRoutes => Volatile.Read(ref _routeTable);
 
     /// <summary>
     /// The mids of the inbound video m-sections negotiated as simulcast (RFC 8853), for which per-layer
@@ -942,10 +953,11 @@ public sealed partial class PeerConnection
         // transport-wide sequence space spans both — then emit feedback when the cadence is due.
         RecordTransportCcArrival(in packet);
 
-        var routes = Volatile.Read(ref _routes);
-        var route = routes.TryGetValue(packet.Header.PayloadType, out var found)
-            ? found
-            : new RtpRoute(string.Empty, MediaKind.Unknown);
+        // Demux mid-first (RFC 8843 §9.2): the MID header extension names the m-section when the peer
+        // stamped one, else the SSRC learned from the remote SDP, else the payload type — the last of
+        // which is unambiguous while there is one m-section per kind, matching the prior behaviour.
+        var routes = Volatile.Read(ref _routeTable);
+        var route = routes.Resolve(packet.Header, packet.Header.PayloadType);
 
         // RFC 4588 §4: an inbound RTX packet repeats an original media packet on its own SSRC, payload
         // type and sequence space. Turn it back into the packet it repairs and feed *that* through the
@@ -972,7 +984,7 @@ public sealed partial class PeerConnection
         RtpRoute route,
         in RtpPacket rtxPacket,
         ReadOnlySpan<byte> rtxDatagram,
-        Dictionary<byte, RtpRoute> routes)
+        RouteTable routes)
     {
         var rtxToMedia = Volatile.Read(ref _rtxSsrcToMediaSsrc);
         if (!rtxToMedia.TryGetValue(rtxPacket.Header.Ssrc, out var mediaSsrc))
@@ -1007,11 +1019,16 @@ public sealed partial class PeerConnection
             return;
         }
 
-        // Route the reconstructed packet by its recovered (media) payload type so it lands on the media
-        // stream's kind, mid and clock rate rather than the repair route it arrived on.
-        var mediaRoute = routes.TryGetValue(recovered.Header.PayloadType, out var mediaFound)
-            ? mediaFound
-            : route with { IsRtx = false };
+        // Route the reconstructed packet onto its media stream's kind, mid and clock rate rather than the
+        // repair route it arrived on. Resolve by the recovered (media) SSRC — recovered above from the
+        // FID association — then payload type; the decrypted repair datagram no longer aliases a media
+        // header extension, so the MID extension is unavailable here. An unresolved recovery falls back
+        // to the repair route with its rtx flag cleared, exactly as the prior payload-type lookup did.
+        var mediaRoute = routes.Resolve(mediaSsrc, recovered.Header.PayloadType);
+        if (mediaRoute.Kind == MediaKind.Unknown)
+        {
+            mediaRoute = route with { IsRtx = false };
+        }
 
         DeliverInboundMedia(mediaRoute, recovered, routes);
     }
@@ -1022,7 +1039,7 @@ public sealed partial class PeerConnection
     /// handler is attached — dispatches it in arrival order or through the per-source jitter buffer. Both
     /// directly received packets and packets reconstructed from an RTX repair flow through here.
     /// </summary>
-    private void DeliverInboundMedia(RtpRoute route, in RtpPacket packet, Dictionary<byte, RtpRoute> routes)
+    private void DeliverInboundMedia(RtpRoute route, in RtpPacket packet, RouteTable routes)
     {
         var payloadType = packet.Header.PayloadType;
 
@@ -1119,14 +1136,14 @@ public sealed partial class PeerConnection
     private void DrainReceiveStream(
         uint ssrc,
         ReceiveStream stream,
-        Dictionary<byte, RtpRoute> routes,
+        RouteTable routes,
         RtpPacketReceivedHandler handler)
     {
         while (stream.Buffer.TryGetNext(out var released))
         {
-            var route = routes.TryGetValue(released.PayloadType, out var found)
-                ? found
-                : new RtpRoute(string.Empty, MediaKind.Unknown);
+            // The released packet's header extension is not retained by the jitter buffer, so resolve by
+            // the stream's SSRC then payload type — the mid a directly received packet would have carried.
+            var route = routes.Resolve(ssrc, released.PayloadType);
 
             var info = new RtpPacketInfo(
                 route.Kind == MediaKind.Unknown ? null : route.Mid,
@@ -1149,6 +1166,121 @@ public sealed partial class PeerConnection
         internal JitterBuffer Buffer { get; } = buffer;
 
         internal string? Rid { get; set; }
+    }
+
+    /// <summary>
+    /// The inbound RTP demux table. It resolves a received packet to its m-section route by the BUNDLE
+    /// precedence WebRTC uses (RFC 8843 §9.2): the MID header extension first, then the SSRC learned
+    /// from the remote SDP (<c>a=ssrc</c> / <c>a=ssrc-group</c>), then the payload type. Payload type is
+    /// the only key a peer that signals neither a MID extension nor <c>a=ssrc</c> lines offers, and it
+    /// is unambiguous while there is one m-section per kind — so for today's single-video/single-audio
+    /// sessions all three keys resolve to the same route and nothing observable changes.
+    /// </summary>
+    internal sealed class RouteTable
+    {
+        private readonly Dictionary<byte, RtpRoute> _byPayloadType;
+        private readonly Dictionary<string, Dictionary<byte, RtpRoute>> _byMid;
+        private readonly Dictionary<uint, string> _ssrcToMid;
+        private readonly byte _midExtensionId;
+
+        internal RouteTable(
+            Dictionary<byte, RtpRoute> byPayloadType,
+            Dictionary<string, Dictionary<byte, RtpRoute>> byMid,
+            Dictionary<uint, string> ssrcToMid,
+            byte midExtensionId)
+        {
+            _byPayloadType = byPayloadType;
+            _byMid = byMid;
+            _ssrcToMid = ssrcToMid;
+            _midExtensionId = midExtensionId;
+        }
+
+        /// <summary>An empty table: every lookup misses and yields the unknown route.</summary>
+        internal static RouteTable Empty { get; } = new([], [], [], 0);
+
+        /// <summary>
+        /// Resolves a freshly received packet mid-first: the MID header extension when the peer stamped
+        /// one naming a section we know, else the SSRC-to-mid map learned from the remote SDP, else the
+        /// payload type. <paramref name="header"/> aliases the decrypted datagram and carries the MID
+        /// extension body.
+        /// </summary>
+        internal RtpRoute Resolve(in RtpHeader header, byte payloadType)
+        {
+            if (_midExtensionId is >= 1 and <= 14
+                && RtpStreamIdentifier.TryGetMid(header, _midExtensionId, out var midBytes)
+                && TryMatchKnownMid(midBytes, out var mid)
+                && TryResolveInMid(mid, payloadType, out var midRoute))
+            {
+                return midRoute;
+            }
+
+            return ResolveBySsrc(header.Ssrc, payloadType);
+        }
+
+        /// <summary>
+        /// Resolves a packet whose header extension is unavailable — an RTX-reconstructed media packet
+        /// or one drained from the jitter buffer — by its already-known SSRC then payload type.
+        /// </summary>
+        internal RtpRoute Resolve(uint ssrc, byte payloadType) => ResolveBySsrc(ssrc, payloadType);
+
+        private RtpRoute ResolveBySsrc(uint ssrc, byte payloadType)
+        {
+            if (_ssrcToMid.TryGetValue(ssrc, out var mid)
+                && TryResolveInMid(mid, payloadType, out var route))
+            {
+                return route;
+            }
+
+            return _byPayloadType.TryGetValue(payloadType, out var fallback)
+                ? fallback
+                : new RtpRoute(string.Empty, MediaKind.Unknown);
+        }
+
+        private bool TryResolveInMid(string mid, byte payloadType, out RtpRoute route)
+        {
+            if (_byMid.TryGetValue(mid, out var routes) && routes.TryGetValue(payloadType, out route))
+            {
+                return true;
+            }
+
+            route = default;
+            return false;
+        }
+
+        // Match the MID extension body against a known mid without allocating a string on the hot path;
+        // there are only a handful of mids, each a short ASCII token.
+        private bool TryMatchKnownMid(ReadOnlySpan<byte> midBytes, out string mid)
+        {
+            foreach (var known in _byMid.Keys)
+            {
+                if (MidEquals(known, midBytes))
+                {
+                    mid = known;
+                    return true;
+                }
+            }
+
+            mid = string.Empty;
+            return false;
+        }
+
+        private static bool MidEquals(string mid, ReadOnlySpan<byte> bytes)
+        {
+            if (mid.Length != bytes.Length)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < mid.Length; i++)
+            {
+                if (mid[i] != (char)bytes[i])
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
     }
 
     /// <summary>
