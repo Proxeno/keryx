@@ -40,6 +40,12 @@ public sealed partial class PeerConnection
     private Dictionary<byte, RtpRoute> _routes = [];
     private Dictionary<string, SimulcastReceiveTracker> _simulcastByMid = new(StringComparer.Ordinal);
 
+    // The most recently demultiplexed remote SSRC per media kind, boxed so a reference write/read is
+    // enough to publish it without locking. Only written from the single ICE receive loop that drives
+    // HandleRtp; read from any thread through GetRemoteSsrc. Null until a packet of that kind arrives.
+    private volatile object? _remoteVideoSsrc;
+    private volatile object? _remoteAudioSsrc;
+
     // Per-SSRC receive jitter buffers, built lazily as sources appear. Only touched from the single
     // ICE receive loop that drives HandleRtp, so it needs no synchronisation; it stays empty unless
     // PeerConnectionConfig.EnableReceiveJitterBuffer is set.
@@ -145,6 +151,54 @@ public sealed partial class PeerConnection
     /// </summary>
     /// <remarks>Meaningful once a remote answer has been applied.</remarks>
     public byte? NegotiatedVideoRtxPayloadType => _negotiatedVideo?.RtxPayloadType;
+
+    /// <summary>
+    /// The payload type the answer settled on for <paramref name="kind"/>, or <see langword="null"/>
+    /// before negotiation has settled — no answer applied yet, or the answer kept no usable codec for
+    /// that kind's m-section.
+    /// </summary>
+    /// <param name="kind">The media kind to look up; only <see cref="MediaKind.Video"/> and
+    /// <see cref="MediaKind.Audio"/> can resolve.</param>
+    /// <returns>The negotiated payload type, or null.</returns>
+    /// <remarks>
+    /// Never throws. A transient null is a soft "not yet" signal, safe to poll in a loop and cache on
+    /// the first non-null value — this is deliberate so a consumer never has to guard the call with a
+    /// state check first.
+    /// </remarks>
+    public byte? GetNegotiatedPayloadType(MediaKind kind) => kind switch
+    {
+        MediaKind.Video => _negotiatedVideo?.PayloadType,
+        MediaKind.Audio => _negotiatedAudio?.PayloadType,
+        _ => null,
+    };
+
+    /// <summary>
+    /// The synchronisation source Keryx sends <paramref name="kind"/> on. Assigned at construction
+    /// (see <see cref="VideoSsrc"/>, <see cref="AudioSsrc"/>) and stable for the connection's lifetime,
+    /// independent of negotiation state.
+    /// </summary>
+    /// <param name="kind">The media kind to look up.</param>
+    /// <returns>The local sending SSRC for <paramref name="kind"/>; zero for any other kind.</returns>
+    public uint GetLocalSsrc(MediaKind kind) => kind switch
+    {
+        MediaKind.Video => _videoSsrc,
+        MediaKind.Audio => _audioSsrc,
+        _ => 0,
+    };
+
+    /// <summary>
+    /// The remote sender's synchronisation source for <paramref name="kind"/>, learned from the most
+    /// recently demultiplexed inbound RTP packet of that kind (the same resolution
+    /// <see cref="OnRtpPacketReceived"/> reports). Null until one has arrived.
+    /// </summary>
+    /// <param name="kind">The media kind to look up.</param>
+    /// <returns>The last observed remote SSRC for <paramref name="kind"/>, or null.</returns>
+    public uint? GetRemoteSsrc(MediaKind kind) => kind switch
+    {
+        MediaKind.Video => (uint?)_remoteVideoSsrc,
+        MediaKind.Audio => (uint?)_remoteAudioSsrc,
+        _ => null,
+    };
 
     /// <summary>
     /// The mids of the inbound video m-sections negotiated as simulcast (RFC 8853), for which per-layer
@@ -731,6 +785,19 @@ public sealed partial class PeerConnection
         var payloadType = packet.Header.PayloadType;
         var routes = Volatile.Read(ref _routes);
         var route = routes.TryGetValue(payloadType, out var found) ? found : new RtpRoute(string.Empty, MediaKind.Unknown);
+
+        // Track the sender's SSRC per kind for GetRemoteSsrc, straight off the same demux resolution
+        // OnRtpPacketReceived is about to see. This is a plain last-writer-wins snapshot, not a full
+        // source table: an RTX repair stream routes to the same kind as its media stream, so it can
+        // also move this value, matching the demux's existing kind resolution.
+        if (route.Kind == MediaKind.Video)
+        {
+            _remoteVideoSsrc = packet.Header.Ssrc;
+        }
+        else if (route.Kind == MediaKind.Audio)
+        {
+            _remoteAudioSsrc = packet.Header.Ssrc;
+        }
 
         var handler = OnRtpPacketReceived;
 
