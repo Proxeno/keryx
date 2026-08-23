@@ -1212,7 +1212,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
                             && apt is >= 0 and <= 127
                             && routes.ContainsKey((byte)apt))
                         {
-                            routes[(byte)payloadType] = new RtpRoute(media.Mid ?? string.Empty, kind);
+                            routes[(byte)payloadType] = new RtpRoute(
+                                media.Mid ?? string.Empty, kind, (uint)rtpMap.ClockRate, IsRtx: true);
                         }
 
                         continue;
@@ -1224,7 +1225,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         continue;
                     }
 
-                    routes[(byte)payloadType] = new RtpRoute(media.Mid ?? string.Empty, kind);
+                    routes[(byte)payloadType] = new RtpRoute(media.Mid ?? string.Empty, kind, (uint)rtpMap.ClockRate);
                 }
             }
 
@@ -1374,7 +1375,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     continue;
                 }
 
-                routes[(byte)codec.PayloadType] = new RtpRoute(media.Mid ?? string.Empty, kind);
+                routes[(byte)codec.PayloadType] = new RtpRoute(media.Mid ?? string.Empty, kind, (uint)codec.ClockRate);
             }
 
             var chosen = media.Codecs.FirstOrDefault(c =>
@@ -1398,7 +1399,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     if (rtx is not null && rtx.PayloadType is >= 0 and <= 127)
                     {
                         rtxPayloadType = (byte)rtx.PayloadType;
-                        routes[(byte)rtx.PayloadType] = new RtpRoute(media.Mid ?? string.Empty, kind);
+                        routes[(byte)rtx.PayloadType] = new RtpRoute(
+                            media.Mid ?? string.Empty, kind, (uint)rtx.ClockRate, IsRtx: true);
                     }
                     else
                     {
@@ -1458,7 +1460,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
         string Protocol,
         TaskCompletionSource<DataChannel> Completion);
 
-    private readonly record struct RtpRoute(string Mid, MediaKind Kind);
+    /// <summary>
+    /// The inbound demux entry for one payload type: the m-section it belongs to, its media kind, the
+    /// RTP clock rate its timestamps run at (for the RFC 3550 jitter estimate), and whether it is an RFC
+    /// 4588 repair stream (which is reported on through the media stream it repairs, not on its own).
+    /// </summary>
+    private readonly record struct RtpRoute(string Mid, MediaKind Kind, uint ClockRate = 0, bool IsRtx = false);
 
     /// <summary>
     /// What the answer settled on for one media kind. <paramref name="RtxPayloadType"/> is null when

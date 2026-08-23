@@ -56,6 +56,13 @@ public sealed partial class PeerConnection
     // ICE receive loop that drives HandleRtp, so it needs no synchronisation; it stays empty unless
     // PeerConnectionConfig.EnableReceiveJitterBuffer is set.
     private readonly Dictionary<uint, ReceiveStream> _receiveStreams = [];
+
+    // Per-inbound-SSRC RFC 3550 reception statistics, feeding the reception report blocks the periodic
+    // RTCP report carries. Written from the single ICE receive loop (HandleRtp and the incoming-SR path)
+    // and read from the RTCP timer thread when a report is built, so every access takes _receiveStatsLock.
+    private readonly object _receiveStatsLock = new();
+    private readonly Dictionary<uint, InboundSourceStats> _receiveStats = [];
+
     private Timer? _rtcpTimer;
     private int _firSequence;
 
@@ -895,6 +902,12 @@ public sealed partial class PeerConnection
             _remoteAudioSsrc = packet.Header.Ssrc;
         }
 
+        TrackInboundReceipt(
+            route,
+            packet.Header.Ssrc,
+            packet.Header.SequenceNumber,
+            packet.Header.Timestamp);
+
         var handler = OnRtpPacketReceived;
 
         // Ingest demux: when the section is simulcast, key the packet to its layer (learning the
@@ -1002,6 +1015,88 @@ public sealed partial class PeerConnection
         internal string? Rid { get; set; }
     }
 
+    /// <summary>
+    /// Folds one received media packet into the RFC 3550 reception statistics for its source, so the
+    /// periodic RTCP report can carry a proper reception report block for it (loss, jitter, EHSN).
+    /// </summary>
+    /// <remarks>
+    /// Only real media streams are tracked: RTX repair packets carry a different SSRC and sequence space
+    /// and belong to the media stream they repair, not a receiver report of their own. The route carries
+    /// the payload's clock rate, needed to express arrival time in timestamp units for the jitter
+    /// estimate; a route with no kind or clock rate (an unrecognised payload type) is skipped.
+    /// </remarks>
+    private void TrackInboundReceipt(RtpRoute route, uint ssrc, ushort sequenceNumber, uint rtpTimestamp)
+    {
+        if (route.IsRtx
+            || route.ClockRate == 0
+            || route.Kind is not (MediaKind.Video or MediaKind.Audio))
+        {
+            return;
+        }
+
+        // RFC 3550 A.8: the jitter estimate compares arrival and RTP timestamps, so scale the wall-clock
+        // arrival into the payload's clock. Only differences matter, so truncation to 32 bits is safe.
+        var arrivalMilliseconds = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var arrivalTimestamp = unchecked((uint)(arrivalMilliseconds * route.ClockRate / 1000));
+
+        lock (_receiveStatsLock)
+        {
+            if (!_receiveStats.TryGetValue(ssrc, out var stats))
+            {
+                stats = new InboundSourceStats(route.Kind);
+                _receiveStats[ssrc] = stats;
+            }
+
+            stats.Statistics.OnRtpPacket(sequenceNumber, rtpTimestamp, arrivalTimestamp);
+        }
+    }
+
+    /// <summary>
+    /// Records an inbound sender report against its source's reception statistics, supplying the LSR and
+    /// DLSR fields the next reception report block owes it (RFC 3550 §6.4.1). No-op when no media has yet
+    /// been received from that source.
+    /// </summary>
+    private void TrackInboundSenderReport(uint sourceSsrc, ulong ntpTimestamp, DateTimeOffset receivedAt)
+    {
+        lock (_receiveStatsLock)
+        {
+            if (_receiveStats.TryGetValue(sourceSsrc, out var stats))
+            {
+                stats.Statistics.OnSenderReport(NtpTime.ToCompact(ntpTimestamp), receivedAt);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Snapshots the reception report blocks owed to every inbound source of <paramref name="kind"/>,
+    /// computing each block's fraction-lost interval as of <paramref name="now"/> (RFC 3550 §6.4.1).
+    /// </summary>
+    private List<RtcpReportBlock> BuildReportBlocksFor(MediaKind kind, DateTimeOffset now)
+    {
+        var blocks = new List<RtcpReportBlock>();
+        lock (_receiveStatsLock)
+        {
+            foreach (var (ssrc, stats) in _receiveStats)
+            {
+                if (stats.Kind == kind && stats.Statistics.PacketsReceived > 0)
+                {
+                    blocks.Add(stats.Statistics.BuildReportBlock(ssrc, now));
+                }
+            }
+        }
+
+        return blocks;
+    }
+
+    /// <summary>One inbound source's RFC 3550 reception statistics, tagged with the media kind it was
+    /// demultiplexed to so the periodic report can group its block with that kind's sender report.</summary>
+    private sealed class InboundSourceStats(MediaKind kind)
+    {
+        internal MediaKind Kind { get; } = kind;
+
+        internal ReceptionStatistics Statistics { get; } = new();
+    }
+
     private void HandleRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram)
     {
         if (datagram.Length > _rxPlain.Length
@@ -1073,6 +1168,7 @@ public sealed partial class PeerConnection
                 break;
 
             case RtcpSenderReport sender:
+                TrackInboundSenderReport(sender.SenderSsrc, sender.NtpTimestamp, receivedAt);
                 OnSenderReport?.Invoke(
                     this,
                     new SenderReportEventArgs(sender.SenderSsrc, sender.NtpTimestamp, sender.RtpTimestamp, receivedAt));
@@ -1234,8 +1330,8 @@ public sealed partial class PeerConnection
         try
         {
             var now = DateTimeOffset.UtcNow;
-            SendReportFor(_videoTrack, now);
-            SendReportFor(_audioTrack, now);
+            SendReportFor(MediaKind.Video, _videoTrack, now);
+            SendReportFor(MediaKind.Audio, _audioTrack, now);
         }
         catch (Exception ex)
         {
@@ -1243,16 +1339,41 @@ public sealed partial class PeerConnection
         }
     }
 
-    private void SendReportFor(TrackSender? track, DateTimeOffset now)
+    private void SendReportFor(MediaKind kind, TrackSender? track, DateTimeOffset now)
     {
+        // The reception report blocks owed to every inbound source of this kind (RFC 3550 §6.4.1). Built
+        // once per cycle because BuildReportBlock advances each source's fraction-lost interval.
+        var reportBlocks = BuildReportBlocksFor(kind, now);
+
         if (track is null)
         {
+            // Receive-only for this kind: nothing to send unless a source is being received, in which
+            // case a standalone receiver report (RFC 3550 §6.4.2) carries its blocks.
+            if (reportBlocks.Count > 0)
+            {
+                var receiverReport = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
+                foreach (var block in reportBlocks)
+                {
+                    receiverReport.ReportBlocks.Add(block);
+                }
+
+                SendRtcpCompound([receiverReport, RtcpSourceDescription.CreateCname(_rtcpSenderSsrc, _cname)]);
+            }
+
             return;
+        }
+
+        // RFC 3550 §6.4.1: a sender report carries the same reception report blocks a receiver report
+        // would, so ride this kind's blocks on its sender report rather than sending a separate one.
+        var senderReport = track.Stream.CreateSenderReport(now);
+        foreach (var block in reportBlocks)
+        {
+            senderReport.ReportBlocks.Add(block);
         }
 
         var packets = new List<RtcpPacket>(4)
         {
-            track.Stream.CreateSenderReport(now),
+            senderReport,
             RtcpSourceDescription.CreateCname(track.Stream.Ssrc, _cname),
         };
 
