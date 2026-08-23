@@ -12,8 +12,8 @@ namespace Keryx.Rtp.Packetization;
 /// usable as a receive-side depacketizer for well-ordered input.
 /// </para>
 /// <para>
-/// The depacketizer assumes payloads arrive in order and without loss; a jitter buffer belongs in
-/// front of it. Malformed payloads are logged and dropped. STAP-B, MTAP16, MTAP24 and FU-B are not
+/// The depacketizer assumes payloads arrive in order and without loss; a <see cref="JitterBuffer"/>
+/// belongs in front of it. Malformed payloads are logged and dropped. STAP-B, MTAP16, MTAP24 and FU-B are not
 /// supported: WebRTC endpoints negotiate packetization-mode=1, which uses only the three forms above.
 /// </para>
 /// <para><b>Thread safety: single-writer</b>, like the rest of the per-stream state in this layer.</para>

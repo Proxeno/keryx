@@ -39,6 +39,11 @@ public sealed partial class PeerConnection
     private NegotiatedTrack? _negotiatedAudio;
     private Dictionary<byte, RtpRoute> _routes = [];
     private Dictionary<string, SimulcastReceiveTracker> _simulcastByMid = new(StringComparer.Ordinal);
+
+    // Per-SSRC receive jitter buffers, built lazily as sources appear. Only touched from the single
+    // ICE receive loop that drives HandleRtp, so it needs no synchronisation; it stays empty unless
+    // PeerConnectionConfig.EnableReceiveJitterBuffer is set.
+    private readonly Dictionary<uint, ReceiveStream> _receiveStreams = [];
     private Timer? _rtcpTimer;
     private int _firSequence;
 
@@ -751,17 +756,87 @@ public sealed partial class PeerConnection
             return;
         }
 
-        var info = new RtpPacketInfo(
-            route.Kind == MediaKind.Unknown ? null : route.Mid,
-            route.Kind,
-            payloadType,
-            packet.Header.Ssrc,
+        if (!_config.EnableReceiveJitterBuffer)
+        {
+            // Arrival-order delivery: fire immediately, exactly as the receive path always has.
+            var info = new RtpPacketInfo(
+                route.Kind == MediaKind.Unknown ? null : route.Mid,
+                route.Kind,
+                payloadType,
+                packet.Header.Ssrc,
+                packet.Header.SequenceNumber,
+                packet.Header.Timestamp,
+                packet.Header.Marker,
+                rid);
+
+            handler(in info, packet.Payload);
+            return;
+        }
+
+        // Playout-order delivery: reorder the source through its jitter buffer, then drain every packet
+        // that has become releasable and fire the handler for each in sequence order.
+        var stream = GetOrCreateReceiveStream(packet.Header.Ssrc);
+        if (rid is not null)
+        {
+            // A layer's SSRC maps to one stable RID (RFC 8852), so caching the last resolved value is
+            // enough to stamp it on packets the buffer releases later.
+            stream.Rid = rid;
+        }
+
+        stream.Buffer.Insert(
             packet.Header.SequenceNumber,
             packet.Header.Timestamp,
             packet.Header.Marker,
-            rid);
+            payloadType,
+            packet.Payload);
 
-        handler(in info, packet.Payload);
+        DrainReceiveStream(packet.Header.Ssrc, stream, routes, handler);
+    }
+
+    private ReceiveStream GetOrCreateReceiveStream(uint ssrc)
+    {
+        if (!_receiveStreams.TryGetValue(ssrc, out var stream))
+        {
+            stream = new ReceiveStream(new JitterBuffer(_config.ReceiveJitterBuffer, _config.TimeProvider));
+            _receiveStreams[ssrc] = stream;
+        }
+
+        return stream;
+    }
+
+    private void DrainReceiveStream(
+        uint ssrc,
+        ReceiveStream stream,
+        Dictionary<byte, RtpRoute> routes,
+        RtpPacketReceivedHandler handler)
+    {
+        while (stream.Buffer.TryGetNext(out var released))
+        {
+            var route = routes.TryGetValue(released.PayloadType, out var found)
+                ? found
+                : new RtpRoute(string.Empty, MediaKind.Unknown);
+
+            var info = new RtpPacketInfo(
+                route.Kind == MediaKind.Unknown ? null : route.Mid,
+                route.Kind,
+                released.PayloadType,
+                ssrc,
+                released.SequenceNumber,
+                released.Timestamp,
+                released.Marker,
+                route.Kind == MediaKind.Video ? stream.Rid : null);
+
+            handler(in info, released.Payload);
+        }
+    }
+
+    /// <summary>One inbound synchronisation source's receive state: its jitter buffer and the last
+    /// simulcast RID resolved for it, cached so packets released after classification still carry it.</summary>
+    private sealed class ReceiveStream(JitterBuffer buffer)
+    {
+        internal JitterBuffer Buffer { get; } = buffer;
+
+        internal string? Rid { get; set; }
     }
 
     private void HandleRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram)
