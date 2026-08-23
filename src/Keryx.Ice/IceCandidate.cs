@@ -24,6 +24,14 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
     /// <summary>The transport token for UDP candidates.</summary>
     public const string UdpTransport = "udp";
 
+    /// <summary>
+    /// The DNS suffix a browser gives an mDNS host candidate when it obfuscates a private address
+    /// as <c>&lt;uuid&gt;.local</c> (draft-ietf-mmusic-mdns-ice-candidates). Such a connection
+    /// address is a host name, not an <see cref="IPAddress"/>, so <see cref="TryParse"/> rejects it
+    /// and <see cref="TryParseMdnsCandidate"/> recognises it instead.
+    /// </summary>
+    public const string MulticastDnsSuffix = ".local";
+
     /// <summary>Creates a candidate.</summary>
     /// <param name="foundation">The foundation; candidates of the same type, base and server share one.</param>
     /// <param name="component">The component id; always 1 for a bundled, rtcp-muxed session.</param>
@@ -139,6 +147,70 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
     public static bool TryParse(string? value, [NotNullWhen(true)] out IceCandidate? candidate)
     {
         candidate = null;
+        if (!TryTokenize(value, out var tokens)
+            || !IPAddress.TryParse(tokens[4], out var address)
+            || !TryParseFields(
+                tokens, out var component, out var priority, out var port, out var type,
+                out var relatedAddress, out var relatedPort, out var extensions))
+        {
+            return false;
+        }
+
+        candidate = new IceCandidate(
+            tokens[0], component, tokens[2], priority, address, port, type, relatedAddress, relatedPort, extensions);
+        return true;
+    }
+
+    /// <summary>
+    /// Recognises a candidate whose connection address is an mDNS <c>&lt;name&gt;.local</c> host
+    /// name rather than an <see cref="IPAddress"/>. Browsers obfuscate host candidates this way by
+    /// default, and because the address token is not an IP <see cref="TryParse"/> rejects the line;
+    /// this method accepts it, yielding the host name to resolve and a factory that rebuilds the
+    /// candidate once resolution produces an address.
+    /// </summary>
+    /// <param name="value">The attribute to parse; may carry an <c>a=</c> and/or <c>candidate:</c> prefix.</param>
+    /// <param name="hostName">On success, the <c>.local</c> host name to resolve.</param>
+    /// <param name="resolve">On success, a factory that builds the candidate from a resolved address.</param>
+    /// <returns>True when <paramref name="value"/> is a well-formed candidate carrying an mDNS host name.</returns>
+    public static bool TryParseMdnsCandidate(
+        string? value,
+        [NotNullWhen(true)] out string? hostName,
+        [NotNullWhen(true)] out Func<IPAddress, IceCandidate>? resolve)
+    {
+        hostName = null;
+        resolve = null;
+        if (!TryTokenize(value, out var tokens))
+        {
+            return false;
+        }
+
+        var name = tokens[4];
+        if (name.Length <= MulticastDnsSuffix.Length
+            || !name.EndsWith(MulticastDnsSuffix, StringComparison.OrdinalIgnoreCase)
+            || IPAddress.TryParse(name, out _))
+        {
+            return false;
+        }
+
+        if (!TryParseFields(
+            tokens, out var component, out var priority, out var port, out var type,
+            out var relatedAddress, out var relatedPort, out var extensions))
+        {
+            return false;
+        }
+
+        var foundation = tokens[0];
+        var transport = tokens[2];
+        hostName = name;
+        resolve = address => new IceCandidate(
+            foundation, component, transport, priority, address, port, type, relatedAddress, relatedPort, extensions);
+        return true;
+    }
+
+    /// <summary>Strips the optional prefixes and splits the attribute, enforcing the <c>typ</c> anchor.</summary>
+    private static bool TryTokenize(string? value, [NotNullWhen(true)] out string[]? tokens)
+    {
+        tokens = null;
         if (string.IsNullOrWhiteSpace(value))
         {
             return false;
@@ -155,26 +227,48 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
             text = text["candidate:".Length..];
         }
 
-        var tokens = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (tokens.Length < 8 || !string.Equals(tokens[6], "typ", StringComparison.OrdinalIgnoreCase))
+        var split = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (split.Length < 8 || !string.Equals(split[6], "typ", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        if (!int.TryParse(tokens[1], NumberStyles.None, CultureInfo.InvariantCulture, out var component)
+        tokens = split;
+        return true;
+    }
+
+    /// <summary>
+    /// Parses every field except the foundation, transport token and connection address (tokens 0,
+    /// 2 and 4), which the callers handle: <see cref="TryParse"/> requires an IP address in token 4,
+    /// <see cref="TryParseMdnsCandidate"/> accepts an mDNS host name there.
+    /// </summary>
+    private static bool TryParseFields(
+        string[] tokens,
+        out int component,
+        out uint priority,
+        out int port,
+        out IceCandidateType type,
+        out IPAddress? relatedAddress,
+        out int? relatedPort,
+        out List<KeyValuePair<string, string>>? extensions)
+    {
+        component = 0;
+        priority = 0;
+        port = 0;
+        type = default;
+        relatedAddress = null;
+        relatedPort = null;
+        extensions = null;
+
+        if (!int.TryParse(tokens[1], NumberStyles.None, CultureInfo.InvariantCulture, out component)
             || component < 1
-            || !uint.TryParse(tokens[3], NumberStyles.None, CultureInfo.InvariantCulture, out var priority)
-            || !IPAddress.TryParse(tokens[4], out var address)
-            || !int.TryParse(tokens[5], NumberStyles.None, CultureInfo.InvariantCulture, out var port)
+            || !uint.TryParse(tokens[3], NumberStyles.None, CultureInfo.InvariantCulture, out priority)
+            || !int.TryParse(tokens[5], NumberStyles.None, CultureInfo.InvariantCulture, out port)
             || port > 65535
-            || !TryParseType(tokens[7], out var type))
+            || !TryParseType(tokens[7], out type))
         {
             return false;
         }
-
-        IPAddress? relatedAddress = null;
-        int? relatedPort = null;
-        List<KeyValuePair<string, string>>? extensions = null;
 
         for (var i = 8; i + 1 < tokens.Length; i += 2)
         {
@@ -203,8 +297,6 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
             }
         }
 
-        candidate = new IceCandidate(
-            tokens[0], component, tokens[2], priority, address, port, type, relatedAddress, relatedPort, extensions);
         return true;
     }
 
