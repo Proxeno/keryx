@@ -13,13 +13,29 @@ namespace Keryx;
 /// </remarks>
 public sealed class LocalIceCandidateEventArgs : EventArgs
 {
+    /// <summary>Creates the arguments, defaulting <see cref="SdpMLineIndex"/> to 0.</summary>
+    /// <param name="candidate">The candidate in SDP attribute syntax, <c>candidate:…</c>.</param>
+    /// <param name="sdpMid">The media identifier the candidate belongs to.</param>
+    /// <remarks>
+    /// Kept for binary compatibility with 0.2.x callers built against the two-parameter constructor;
+    /// prefer <see cref="LocalIceCandidateEventArgs(string, string?, int)"/>, which this delegates to.
+    /// </remarks>
+    public LocalIceCandidateEventArgs(string candidate, string? sdpMid)
+        : this(candidate, sdpMid, sdpMLineIndex: 0)
+    {
+    }
+
     /// <summary>Creates the arguments.</summary>
     /// <param name="candidate">The candidate in SDP attribute syntax, <c>candidate:…</c>.</param>
     /// <param name="sdpMid">The media identifier the candidate belongs to.</param>
-    public LocalIceCandidateEventArgs(string candidate, string? sdpMid)
+    /// <param name="sdpMLineIndex">
+    /// The 0-based index of <paramref name="sdpMid"/>'s m-line in the local description.
+    /// </param>
+    public LocalIceCandidateEventArgs(string candidate, string? sdpMid, int sdpMLineIndex)
     {
         Candidate = candidate;
         SdpMid = sdpMid;
+        SdpMLineIndex = sdpMLineIndex;
     }
 
     /// <summary>The candidate in SDP attribute syntax, including the <c>candidate:</c> prefix.</summary>
@@ -30,6 +46,16 @@ public sealed class LocalIceCandidateEventArgs : EventArgs
     /// applies the candidate to the whole bundled transport.
     /// </summary>
     public string? SdpMid { get; }
+
+    /// <summary>
+    /// The 0-based position of <see cref="SdpMid"/>'s m-line in the local description's m-section
+    /// order — the JSEP <c>sdpMLineIndex</c> a browser peer expects alongside <c>sdpMid</c>. Computed
+    /// from the session's actual section order, not by parsing <see cref="SdpMid"/> as a number, so it
+    /// stays correct once mids stop being small integers. Under Keryx's current max-bundle single
+    /// transport this is always the index of the first m-line (0), because every gathered candidate
+    /// applies to the whole bundled transport.
+    /// </summary>
+    public int SdpMLineIndex { get; }
 }
 
 /// <summary>A received Picture Loss Indication (RFC 4585 §6.3.1): the peer wants a fresh key frame.</summary>
