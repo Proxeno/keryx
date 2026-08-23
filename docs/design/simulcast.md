@@ -1,6 +1,6 @@
 # Simulcast transport primitives
 
-Status: implemented (EWI-1250). Follow-up chain steps 1–5 landed; the BWE seam (step 6) stays an
+Status: implemented. Follow-up chain steps 1–5 landed; the BWE seam (step 6) stays an
 app-side concern. See the "Follow-up PR breakdown" below for per-step status.
 
 Keryx is the WebRTC transport stack under the vuefix broadcast platform: a creator ingests one video
@@ -22,8 +22,8 @@ Keryx owns, and this document specifies:
 
 Keryx explicitly does **not** own:
 
-- **Layer selection.** Which layer each viewer receives, driven by that viewer's bandwidth estimate
-  (EWI-1248), is decided in vuefix. Keryx forwards the layer the app selects and exposes the signals
+- **Layer selection.** Which layer each viewer receives, driven by that viewer's bandwidth estimate,
+  is decided in vuefix. Keryx forwards the layer the app selects and exposes the signals
   (switch pending, keyframe needed) the app needs to drive the decision.
 - **Fan-out / routing topology.** Keryx has no notion of "subscribers" as a set, no SFU router, no
   subscription table. The app owns a `RtpForwarder` per subscriber output and pumps packets through.
@@ -148,12 +148,12 @@ upstream ask, protecting the creator's encoder from a keyframe flood.
 The coalescer builds and sends no RTCP: the app issues the request through the existing peer-connection
 primitives (`SendPictureLossIndication(ssrc)` / `SendFullIntraRequest(ssrc)`) using the returned SSRC.
 
-## 4. How per-subscriber BWE (EWI-1248) drives selection, from the app side
+## 4. How per-subscriber BWE drives selection, from the app side
 
 The BWE work lands a per-subscriber downlink bandwidth estimate (from transport-cc / REMB / RR, all
 already surfaced by Keryx). The vuefix SFU runs, per subscriber, a loop Keryx never participates in:
 
-1. Read the subscriber's current estimate (EWI-1248).
+1. Read the subscriber's current bandwidth estimate.
 2. Pick the highest layer whose advertised `a=rid` bitrate/resolution fits the estimate (plus
    hysteresis to avoid flapping). **This is the layer-selection policy — app-only.**
 3. Call `forwarder.SelectLayer(layerId)`.
@@ -194,5 +194,5 @@ Changed (`Keryx`): `PeerConnectionEvents.cs` (`RtpPacketInfo.Rid`).
 5. **Keyframe routing completion** — *done.* Deferred-request firing (`TryTakeDeferred`), per-upstream
    FIR command-sequence (`NextFirCommandSequence`), wired to the PLI/FIR senders via
    `PeerConnection.SendCoalescedKeyframeRequest` / `SendDeferredKeyframeRequests`.
-6. **BWE seam (EWI-1248)** — document and implement the vuefix-side selection loop against the Keryx
+6. **BWE seam** — document and implement the vuefix-side selection loop against the Keryx
    primitives (in the app, not in Keryx). *Deliberately out of scope for Keryx.*
