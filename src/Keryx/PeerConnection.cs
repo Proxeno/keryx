@@ -747,12 +747,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         var ice = new IceAgent(options);
-        var mid = _config.VideoCodecs.Count > 0
-            ? _config.VideoMid
-            : _config.AudioCodecs.Count > 0 ? _config.AudioMid : _config.ApplicationMid;
+        var (mid, mLineIndex) = SelectCandidateMediaSection();
 
         ice.OnLocalCandidate += (_, candidate) =>
-            OnLocalIceCandidate?.Invoke(this, new LocalIceCandidateEventArgs(candidate.ToAttributeString(), mid));
+            OnLocalIceCandidate?.Invoke(
+                this,
+                new LocalIceCandidateEventArgs(candidate.ToAttributeString(), mid, mLineIndex));
         ice.OnGatheringComplete += (_, _) => OnIceGatheringComplete?.Invoke(this, EventArgs.Empty);
         ice.OnStateChanged += (_, state) => HandleIceStateChanged(state);
         // PeerConnectionConfig.TransportInterceptor is the fault-injection / diagnostics seam: the
@@ -774,6 +774,47 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         _pendingRemoteCandidates.Clear();
         return ice;
+    }
+
+    /// <summary>
+    /// Picks the mid a gathered local candidate is reported against, and that mid's 0-based m-line
+    /// index in the description that will carry it.
+    /// </summary>
+    /// <remarks>
+    /// Candidates are raised while gathering, before <see cref="BuildOffer"/> / <see cref="BuildAnswer"/>
+    /// have run, so there is no built <see cref="SessionDescription"/> to look the index up against yet.
+    /// Instead this mirrors the section order those builders are about to produce: when answering,
+    /// <see cref="BuildAnswer"/> mirrors the applied offer's sections index-for-index, so the offer's
+    /// first m-line is the answer's first m-line; when offering, <see cref="BuildOffer"/> emits video
+    /// (if configured), then audio (if configured), then the data channel, in that order. Either way the
+    /// selected mid is always the section that ends up first — under Keryx's single max-bundle transport
+    /// every candidate belongs to the whole bundle, so it is always scoped to m-line 0. The index is
+    /// still computed by position rather than assumed, so this keeps working if that ordering — or which
+    /// kind leads it — changes later.
+    /// </remarks>
+    private (string Mid, int MLineIndex) SelectCandidateMediaSection()
+    {
+        if (_remoteDescription is { MediaDescriptions.Count: > 0 } remote)
+        {
+            var firstOffered = remote.MediaDescriptions[0].Mid ?? _config.ApplicationMid;
+            return (firstOffered, 0);
+        }
+
+        var order = new List<string>(3);
+        if (_config.VideoCodecs.Count > 0)
+        {
+            order.Add(_config.VideoMid);
+        }
+
+        if (_config.AudioCodecs.Count > 0)
+        {
+            order.Add(_config.AudioMid);
+        }
+
+        order.Add(_config.ApplicationMid);
+
+        var mid = order[0];
+        return (mid, order.IndexOf(mid));
     }
 
     private void HandleIceStateChanged(IceAgentState state)
