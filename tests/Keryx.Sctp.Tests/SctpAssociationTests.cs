@@ -191,6 +191,76 @@ public class SctpAssociationTests : IDisposable
     }
 
     [Fact]
+    public async Task TimedUnreliableMessageIsAbandonedAfterItsLifetimeElapses()
+    {
+        // Unordered timed-unreliable (maxPacketLifetime) is the common WebRTC data-channel case.
+        var time = new TestTimeProvider();
+        using var harness = new Harness(time);
+        var lossy = harness.A.CreateChannel("lossy", ordered: false, maxPacketLifetime: 200);
+        await harness.ConnectAsync();
+        WaitFor(() => harness.B.Channels.ContainsKey("lossy")).Should().BeTrue();
+        WaitFor(() => lossy.State == DataChannelState.Open).Should().BeTrue();
+        Quiesce();
+
+        // Drop the one and only transmission attempt. The fake clock is frozen, so the T3
+        // retransmission timer (which fires when NowMs reaches an already-computed expiry) never
+        // trips and no further attempt is made — the message can only be freed by its lifetime.
+        harness.A.Transport.DropNextDataDatagrams(1);
+        lossy.SendText("lost-to-time");
+        WaitFor(() => harness.A.Transport.DroppedDatagrams == 1).Should().BeTrue();
+
+        // Give the periodic Tick a moment to observe the still-frozen clock and confirm it does
+        // NOT abandon the message early.
+        Thread.Sleep(60);
+        lossy.BufferedAmount.Should().BeGreaterThan(0);
+        harness.B.Messages.Should().BeEmpty();
+
+        // Advance past the message's lifetime; the next Tick abandons it via FORWARD-TSN.
+        time.Advance(TimeSpan.FromMilliseconds(250));
+
+        lossy.SendText("kept");
+        WaitFor(() => harness.B.Messages.Count == 1).Should().BeTrue();
+        Encoding.UTF8.GetString(harness.B.Messages.Single().Payload).Should().Be("kept");
+
+        // The abandoned message's buffered bytes were released and the association kept flowing.
+        WaitFor(() => lossy.BufferedAmount == 0).Should().BeTrue();
+        harness.A.Association.State.Should().Be(SctpAssociationState.Established);
+        harness.B.Association.State.Should().Be(SctpAssociationState.Established);
+    }
+
+    [Fact]
+    public async Task TimedMessageDeliveredWithinItsLifetimeIsNotAbandoned()
+    {
+        var time = new TestTimeProvider();
+        using var harness = new Harness(time);
+        var channel = harness.A.CreateChannel("prompt", ordered: false, maxPacketLifetime: 5000);
+        await harness.ConnectAsync();
+        WaitFor(() => harness.B.Channels.ContainsKey("prompt")).Should().BeTrue();
+        WaitFor(() => channel.State == DataChannelState.Open).Should().BeTrue();
+        Quiesce();
+
+        channel.SendText("on-time");
+        WaitFor(() => harness.B.Messages.Count == 1).Should().BeTrue();
+        WaitFor(() => channel.BufferedAmount == 0).Should().BeTrue();
+
+        // Advance well past the lifetime after delivery already completed: nothing left to abandon.
+        time.Advance(TimeSpan.FromSeconds(10));
+        Thread.Sleep(60);
+
+        Encoding.UTF8.GetString(harness.B.Messages.Single().Payload).Should().Be("on-time");
+        harness.A.Association.State.Should().Be(SctpAssociationState.Established);
+        harness.B.Association.State.Should().Be(SctpAssociationState.Established);
+    }
+
+    [Fact]
+    public void CreateChannelRejectsBothReliabilityLimitsAtOnce()
+    {
+        using var harness = new Harness();
+        var act = () => harness.A.CreateChannel("bad", maxRetransmits: 0, maxPacketLifetime: 100);
+        act.Should().Throw<ArgumentException>();
+    }
+
+    [Fact]
     public async Task ReliableMessageSurvivesADroppedFirstAttempt()
     {
         var telemetry = _harness.A.CreateChannel("telemetry");
@@ -293,7 +363,7 @@ public class SctpAssociationTests : IDisposable
         private readonly ConcurrentQueue<Message> _messages = new();
         private readonly ConcurrentQueue<Exception> _errors = new();
 
-        public Endpoint(LoopbackTransport transport, bool isInitiator, bool usesEvenStreamIds)
+        public Endpoint(LoopbackTransport transport, bool isInitiator, bool usesEvenStreamIds, TimeProvider? timeProvider = null)
         {
             Transport = transport;
             Association = new SctpAssociation(transport, new SctpAssociationConfig
@@ -304,6 +374,7 @@ public class SctpAssociationTests : IDisposable
                 InitialRto = TimeSpan.FromMilliseconds(100),
                 MinRto = TimeSpan.FromMilliseconds(50),
                 HeartbeatInterval = TimeSpan.Zero,
+                TimeProvider = timeProvider ?? TimeProvider.System,
             });
 
             Association.OnAssociated += () => Associated = true;
@@ -330,9 +401,14 @@ public class SctpAssociationTests : IDisposable
 
         public bool Closed { get; private set; }
 
-        public DataChannel CreateChannel(string label, bool ordered = true, ushort? maxRetransmits = null, string protocol = "")
+        public DataChannel CreateChannel(
+            string label,
+            bool ordered = true,
+            ushort? maxRetransmits = null,
+            string protocol = "",
+            ushort? maxPacketLifetime = null)
         {
-            var channel = Association.CreateChannel(label, ordered, maxRetransmits, protocol);
+            var channel = Association.CreateChannel(label, ordered, maxRetransmits, protocol, maxPacketLifetime);
             Observe(channel);
             return channel;
         }
@@ -350,10 +426,10 @@ public class SctpAssociationTests : IDisposable
         private readonly LoopbackTransport _transportA;
         private readonly LoopbackTransport _transportB;
 
-        public Harness()
+        public Harness(TimeProvider? timeProviderA = null)
         {
             (_transportA, _transportB) = LoopbackTransport.CreatePair();
-            A = new Endpoint(_transportA, isInitiator: true, usesEvenStreamIds: true);
+            A = new Endpoint(_transportA, isInitiator: true, usesEvenStreamIds: true, timeProviderA);
             B = new Endpoint(_transportB, isInitiator: false, usesEvenStreamIds: false);
         }
 

@@ -350,20 +350,39 @@ public sealed class SctpAssociation : IDisposable
     /// <param name="ordered">Whether messages are delivered in send order.</param>
     /// <param name="maxRetransmits">
     /// Retransmission limit per message, or null for full reliability. Zero means each message is
-    /// transmitted once and abandoned if lost.
+    /// transmitted once and abandoned if lost. Mutually exclusive with
+    /// <paramref name="maxPacketLifetime"/>.
     /// </param>
     /// <param name="protocol">Optional sub-protocol name.</param>
+    /// <param name="maxPacketLifetime">
+    /// Message lifetime in milliseconds, or null for full reliability. A message still
+    /// unacknowledged after this many milliseconds is abandoned (RFC 3758 timed PR-SCTP). Mutually
+    /// exclusive with <paramref name="maxRetransmits"/>.
+    /// </param>
     /// <returns>The new channel, initially in <see cref="DataChannelState.Connecting"/>.</returns>
-    public DataChannel CreateChannel(string label, bool ordered = true, ushort? maxRetransmits = null, string protocol = "")
+    /// <exception cref="ArgumentException">Both <paramref name="maxRetransmits"/> and <paramref name="maxPacketLifetime"/> are set.</exception>
+    public DataChannel CreateChannel(
+        string label,
+        bool ordered = true,
+        ushort? maxRetransmits = null,
+        string protocol = "",
+        ushort? maxPacketLifetime = null)
     {
         ArgumentNullException.ThrowIfNull(label);
         ArgumentNullException.ThrowIfNull(protocol);
+        if (maxRetransmits.HasValue && maxPacketLifetime.HasValue)
+        {
+            throw new ArgumentException(
+                "maxRetransmits and maxPacketLifetime are mutually exclusive; RFC 8832 channel types cannot select both.",
+                nameof(maxPacketLifetime));
+        }
+
         DataChannel channel;
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             var streamId = AllocateStreamId();
-            channel = new DataChannel(this, streamId, label, protocol, ordered, maxRetransmits, negotiatedByPeer: false);
+            channel = new DataChannel(this, streamId, label, protocol, ordered, maxRetransmits, maxPacketLifetime, negotiatedByPeer: false);
             _channels[streamId] = channel;
 
             // TSNs are assignable before the association exists, so the OPEN can be queued now and
@@ -472,6 +491,7 @@ public sealed class SctpAssociation : IDisposable
                 body,
                 ordered: channel.Ordered,
                 maxRetransmits: channel.MaxRetransmits,
+                maxPacketLifetime: channel.MaxPacketLifetime,
                 channel: channel,
                 bufferedBytes: userBytes);
             Flush();
@@ -1405,6 +1425,7 @@ public sealed class SctpAssociation : IDisposable
             open.Protocol,
             ordered: !open.Unordered,
             maxRetransmits: open.MaxRetransmits,
+            maxPacketLifetime: open.MaxPacketLifetime,
             negotiatedByPeer: true);
         _channels[message.StreamId] = channel;
 
@@ -1415,6 +1436,7 @@ public sealed class SctpAssociation : IDisposable
             DcepOpenMessage.EncodeAck(),
             ordered: true,
             maxRetransmits: null,
+            maxPacketLifetime: null,
             channel: null,
             bufferedBytes: 0);
 
@@ -1437,11 +1459,11 @@ public sealed class SctpAssociation : IDisposable
     private void SendDcepOpen(DataChannel channel)
     {
         var open = new DcepOpenMessage(
-            DcepOpenMessage.ChannelTypeFor(channel.Ordered, channel.MaxRetransmits),
+            DcepOpenMessage.ChannelTypeFor(channel.Ordered, channel.MaxRetransmits, channel.MaxPacketLifetime),
             channel.Label,
             channel.Protocol,
             priority: 0,
-            reliabilityParameter: channel.MaxRetransmits ?? 0);
+            reliabilityParameter: channel.MaxRetransmits ?? channel.MaxPacketLifetime ?? 0);
 
         // RFC 8832 §5.1: DATA_CHANNEL_OPEN is always sent with ordered delivery, even for an
         // unordered channel, so it cannot be overtaken by the channel's own traffic.
@@ -1451,6 +1473,7 @@ public sealed class SctpAssociation : IDisposable
             open.Encode(),
             ordered: true,
             maxRetransmits: null,
+            maxPacketLifetime: null,
             channel: null,
             bufferedBytes: 0);
     }
@@ -1835,10 +1858,16 @@ public sealed class SctpAssociation : IDisposable
         byte[] body,
         bool ordered,
         ushort? maxRetransmits,
+        ushort? maxPacketLifetime,
         DataChannel? channel,
         int bufferedBytes)
     {
         var interleaved = UseInterleaving;
+
+        // RFC 3758 §3.3: the message's lifetime timer starts when it is presented to SCTP, not from
+        // its (possibly retried) first transmission, so every fragment shares one deadline stamped
+        // here.
+        var expiresAtMs = maxPacketLifetime.HasValue ? NowMs + maxPacketLifetime.Value : (long?)null;
 
         // Classic DATA carries a 16-bit per-fragment stream sequence number for ordered messages;
         // I-DATA replaces it with a 32-bit message identifier drawn from a per-stream, per-ordering
@@ -1887,6 +1916,7 @@ public sealed class SctpAssociation : IDisposable
                 FragmentSequenceNumber = fsn,
                 MessageId = messageId,
                 MaxRetransmits = maxRetransmits,
+                ExpiresAtMs = expiresAtMs,
                 Channel = channel,
                 BufferedBytes = share,
             });
@@ -2382,8 +2412,15 @@ public sealed class SctpAssociation : IDisposable
         return Serial.Gt(_advancedPeerAckPoint, _peerCumulativeAck);
     }
 
-    private static bool ShouldAbandon(OutgoingChunk chunk) =>
-        chunk.MaxRetransmits.HasValue && chunk.Transmits - 1 >= chunk.MaxRetransmits.Value;
+    /// <summary>
+    /// True once a chunk's reliability limit has been exceeded — either the count-based
+    /// <see cref="OutgoingChunk.MaxRetransmits"/> (RFC 3758 §3.3.1) or the time-based
+    /// <see cref="OutgoingChunk.ExpiresAtMs"/> deadline (RFC 3758 §3.3.2, RFC 8831's
+    /// maxPacketLifetime).
+    /// </summary>
+    private bool ShouldAbandon(OutgoingChunk chunk) =>
+        (chunk.MaxRetransmits.HasValue && chunk.Transmits - 1 >= chunk.MaxRetransmits.Value) ||
+        (chunk.ExpiresAtMs.HasValue && NowMs >= chunk.ExpiresAtMs.Value);
 
     private void AbandonMessage(int messageId)
     {
@@ -2466,6 +2503,47 @@ public sealed class SctpAssociation : IDisposable
         _out.RemoveAll(c => Serial.Lte(c.Tsn, _advancedPeerAckPoint));
     }
 
+    /// <summary>
+    /// RFC 3758 timed partial reliability: abandons any outstanding chunk on a maxPacketLifetime
+    /// channel whose deadline has passed, independent of ack or retransmission-timer activity, so a
+    /// message is never held past its wall-clock lifetime even when it never draws a gap report or a
+    /// T3 timeout (e.g. it is the last thing queued, or the RTO happens to exceed the lifetime).
+    /// Driven from <see cref="Tick"/> so it runs on the association's regular cadence.
+    /// </summary>
+    private void AbandonExpiredChunks(long now)
+    {
+        List<int>? expired = null;
+        foreach (var chunk in _out)
+        {
+            if (chunk.Acked || chunk.Abandoned || chunk.ExpiresAtMs is not { } deadline || now < deadline)
+            {
+                continue;
+            }
+
+            expired ??= new List<int>();
+            if (!expired.Contains(chunk.MessageId))
+            {
+                expired.Add(chunk.MessageId);
+            }
+        }
+
+        if (expired is null)
+        {
+            return;
+        }
+
+        foreach (var messageId in expired)
+        {
+            AbandonMessage(messageId);
+        }
+
+        MaybeSendForwardTsn();
+        if (!HasOutstanding())
+        {
+            _t3Expiry = 0;
+        }
+    }
+
     // ------------------------------------------------------------------ timers
 
     private void Tick()
@@ -2478,6 +2556,12 @@ public sealed class SctpAssociation : IDisposable
             }
 
             var now = NowMs;
+
+            if (_state is SctpAssociationState.Established or SctpAssociationState.ShutdownPending
+                or SctpAssociationState.ShutdownReceived or SctpAssociationState.ShutdownSent)
+            {
+                AbandonExpiredChunks(now);
+            }
 
             if (_initExpiry != 0 && now >= _initExpiry)
             {

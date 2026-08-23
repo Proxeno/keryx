@@ -30,6 +30,7 @@ public sealed class DataChannel
         string protocol,
         bool ordered,
         ushort? maxRetransmits,
+        ushort? maxPacketLifetime,
         bool negotiatedByPeer)
     {
         _association = association;
@@ -38,6 +39,7 @@ public sealed class DataChannel
         Protocol = protocol;
         Ordered = ordered;
         MaxRetransmits = maxRetransmits;
+        MaxPacketLifetime = maxPacketLifetime;
         NegotiatedByPeer = negotiatedByPeer;
         State = DataChannelState.Connecting;
     }
@@ -65,6 +67,14 @@ public sealed class DataChannel
     /// transmitted exactly once and abandoned if it is lost.
     /// </summary>
     public ushort? MaxRetransmits { get; }
+
+    /// <summary>
+    /// Message lifetime in milliseconds, or null for full reliability or count-based partial
+    /// reliability. A message still unacknowledged when this many milliseconds have elapsed since
+    /// it was queued is abandoned (RFC 3758 timed PR-SCTP), advancing past it with FORWARD-TSN.
+    /// Mutually exclusive with <see cref="MaxRetransmits"/>.
+    /// </summary>
+    public ushort? MaxPacketLifetime { get; }
 
     /// <summary>The SCTP stream identifier carrying this channel.</summary>
     public int StreamId { get; }

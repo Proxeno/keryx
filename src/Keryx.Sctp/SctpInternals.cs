@@ -52,6 +52,14 @@ internal sealed class OutgoingChunk
 
     internal required ushort? MaxRetransmits { get; init; }
 
+    /// <summary>
+    /// RFC 3758 timed partial reliability deadline, in the association's monotonic millisecond
+    /// clock (same domain as <see cref="LastSentMs"/>), or null when the message is not
+    /// lifetime-limited. Stamped once, when the message is queued, so the timer runs from when it
+    /// was presented to SCTP rather than from its (possibly retried) first transmission.
+    /// </summary>
+    internal long? ExpiresAtMs { get; init; }
+
     internal DataChannel? Channel { get; init; }
 
     /// <summary>Bytes of user payload this chunk contributes to the channel's buffered amount.</summary>
