@@ -129,6 +129,50 @@ public sealed class IceCandidateTests
     }
 
     [Fact]
+    public void TryParse_RejectsAnMdnsHostCandidateBecauseTheAddressIsNotAnIP()
+    {
+        // The whole reason .local candidates need separate handling: the address token is a host
+        // name, so the normal parser cannot accept it.
+        IceCandidate.TryParse(
+            "candidate:1 1 udp 2130706431 3f4a1c9e-2b6d-4e11-9a7c-1d2e3f4a5b6c.local 50000 typ host",
+            out var candidate).Should().BeFalse();
+        candidate.Should().BeNull();
+    }
+
+    [Fact]
+    public void TryParseMdnsCandidate_RecognisesALocalHostCandidateAndRebuildsItOnResolution()
+    {
+        IceCandidate.TryParseMdnsCandidate(
+            "a=candidate:1 1 udp 2130706431 3f4a1c9e-2b6d-4e11-9a7c-1d2e3f4a5b6c.local 50000 typ host generation 0",
+            out var hostName,
+            out var resolve).Should().BeTrue();
+
+        hostName.Should().Be("3f4a1c9e-2b6d-4e11-9a7c-1d2e3f4a5b6c.local");
+
+        var resolved = resolve!(IPAddress.Parse("192.168.1.42"));
+        resolved.Type.Should().Be(IceCandidateType.Host);
+        resolved.Foundation.Should().Be("1");
+        resolved.Priority.Should().Be(2130706431u);
+        resolved.Address.Should().Be(IPAddress.Parse("192.168.1.42"));
+        resolved.EndPoint.Should().Be(new IPEndPoint(IPAddress.Parse("192.168.1.42"), 50000));
+        resolved.Extensions.Should().Equal(new[] { new KeyValuePair<string, string>("generation", "0") });
+    }
+
+    [Theory]
+    [InlineData("candidate:1 1 udp 2130706431 192.168.1.7 50000 typ host")]
+    [InlineData("candidate:1 1 udp 2130706431 ::1 50000 typ host")]
+    [InlineData(".local 1 udp 2130706431 192.168.1.7 50000 typ host")]
+    [InlineData("candidate:1 1 udp 2130706431 192.168.1.7 99999 typ host")]
+    [InlineData("not a candidate")]
+    [InlineData(null)]
+    public void TryParseMdnsCandidate_RejectsNonMdnsOrMalformedAttributes(string? attribute)
+    {
+        IceCandidate.TryParseMdnsCandidate(attribute, out var hostName, out var resolve).Should().BeFalse();
+        hostName.Should().BeNull();
+        resolve.Should().BeNull();
+    }
+
+    [Fact]
     public void TypeToken_MatchesTheSdpSpelling()
     {
         IceCandidate.TypeToken(IceCandidateType.Host).Should().Be("host");

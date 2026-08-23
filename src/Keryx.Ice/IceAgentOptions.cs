@@ -84,6 +84,22 @@ public sealed class IceAgentOptions
     /// <summary>Highest port to bind, inclusive.</summary>
     public int MaxPort { get; set; }
 
+    /// <summary>
+    /// Whether a remote host candidate whose connection address is an mDNS <c>&lt;name&gt;.local</c>
+    /// host name is resolved to an address and paired, instead of being dropped as unparsable.
+    /// Browsers obfuscate host candidates this way by default, so this is on by default to keep
+    /// same-LAN direct connections working; resolution runs off the intake path and any failure
+    /// degrades gracefully to skipping the candidate (RFC 6762, draft mdns-ice-candidates).
+    /// </summary>
+    public bool ResolveMdnsCandidates { get; set; } = true;
+
+    /// <summary>
+    /// The resolver used for <c>.local</c> host candidates when <see cref="ResolveMdnsCandidates"/>
+    /// is set. Null uses <see cref="MulticastMdnsResolver.Shared"/>; a test can supply a stub to
+    /// route intake without a live multicast responder.
+    /// </summary>
+    public IMdnsResolver? MdnsResolver { get; set; }
+
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }
 

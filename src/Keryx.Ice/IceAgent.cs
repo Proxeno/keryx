@@ -71,6 +71,7 @@ public sealed class IceAgent : IDisposable
     private readonly List<RelayAllocation> _allocations = [];
     private readonly CancellationTokenSource _cts = new();
     private readonly byte[] _localKey;
+    private readonly IMdnsResolver? _mdnsResolver;
 
     private Socket? _socket;
     private Task? _receiveLoop;
@@ -101,6 +102,7 @@ public sealed class IceAgent : IDisposable
         LocalUfrag = _options.LocalUfrag ?? IceCredentials.NewUfrag();
         LocalPassword = _options.LocalPassword ?? IceCredentials.NewPassword();
         _localKey = StunCredentials.ShortTermKey(LocalPassword);
+        _mdnsResolver = _options.ResolveMdnsCandidates ? (_options.MdnsResolver ?? MulticastMdnsResolver.Shared) : null;
         _transport = new IceTransport(this);
     }
 
@@ -345,17 +347,76 @@ public sealed class IceAgent : IDisposable
 
     /// <summary>Parses and adds a candidate in SDP attribute syntax.</summary>
     /// <param name="candidateAttribute">An <c>a=candidate:...</c> line or bare attribute value.</param>
-    /// <returns>True when the attribute parsed and the candidate was accepted.</returns>
+    /// <returns>
+    /// True when the attribute was recognised: either it parsed and the candidate was accepted, or
+    /// it is an mDNS <c>.local</c> host candidate that was handed off for asynchronous resolution
+    /// (which may still end up unresolvable). False only for an attribute that is not valid syntax.
+    /// </returns>
     public bool AddRemoteCandidate(string candidateAttribute)
     {
-        if (!IceCandidate.TryParse(candidateAttribute, out var candidate))
+        if (IceCandidate.TryParse(candidateAttribute, out var candidate))
         {
-            _logger.Log(KeryxLogLevel.Warning, $"Ignoring unparsable remote candidate '{candidateAttribute}'.");
-            return false;
+            AddRemoteCandidate(candidate);
+            return true;
         }
 
-        AddRemoteCandidate(candidate);
-        return true;
+        // A browser obfuscates its host candidate as <uuid>.local, which TryParse rejects because the
+        // connection address is not an IP. Resolve it off this path rather than dropping it, so a
+        // same-LAN direct pair can still form (draft mdns-ice-candidates).
+        if (_mdnsResolver is not null
+            && IceCandidate.TryParseMdnsCandidate(candidateAttribute, out var hostName, out var resolve))
+        {
+            _logger.Log(KeryxLogLevel.Debug, $"Resolving mDNS remote candidate host '{hostName}'.");
+            ResolveMdnsCandidate(hostName, resolve, candidateAttribute);
+            return true;
+        }
+
+        _logger.Log(KeryxLogLevel.Warning, $"Ignoring unparsable remote candidate '{candidateAttribute}'.");
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves an mDNS host candidate off the intake path and, on success, adds the resolved
+    /// candidate. A timeout or failure is logged as an unresolvable mDNS candidate - distinct from
+    /// the unparsable-attribute path - and the candidate is skipped without disturbing the agent.
+    /// </summary>
+    private void ResolveMdnsCandidate(string hostName, Func<IPAddress, IceCandidate> resolve, string candidateAttribute)
+    {
+        var resolver = _mdnsResolver;
+        if (resolver is null)
+        {
+            return;
+        }
+
+        _ = Task.Run(
+            async () =>
+            {
+                IPAddress? address;
+                try
+                {
+                    address = await resolver.ResolveAsync(hostName, _cts.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or SocketException)
+                {
+                    _logger.Log(KeryxLogLevel.Warning, $"Skipping unresolvable mDNS remote candidate '{candidateAttribute}'.", ex);
+                    return;
+                }
+
+                if (address is null)
+                {
+                    _logger.Log(KeryxLogLevel.Warning, $"Skipping unresolvable mDNS remote candidate '{candidateAttribute}'; host '{hostName}' did not answer.");
+                    return;
+                }
+
+                if (_cts.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                _logger.Log(KeryxLogLevel.Debug, $"Resolved mDNS candidate host '{hostName}' to {address}.");
+                AddRemoteCandidate(resolve(address));
+            },
+            CancellationToken.None);
     }
 
     /// <summary>
