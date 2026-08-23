@@ -15,10 +15,26 @@ public enum SrtpProtectionProfileKind
     Aes128CmHmacSha1_80 = 0x0001,
 
     /// <summary>
+    /// <c>SRTP_AES128_CM_HMAC_SHA1_32</c> (RFC 5764 Section 4.1.2): the same AES-128 counter-mode
+    /// cipher as <see cref="Aes128CmHmacSha1_80"/> with HMAC-SHA1 truncated to 32 bits instead of
+    /// 80 (RFC 3711 Section 4.2.1). Intended for bandwidth-constrained links where a shorter tag is
+    /// an acceptable trade against forgery probability; browsers rarely offer it above the
+    /// mandatory-to-implement 80-bit profile.
+    /// </summary>
+    Aes128CmHmacSha1_32 = 0x0002,
+
+    /// <summary>
     /// <c>SRTP_AEAD_AES_128_GCM</c> (RFC 7714 Section 14.2): AES-128-GCM with a 128-bit
     /// authentication tag, using the RFC 3711 AES-CM PRF for key derivation.
     /// </summary>
     AeadAes128Gcm = 0x0007,
+
+    /// <summary>
+    /// <c>SRTP_AEAD_AES_256_GCM</c> (RFC 7714 Section 14.2): the same AES-GCM construction as
+    /// <see cref="AeadAes128Gcm"/> with a 256-bit key, using the RFC 3711 AES-CM PRF (itself keyed
+    /// with the 256-bit master key) for key derivation.
+    /// </summary>
+    AeadAes256Gcm = 0x0008,
 }
 
 /// <summary>
@@ -58,6 +74,19 @@ public sealed class SrtpProtectionProfile
         tagLength: 10);
 
     /// <summary>
+    /// <c>SRTP_AES128_CM_HMAC_SHA1_32</c>: 128-bit master key, 112-bit master salt, 32-bit tag.
+    /// Identical to <see cref="Aes128CmHmacSha1_80"/> except for the truncated tag.
+    /// </summary>
+    public static SrtpProtectionProfile Aes128CmHmacSha1_32 { get; } = new(
+        SrtpProtectionProfileKind.Aes128CmHmacSha1_32,
+        "SRTP_AES128_CM_HMAC_SHA1_32",
+        masterKeyLength: 16,
+        masterSaltLength: 14,
+        sessionSaltLength: 14,
+        authKeyLength: 20,
+        tagLength: 4);
+
+    /// <summary>
     /// <c>SRTP_AEAD_AES_128_GCM</c>: 128-bit master key, 96-bit master salt, 128-bit AEAD tag
     /// (RFC 7714 Section 12, Table 2).
     /// </summary>
@@ -65,6 +94,20 @@ public sealed class SrtpProtectionProfile
         SrtpProtectionProfileKind.AeadAes128Gcm,
         "SRTP_AEAD_AES_128_GCM",
         masterKeyLength: 16,
+        masterSaltLength: 12,
+        sessionSaltLength: 12,
+        authKeyLength: 0,
+        tagLength: 16);
+
+    /// <summary>
+    /// <c>SRTP_AEAD_AES_256_GCM</c>: 256-bit master key, 96-bit master salt, 128-bit AEAD tag
+    /// (RFC 7714 Section 12, Table 2). Identical to <see cref="AeadAes128Gcm"/> except for the
+    /// wider key.
+    /// </summary>
+    public static SrtpProtectionProfile AeadAes256Gcm { get; } = new(
+        SrtpProtectionProfileKind.AeadAes256Gcm,
+        "SRTP_AEAD_AES_256_GCM",
+        masterKeyLength: 32,
         masterSaltLength: 12,
         sessionSaltLength: 12,
         authKeyLength: 0,
@@ -112,7 +155,9 @@ public sealed class SrtpProtectionProfile
     public static SrtpProtectionProfile ForKind(SrtpProtectionProfileKind kind) => kind switch
     {
         SrtpProtectionProfileKind.Aes128CmHmacSha1_80 => Aes128CmHmacSha1_80,
+        SrtpProtectionProfileKind.Aes128CmHmacSha1_32 => Aes128CmHmacSha1_32,
         SrtpProtectionProfileKind.AeadAes128Gcm => AeadAes128Gcm,
+        SrtpProtectionProfileKind.AeadAes256Gcm => AeadAes256Gcm,
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unsupported SRTP protection profile."),
     };
 
