@@ -6,19 +6,21 @@ namespace Keryx.IntegrationTests;
 
 /// <summary>
 /// <see cref="PeerConnection.CreateAnswerAsync"/> must negotiate the answered <c>a=</c> direction
-/// attribute from the offered direction rather than hardcoding <c>recvonly</c>. Keryx does
-/// not send media as an answerer, so its local capability is receive-only; these tests pin down what
-/// <see cref="SdpDirection.Negotiate"/> returns for that capability against each of the four offered
-/// directions, matching RFC 3264 §6.1's answer rules.
+/// attribute from the offered direction rather than hardcoding <c>recvonly</c>. Keryx answers as a
+/// sender only when the offer is <c>recvonly</c> — the SFU subscriber shape, where a viewer offers
+/// recvonly and Keryx answers sendonly and forwards media on its own SSRC; for every other offered
+/// direction its local capability stays receive-only. These tests pin down what
+/// <see cref="SdpDirection.Negotiate"/> returns against each of the four offered directions, matching
+/// RFC 3264 §6.1's answer rules.
 /// </summary>
 public sealed class AnswererDirectionNegotiationTests
 {
     [Theory]
-    [InlineData("sendrecv", "recvonly")] // offerer will send and receive; Keryx can only receive.
+    [InlineData("sendrecv", "recvonly")] // offerer will send and receive; Keryx only receives.
     [InlineData("sendonly", "recvonly")] // offerer only sends; Keryx receives it.
-    [InlineData("recvonly", "inactive")] // offerer wants Keryx to send, which Keryx cannot do.
+    [InlineData("recvonly", "sendonly")] // offerer only receives; Keryx answers as the sender.
     [InlineData("inactive", "inactive")] // neither side transmits.
-    public async Task AnswersTheDirectionRfc3264DemandsForAReceiveOnlyAnswerer(
+    public async Task AnswersTheDirectionRfc3264Demands(
         string offeredDirection,
         string expectedAnsweredDirection)
     {

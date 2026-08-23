@@ -104,6 +104,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _videoRtxSsrc = NewSsrc();
         _audioSsrc = NewSsrc();
         _rtcpSenderSsrc = NewSsrc();
+        _videoForwarder = new RtpForwarderHandle(this, MediaKind.Video);
+        _audioForwarder = new RtpForwarderHandle(this, MediaKind.Audio);
 
         if (_config.EnableCongestionControl)
         {
@@ -361,14 +363,15 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <param name="cancellationToken">Cancels gathering.</param>
     /// <returns>The answer, ready to hand to signalling.</returns>
     /// <remarks>
-    /// The answerer path is deliberately minimal: it mirrors the offer's m-sections and negotiates
-    /// each answered direction from a receive-only local capability, since Keryx does not send media
-    /// as an answerer — a <c>sendrecv</c> or <c>sendonly</c> offer answers <c>recvonly</c>, a
-    /// <c>recvonly</c> offer (which would require this endpoint to send) answers <c>inactive</c>, and
-    /// an <c>inactive</c> offer stays <c>inactive</c>. It also answers <c>a=setup:active</c>, so this
-    /// endpoint becomes the DTLS client and therefore the SCTP initiator using even stream
-    /// identifiers. It exists so a Keryx-to-Keryx loopback can prove the whole stack; the offerer path
-    /// is the supported production shape.
+    /// The answerer mirrors the offer's m-sections and negotiates each answered direction from the
+    /// offered one: a <c>sendrecv</c> or <c>sendonly</c> offer answers <c>recvonly</c> and an
+    /// <c>inactive</c> offer stays <c>inactive</c>, while a <c>recvonly</c> offer — the SFU subscriber
+    /// shape, where a viewer only wants to receive — answers <c>sendonly</c> and wires a real send
+    /// track (local SSRC, SRTP-protected sender, pacer and RFC 4588 repair stream), so
+    /// <see cref="SendVideoFrame"/>, <see cref="TryForwardRtp"/> and the introspection accessors all
+    /// light up on the answerer just as they do on the offerer. It also answers <c>a=setup:active</c>,
+    /// so this endpoint becomes the DTLS client and therefore the SCTP initiator using even stream
+    /// identifiers.
     /// </remarks>
     /// <exception cref="InvalidOperationException">No remote offer has been applied.</exception>
     public async Task<string> CreateAnswerAsync(CancellationToken cancellationToken = default)
@@ -956,6 +959,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
             TrickleIce = true,
         };
 
+        // The transport-wide sequence number the send path stamps is shared across the BUNDLE; the
+        // first sending section that echoed the extension fixes its id for the whole connection.
+        byte? answerSendTransportCcId = null;
+
         for (var i = 0; i < offer.MediaDescriptions.Count; i++)
         {
             var offered = offer.MediaDescriptions[i];
@@ -969,13 +976,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 continue;
             }
 
-            // Keryx does not yet send media as an answerer, so the local capability is receive-only.
-            // Negotiate it against the offered direction rather than hardcoding recvonly: a sendrecv or
-            // sendonly offer still answers recvonly, but a recvonly offer (which asks this endpoint to
-            // send) correctly answers inactive instead of the nonsensical recvonly/recvonly pairing.
+            // Keryx answers as a sender when — and only when — the offer is recvonly, i.e. the peer
+            // asked this endpoint to send and to receive nothing back. That is the SFU subscriber shape:
+            // a viewer offers recvonly and Keryx (the subscriber PeerConnection) answers sendonly and
+            // forwards media on its own SSRC. For every other offered direction the local capability
+            // stays receive-only, so a sendrecv or sendonly offer still answers recvonly and an inactive
+            // offer stays inactive — the media-server-receiving-from-browsers shape is unchanged.
+            var offeredDirection = offered.DirectionOrDefault;
+            var localCapability = offeredDirection == MediaDirection.RecvOnly
+                ? MediaDirection.SendRecv
+                : MediaDirection.RecvOnly;
+            var negotiatedDirection = SdpDirection.Negotiate(localCapability, offeredDirection);
             var section = new SdpMediaOffer(mid, offered.Media, offered.Protocol)
             {
-                Direction = SdpDirection.Negotiate(MediaDirection.RecvOnly, offered.DirectionOrDefault),
+                Direction = negotiatedDirection,
                 RtcpMux = offered.RtcpMux,
             };
 
@@ -1072,9 +1086,72 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 section.Simulcast = simulcast.Simulcast;
             }
 
+            // When the negotiated direction has this endpoint sending (a recvonly offer answered
+            // sendonly), wire the send track the driver builds in CreateTrackSenders: pick the primary
+            // codec — and its RFC 4588 rtx repair codec, if the answer kept one — record it as the
+            // negotiated track so the introspection accessors and TryForwardRtp resolve, and publish
+            // this connection's send SSRC (plus the FID repair SSRC) so the peer can correlate the
+            // stream it is about to receive.
+            if (negotiatedDirection.Sends() && section.Port != 0)
+            {
+                var kind = ToMediaKind(offered.Media);
+                var primary = section.Codecs.FirstOrDefault(c => !c.IsRtx);
+                if (kind is MediaKind.Video or MediaKind.Audio && primary is not null)
+                {
+                    byte? rtxPayloadType = null;
+                    if (kind == MediaKind.Video)
+                    {
+                        var rtx = section.Codecs.FirstOrDefault(c =>
+                            c.IsRtx && AssociatedPayloadType(c.Fmtp) == primary.PayloadType);
+                        if (rtx is not null && rtx.PayloadType is >= 0 and <= 127)
+                        {
+                            rtxPayloadType = (byte)rtx.PayloadType;
+                        }
+                    }
+
+                    var sendSsrc = kind == MediaKind.Video ? _videoSsrc : _audioSsrc;
+                    section.TrackId = kind == MediaKind.Video ? _videoTrackId : _audioTrackId;
+                    section.Ssrcs.Add(sendSsrc);
+                    if (rtxPayloadType is not null)
+                    {
+                        // RFC 5576 §4.2: FID binds the media source to the repair source that carries
+                        // its retransmissions; both publish the same cname, which the builder writes.
+                        section.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sendSsrc, _videoRtxSsrc]));
+                        section.Ssrcs.Add(_videoRtxSsrc);
+                    }
+
+                    var track = new NegotiatedTrack(
+                        mid,
+                        (byte)primary.PayloadType,
+                        (uint)primary.ClockRate,
+                        rtxPayloadType);
+                    if (kind == MediaKind.Video)
+                    {
+                        _negotiatedVideo = track;
+                    }
+                    else
+                    {
+                        _negotiatedAudio = track;
+                    }
+
+                    if (_config.EnableTransportWideCc && answerSendTransportCcId is null)
+                    {
+                        foreach (var extMap in section.HeaderExtensions)
+                        {
+                            if (extMap.IsTransportWideCc && extMap.Id is >= 1 and <= 14)
+                            {
+                                answerSendTransportCcId = (byte)extMap.Id;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             builder.AddMedia(section);
         }
 
+        _sendTransportCcExtensionId = answerSendTransportCcId;
         return builder.Build();
     }
 

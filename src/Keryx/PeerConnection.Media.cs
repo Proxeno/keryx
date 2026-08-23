@@ -37,6 +37,12 @@ public sealed partial class PeerConnection
     private TrackSender? _audioTrack;
     private NegotiatedTrack? _negotiatedVideo;
     private NegotiatedTrack? _negotiatedAudio;
+
+    // Stable per-kind forwarder handles, wired to the send track through the owner's locked forward
+    // path. Created once in the constructor so GetForwarder is total and allocation-free; they return
+    // false until the corresponding send track is negotiated.
+    private RtpForwarderHandle _videoForwarder = null!;
+    private RtpForwarderHandle _audioForwarder = null!;
     private Dictionary<byte, RtpRoute> _routes = [];
     private Dictionary<string, SimulcastReceiveTracker> _simulcastByMid = new(StringComparer.Ordinal);
 
@@ -144,6 +150,96 @@ public sealed partial class PeerConnection
             return track.SendFrame(opusPacket, rtpTimestamp48k);
         }
     }
+
+    /// <summary>
+    /// Forwards one already-packetized RTP payload verbatim onto this connection's send track for
+    /// <paramref name="kind"/>, on the SSRC and sequence space this connection owns for that kind. This
+    /// is the subscriber-egress path an SFU gateway drives once this connection has negotiated a
+    /// sending track as an answerer (or offerer).
+    /// </summary>
+    /// <param name="kind">The media kind to forward on; only <see cref="MediaKind.Video"/> and
+    /// <see cref="MediaKind.Audio"/> can send.</param>
+    /// <param name="payload">
+    /// The RTP payload, already codec-packetized upstream. It is written into the RTP payload
+    /// <em>verbatim</em> — Keryx never re-packetizes it.
+    /// </param>
+    /// <param name="rtpTimestamp">
+    /// The RTP timestamp to stamp on the packet. The value is used as-is (the broadcaster's timestamp,
+    /// forwarded unchanged on this subscriber's SSRC), so a fan-out keeps every subscriber's timeline
+    /// aligned to the source.
+    /// </param>
+    /// <param name="marker">The marker bit to set.</param>
+    /// <param name="payloadType">The payload type this subscriber negotiated for <paramref name="kind"/>.</param>
+    /// <returns>
+    /// True when the packet was assembled, protected and handed to the send path. False — never an
+    /// exception — when the connection is not <see cref="PeerConnectionState.Connected"/>, has no
+    /// negotiated send track for <paramref name="kind"/>, is closing, or the payload will not fit the
+    /// negotiated MTU. A false return lets one dead subscriber never break a fan-out loop.
+    /// </returns>
+    /// <remarks>
+    /// Keryx assigns the SSRC (the local send SSRC for <paramref name="kind"/>) and a monotonic
+    /// sequence number, and records the emitted packet in the per-subscriber send history keyed by that
+    /// sequence number. When RFC 4588 retransmission was negotiated, an inbound NACK is therefore
+    /// served as an RTX repair automatically. Safe to call from any thread; serialises internally on
+    /// the same send lock as <see cref="SendVideoFrame"/>.
+    /// </remarks>
+    public bool TryForwardRtp(
+        MediaKind kind,
+        ReadOnlySpan<byte> payload,
+        uint rtpTimestamp,
+        bool marker,
+        byte payloadType)
+    {
+        var track = kind switch
+        {
+            MediaKind.Video => _videoTrack,
+            MediaKind.Audio => _audioTrack,
+            _ => null,
+        };
+
+        if (track is null || State != PeerConnectionState.Connected)
+        {
+            return false;
+        }
+
+        lock (_sendLock)
+        {
+            if (_srtp is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return track.ForwardRtp(payload, rtpTimestamp, marker, payloadType);
+            }
+            catch (Exception ex)
+            {
+                // TryForwardRtp is contractually total: a transient send-path failure (a torn-down
+                // transport, an SRTP index-guard race) must surface as false, never as a throw that
+                // could unwind a subscriber fan-out loop.
+                _logger.Log(KeryxLogLevel.Warning, "Dropping a forwarded RTP packet after a send failure.", ex);
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The forwarder handle for <paramref name="kind"/>'s send track, for a consumer that prefers to
+    /// hold it in a hot fan-out loop rather than call <see cref="TryForwardRtp"/> with the kind each
+    /// time. The handle is stable for the connection's lifetime and reaches the same wire path; before
+    /// a send track is negotiated its <see cref="IRtpForwarder.TryForwardRtp"/> simply returns false.
+    /// </summary>
+    /// <param name="kind">The media kind; only <see cref="MediaKind.Video"/> and
+    /// <see cref="MediaKind.Audio"/> can send.</param>
+    /// <returns>The forwarder for <paramref name="kind"/>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="kind"/> is not audio or video.</exception>
+    public IRtpForwarder GetForwarder(MediaKind kind) => kind switch
+    {
+        MediaKind.Video => _videoForwarder,
+        MediaKind.Audio => _audioForwarder,
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Only audio and video can be forwarded."),
+    };
 
     /// <summary>
     /// The <c>rtx</c> payload type the answer settled on for video, or <see langword="null"/> when the
@@ -1315,6 +1411,21 @@ public sealed partial class PeerConnection
         _congestionController?.OnPacketSent(transportSequenceNumber, SendTimestampMicroseconds(), sizeBytes);
 
     /// <summary>
+    /// A stable, per-kind implementation of <see cref="IRtpForwarder"/> that delegates to the owner's
+    /// locked forward path. Holds no state of its own, so it is valid before the send track exists —
+    /// <see cref="TryForwardRtp"/> simply returns false until then.
+    /// </summary>
+    private sealed class RtpForwarderHandle(PeerConnection owner, MediaKind kind) : IRtpForwarder
+    {
+        public MediaKind Kind => kind;
+
+        public uint Ssrc => owner.GetLocalSsrc(kind);
+
+        public bool TryForwardRtp(ReadOnlySpan<byte> payload, uint rtpTimestamp, bool marker, byte payloadType) =>
+            owner.TryForwardRtp(kind, payload, rtpTimestamp, marker, payloadType);
+    }
+
+    /// <summary>
     /// One outbound RTP stream: the payloadizer, the sequence/timestamp state, and a single reusable
     /// datagram buffer that the payloadizer fills in place and SRTP encrypts in place. When RFC 4588
     /// retransmission is negotiated it also owns the repair stream and a second buffer for it.
@@ -1379,7 +1490,45 @@ public sealed partial class PeerConnection
             // The payload already sits at the offset the RTP header (fixed part plus any stamped
             // extension) will end at, so WritePacket's copy is a no-op self-copy and the packet is
             // assembled without a second buffer.
-            var payload = _buffer.AsSpan(_headerReserve, length);
+            EmitPacket(_buffer.AsSpan(_headerReserve, length), marker, _timestamp);
+        }
+
+        /// <summary>
+        /// Forwards one already-packetized RTP payload verbatim onto this send track: the track's
+        /// owned SSRC, the next monotonic sequence number, the supplied timestamp, marker bit and
+        /// payload type. The payload is never re-packetized. The emitted packet is recorded in the
+        /// send history keyed by its outbound sequence number, so an inbound NACK is served as an
+        /// RFC 4588 RTX repair by the same path <see cref="Retransmit"/> drives. Called under the
+        /// owner's send lock, exactly like <see cref="SendFrame"/>. Never throws.
+        /// </summary>
+        /// <param name="payload">The RTP payload, written verbatim.</param>
+        /// <param name="timestamp">The RTP timestamp to stamp on the packet.</param>
+        /// <param name="marker">The marker bit.</param>
+        /// <param name="payloadType">The payload type to stamp; the subscriber's negotiated type.</param>
+        /// <returns>True when the packet was assembled and handed to the send path; false when the
+        /// payload cannot fit the negotiated MTU.</returns>
+        internal bool ForwardRtp(ReadOnlySpan<byte> payload, uint timestamp, bool marker, byte payloadType)
+        {
+            if (payload.Length > _maxPayload)
+            {
+                // A single packet that will not fit the negotiated MTU is dropped rather than
+                // fragmented — the upstream already chose the packetization, and re-splitting it
+                // would corrupt the codec framing.
+                return false;
+            }
+
+            // The forwarder owns the wire format: stamp the subscriber's negotiated payload type and
+            // publish the rebased timestamp so this track's sender reports describe what it emitted.
+            Stream.PayloadType = payloadType;
+            Stream.Timestamp = timestamp;
+            _timestamp = timestamp;
+            EmitPacket(payload, marker, timestamp);
+            _frames++;
+            return true;
+        }
+
+        private void EmitPacket(ReadOnlySpan<byte> payload, bool marker, uint timestamp)
+        {
             int packetLength;
             ushort transportSequenceNumber = 0;
             var stamped = false;
@@ -1392,14 +1541,14 @@ public sealed partial class PeerConnection
                 packetLength = Stream.WritePacket(
                     payload,
                     marker,
-                    _timestamp,
+                    timestamp,
                     RtpHeaderExtension.OneByteProfile,
                     extensionBody,
                     _buffer);
             }
             else
             {
-                packetLength = Stream.WritePacket(payload, marker, _timestamp, _buffer);
+                packetLength = Stream.WritePacket(payload, marker, timestamp, _buffer);
             }
 
             // Capture the plaintext before SRTP encrypts the same buffer in place.
@@ -1412,7 +1561,7 @@ public sealed partial class PeerConnection
 
             _owner.SendRtp(_buffer, packetLength);
             _packets++;
-            _bytes += length;
+            _bytes += payload.Length;
         }
 
         internal int SendFrame(ReadOnlySpan<byte> frame, uint timestamp)
