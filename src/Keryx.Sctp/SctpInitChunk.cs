@@ -58,6 +58,12 @@ public sealed class SctpInitChunk : SctpChunk
     /// </summary>
     public bool ReconfigSupported => SupportsExtension(SctpChunkType.ReConfig);
 
+    /// <summary>
+    /// True when the peer advertised RFC 8260 user-message interleaving by listing I-DATA in the
+    /// Supported Extensions parameter (0x8008).
+    /// </summary>
+    public bool InterleavingSupported => SupportsExtension(SctpChunkType.IData);
+
     /// <summary>Returns whether the Supported Extensions parameter lists the given chunk type.</summary>
     /// <param name="chunkType">Chunk type to look for.</param>
     /// <returns>True when the chunk type appears in the Supported Extensions parameter.</returns>

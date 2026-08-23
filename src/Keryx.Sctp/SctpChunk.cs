@@ -72,6 +72,7 @@ public abstract class SctpChunk
         SctpChunk chunk = (SctpChunkType)type switch
         {
             SctpChunkType.Data => SctpDataChunk.ParseBody(flags, body),
+            SctpChunkType.IData => SctpIDataChunk.ParseBody(flags, body),
             SctpChunkType.Init => SctpInitChunk.ParseBody(SctpChunkType.Init, body),
             SctpChunkType.InitAck => SctpInitChunk.ParseBody(SctpChunkType.InitAck, body),
             SctpChunkType.Sack => SctpSackChunk.ParseBody(body),

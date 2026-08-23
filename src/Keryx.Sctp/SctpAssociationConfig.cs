@@ -31,6 +31,14 @@ public sealed class SctpAssociationConfig
     /// <summary>Largest user message, in bytes, that may be sent or reassembled.</summary>
     public uint MaxMessageSize { get; set; } = 262144;
 
+    /// <summary>
+    /// When true (the default) this endpoint advertises RFC 8260 user-message interleaving (I-DATA)
+    /// in its INIT/INIT ACK and uses it whenever the peer also advertises it, so a large message on
+    /// one stream cannot head-of-line-block small messages on others. When false, or when the peer
+    /// does not advertise I-DATA, data travels as classic DATA chunks.
+    /// </summary>
+    public bool EnableInterleaving { get; set; } = true;
+
     /// <summary>Destination for diagnostics.</summary>
     public IKeryxLogger Logger { get; set; } = NullLogger.Instance;
 
