@@ -639,10 +639,11 @@ public sealed partial class PeerConnection
             // through SendRtp, and the drain re-encrypts and emits under _sendLock. A single MTU is the
             // floor so a lone large packet is never wedged behind an empty budget.
             _pacedSender = new PacedRtpSender(
-                this,
                 new PacketPacer(controller.TargetBitrateBitsPerSecond, _time),
                 _time,
-                profile.RtpOverhead);
+                profile.RtpOverhead,
+                SendProtectedRtpLocked,
+                _logger);
         }
     }
 
@@ -1350,29 +1351,41 @@ public sealed partial class PeerConnection
     /// <remarks>
     /// The send path already holds <see cref="_sendLock"/> when it calls <see cref="Enqueue"/>, and
     /// <see cref="Enqueue"/> only ever also takes <c>_gate</c>. The drain takes <c>_gate</c> to pull the
-    /// packets the budget admits, releases it, and only then takes <see cref="_sendLock"/> to send — so
-    /// the two locks are never held at once on the drain path and the orderings cannot deadlock.
+    /// packets the budget admits, releases it, and only then invokes <c>_send</c> (which takes
+    /// <see cref="_sendLock"/>) — so <c>_gate</c> and <see cref="_sendLock"/> are never held at once on
+    /// the drain path and the orderings cannot deadlock. A separate <c>_drainLock</c> serialises whole
+    /// drains so two timer callbacks can never interleave their sends: without it a callback that
+    /// emptied the queue could race a freshly scheduled one for <see cref="_sendLock"/> and protect a
+    /// later packet before an earlier one, which the SRTP index guard (RFC 3711 §9.1) rejects.
     /// </remarks>
-    private sealed class PacedRtpSender : IDisposable
+    internal sealed class PacedRtpSender : IDisposable
     {
         private static readonly TimeSpan MinDrainInterval = TimeSpan.FromMilliseconds(1);
 
-        private readonly PeerConnection _owner;
         private readonly PacketPacer _pacer;
         private readonly TimeProvider _time;
         private readonly int _srtpOverhead;
+        private readonly Action<byte[], int> _send;
+        private readonly IKeryxLogger _logger;
         private readonly object _gate = new();
+        private readonly object _drainLock = new();
         private readonly Queue<QueuedPacket> _queue = new();
         private ITimer? _timer;
         private bool _timerArmed;
         private bool _disposed;
 
-        internal PacedRtpSender(PeerConnection owner, PacketPacer pacer, TimeProvider time, int srtpOverhead)
+        internal PacedRtpSender(
+            PacketPacer pacer,
+            TimeProvider time,
+            int srtpOverhead,
+            Action<byte[], int> send,
+            IKeryxLogger logger)
         {
-            _owner = owner;
             _pacer = pacer;
             _time = time;
             _srtpOverhead = srtpOverhead;
+            _send = send;
+            _logger = logger;
             _timer = _time.CreateTimer(_ => Drain(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         }
 
@@ -1417,6 +1430,26 @@ public sealed partial class PeerConnection
 
         private void Drain()
         {
+            // _drainLock serialises whole drains so a callback scheduled while this one is still
+            // sending cannot reorder its packets ahead of ours (see the class remarks).
+            lock (_drainLock)
+            {
+                try
+                {
+                    DrainOnce();
+                }
+                catch (Exception ex)
+                {
+                    // Nothing may escape a timer callback: an unhandled throw on the thread-pool
+                    // thread would fault the host process. The per-packet handling below already
+                    // absorbs send failures; this is the final safety net for anything else.
+                    _logger.Log(KeryxLogLevel.Error, "The paced RTP drain failed unexpectedly.", ex);
+                }
+            }
+        }
+
+        private void DrainOnce()
+        {
             List<QueuedPacket>? ready = null;
             var wait = Timeout.InfiniteTimeSpan;
             lock (_gate)
@@ -1445,20 +1478,34 @@ public sealed partial class PeerConnection
                 {
                     _timerArmed = true;
                 }
-            }
 
-            if (ready is not null)
-            {
-                foreach (var packet in ready)
+                if (wait != Timeout.InfiniteTimeSpan)
                 {
-                    _owner.SendProtectedRtpLocked(packet.Buffer, packet.Length);
+                    // Re-arm under _gate, where the timer is guaranteed live (Dispose can only run
+                    // between critical sections), so a teardown race cannot fault Change. A zero or
+                    // negative wait would spin the timer hot; hold it to a 1 ms floor.
+                    _timer?.Change(wait < MinDrainInterval ? MinDrainInterval : wait, Timeout.InfiniteTimeSpan);
                 }
             }
 
-            if (wait != Timeout.InfiniteTimeSpan)
+            if (ready is null)
             {
-                // A zero or negative wait would spin the timer hot; hold it to a 1 ms floor.
-                _timer?.Change(wait < MinDrainInterval ? MinDrainInterval : wait, Timeout.InfiniteTimeSpan);
+                return;
+            }
+
+            foreach (var packet in ready)
+            {
+                try
+                {
+                    _send(packet.Buffer, packet.Length);
+                }
+                catch (Exception ex)
+                {
+                    // A send can throw transiently — most notably the SRTP index guard refusing a
+                    // reused index (RFC 3711 §9.1) during a teardown/reset race. Drop this packet
+                    // and keep draining the rest rather than crashing the host; RTP tolerates loss.
+                    _logger.Log(KeryxLogLevel.Warning, "Dropping a paced RTP packet after a send failure.", ex);
+                }
             }
         }
 
