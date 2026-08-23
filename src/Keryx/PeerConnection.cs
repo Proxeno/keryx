@@ -361,11 +361,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <param name="cancellationToken">Cancels gathering.</param>
     /// <returns>The answer, ready to hand to signalling.</returns>
     /// <remarks>
-    /// The answerer path is deliberately minimal: it mirrors the offer's m-sections, answers
-    /// <c>recvonly</c> on every media section (Keryx does not send media as an answerer) and
-    /// <c>a=setup:active</c>, so this endpoint becomes the DTLS client and therefore the SCTP
-    /// initiator using even stream identifiers. It exists so a Keryx-to-Keryx loopback can prove the
-    /// whole stack; the offerer path is the supported production shape.
+    /// The answerer path is deliberately minimal: it mirrors the offer's m-sections and negotiates
+    /// each answered direction from a receive-only local capability, since Keryx does not send media
+    /// as an answerer — a <c>sendrecv</c> or <c>sendonly</c> offer answers <c>recvonly</c>, a
+    /// <c>recvonly</c> offer (which would require this endpoint to send) answers <c>inactive</c>, and
+    /// an <c>inactive</c> offer stays <c>inactive</c>. It also answers <c>a=setup:active</c>, so this
+    /// endpoint becomes the DTLS client and therefore the SCTP initiator using even stream
+    /// identifiers. It exists so a Keryx-to-Keryx loopback can prove the whole stack; the offerer path
+    /// is the supported production shape.
     /// </remarks>
     /// <exception cref="InvalidOperationException">No remote offer has been applied.</exception>
     public async Task<string> CreateAnswerAsync(CancellationToken cancellationToken = default)
@@ -966,9 +969,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 continue;
             }
 
+            // Keryx does not yet send media as an answerer, so the local capability is receive-only.
+            // Negotiate it against the offered direction rather than hardcoding recvonly: a sendrecv or
+            // sendonly offer still answers recvonly, but a recvonly offer (which asks this endpoint to
+            // send) correctly answers inactive instead of the nonsensical recvonly/recvonly pairing.
             var section = new SdpMediaOffer(mid, offered.Media, offered.Protocol)
             {
-                Direction = MediaDirection.RecvOnly,
+                Direction = SdpDirection.Negotiate(MediaDirection.RecvOnly, offered.DirectionOrDefault),
                 RtcpMux = offered.RtcpMux,
             };
 
