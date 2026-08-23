@@ -45,4 +45,47 @@ public class RtpStreamIdentifierTests
         // Element id 0 means the RID extension was not negotiated.
         RtpStreamIdentifier.TryGetRid(header, 0, out _).Should().BeFalse();
     }
+
+    [Fact]
+    public void TryGetMid_and_TryGetRid_read_correctly_under_two_byte_encoding()
+    {
+        // A browser emits the two-byte (0x1000) profile for the whole extension block when any single
+        // element in it needs one — here an unrelated, densely negotiated extension (id 20, standing in
+        // for something like abs-capture-time) forces it even though MID and RID are both short.
+        const byte midId = SimulcastTestPackets.MidId;
+        const byte ridId = SimulcastTestPackets.RidId;
+        const byte otherId = 20;
+
+        Span<byte> scratch = stackalloc byte[64];
+        var writer = new RtpTwoByteExtensionWriter(scratch);
+        writer.TryAppend(midId, "0"u8).Should().BeTrue();
+        writer.TryAppend(ridId, "high"u8).Should().BeTrue();
+        writer.TryAppend(otherId, [0xDE, 0xAD, 0xBE, 0xEF]).Should().BeTrue();
+        var length = writer.Finish();
+
+        var header = new RtpHeader
+        {
+            Version = 2,
+            PayloadType = 96,
+            SequenceNumber = 1,
+            Timestamp = 1000,
+            Ssrc = 0x5555,
+            HasExtension = true,
+            ExtensionProfile = RtpHeaderExtension.TwoByteProfile,
+            ExtensionData = scratch[..length],
+        };
+
+        Span<byte> packet = stackalloc byte[96];
+        var written = header.WriteTo(packet);
+        RtpHeader.TryParse(packet[..written], out var parsed).Should().BeTrue();
+
+        RtpStreamIdentifier.TryGetMid(parsed, midId, out var mid).Should().BeTrue();
+        mid.ToArray().Should().Equal("0"u8.ToArray());
+
+        RtpStreamIdentifier.TryGetRid(parsed, ridId, out var rid).Should().BeTrue();
+        rid.ToString().Should().Be("high");
+
+        parsed.TryGetExtension(otherId, out var other).Should().BeTrue();
+        other.ToArray().Should().Equal(0xDE, 0xAD, 0xBE, 0xEF);
+    }
 }

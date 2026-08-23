@@ -70,7 +70,8 @@ public ref struct RtpHeader
 
     /// <summary>
     /// Profile-defined header-extension identifier, valid when <see cref="HasExtension"/> is set.
-    /// See <see cref="RtpHeaderExtension.OneByteProfile"/> for the RFC 8285 one-byte form.
+    /// See <see cref="RtpHeaderExtension.OneByteProfile"/> and <see cref="RtpHeaderExtension.TwoByteProfile"/>
+    /// for the RFC 8285 one-byte and two-byte forms.
     /// </summary>
     public ushort ExtensionProfile { get; set; }
 
@@ -122,20 +123,33 @@ public ref struct RtpHeader
     }
 
     /// <summary>
-    /// Enumerates the RFC 8285 one-byte-header extension elements carried by this header. The
-    /// enumeration is empty unless <see cref="HasExtension"/> is set and <see cref="ExtensionProfile"/>
-    /// equals <see cref="RtpHeaderExtension.OneByteProfile"/>.
+    /// Enumerates the RFC 8285 header-extension elements carried by this header, whichever of the
+    /// one-byte (§4.2) or two-byte (§4.3) forms <see cref="ExtensionProfile"/> selects. The enumeration
+    /// is empty unless <see cref="HasExtension"/> is set and the profile is
+    /// <see cref="RtpHeaderExtension.OneByteProfile"/> or matches
+    /// <see cref="RtpHeaderExtension.IsTwoByteProfile"/>.
     /// </summary>
     /// <returns>An allocation-free enumerator usable directly in <see langword="foreach"/>.</returns>
-    public readonly RtpOneByteExtensionEnumerator GetExtensionElements() =>
-        HasExtension && ExtensionProfile == RtpHeaderExtension.OneByteProfile
-            ? new RtpOneByteExtensionEnumerator(ExtensionData)
-            : new RtpOneByteExtensionEnumerator(default);
+    public readonly RtpExtensionElementEnumerator GetExtensionElements()
+    {
+        if (HasExtension && ExtensionProfile == RtpHeaderExtension.OneByteProfile)
+        {
+            return new RtpExtensionElementEnumerator(ExtensionData, isTwoByte: false);
+        }
+
+        if (HasExtension && RtpHeaderExtension.IsTwoByteProfile(ExtensionProfile))
+        {
+            return new RtpExtensionElementEnumerator(ExtensionData, isTwoByte: true);
+        }
+
+        return new RtpExtensionElementEnumerator(default, isTwoByte: false);
+    }
 
     /// <summary>
-    /// Finds the first RFC 8285 one-byte-header extension element with the given negotiated identifier.
+    /// Finds the first RFC 8285 header-extension element with the given negotiated identifier, under
+    /// whichever of the one-byte or two-byte forms this header carries.
     /// </summary>
-    /// <param name="id">The extension element identifier (1–14) negotiated via <c>a=extmap</c>.</param>
+    /// <param name="id">The extension element identifier negotiated via <c>a=extmap</c>.</param>
     /// <param name="data">On success, the element body.</param>
     /// <returns><see langword="true"/> when an element with that identifier is present.</returns>
     public readonly bool TryGetExtension(byte id, out ReadOnlySpan<byte> data)
