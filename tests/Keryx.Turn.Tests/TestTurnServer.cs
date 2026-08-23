@@ -86,6 +86,19 @@ internal sealed class TestTurnServer : IDisposable
     /// <summary>When positive, every authenticated Allocate is refused with this error code.</summary>
     public int RefuseAllocationsWith { get; set; }
 
+    /// <summary>
+    /// True to always grant an IPv4 relay regardless of what REQUESTED-ADDRESS-FAMILY asked for - a
+    /// double for a server that mishandles RFC 8656 section 18.6, so a test can prove the client
+    /// notices a family it did not ask for.
+    /// </summary>
+    public bool IgnoreRequestedAddressFamily { get; set; }
+
+    /// <summary>
+    /// The REQUESTED-ADDRESS-FAMILY the last Allocate carried, or null when the request carried
+    /// none at all (RFC 8656 section 18.6).
+    /// </summary>
+    public AddressFamily? LastAllocateRequestedFamily { get; private set; }
+
     /// <summary>The relayed transport address handed out by the last Allocate, if any.</summary>
     public IPEndPoint? RelayedEndPoint
     {
@@ -311,6 +324,12 @@ internal sealed class TestTurnServer : IDisposable
     {
         Interlocked.Increment(ref AuthenticatedAllocates);
 
+        // RFC 8656 section 18.6: absent, the client gets the server's default (IPv4); present, the
+        // relayed address comes from the named family. Recorded so a test can assert on what the
+        // client actually put on the wire.
+        var requestedFamily = request.GetAttribute<StunRequestedAddressFamilyAttribute>()?.AddressFamily;
+        LastAllocateRequestedFamily = requestedFamily;
+
         if (RefuseAllocationsWith > 0)
         {
             Send(StunMessage.CreateErrorResponse(request, RefuseAllocationsWith, "Refused"), from, key, useSha256);
@@ -338,8 +357,10 @@ internal sealed class TestTurnServer : IDisposable
 
             if (_relay is null)
             {
-                var relay = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                relay.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                var relayFamily = IgnoreRequestedAddressFamily ? AddressFamily.InterNetwork : requestedFamily ?? AddressFamily.InterNetwork;
+                var relayAddress = relayFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
+                var relay = new Socket(relayFamily, SocketType.Dgram, ProtocolType.Udp);
+                relay.Bind(new IPEndPoint(relayAddress, 0));
                 _relay = relay;
                 _loops.Add(Task.Run(() => RelayLoopAsync(relay, _cts.Token)));
             }
@@ -466,7 +487,12 @@ internal sealed class TestTurnServer : IDisposable
     {
         var buffer = new byte[4096];
         var outbound = new byte[4096 + TurnChannelData.HeaderLength];
-        EndPoint any = new IPEndPoint(IPAddress.Any, 0);
+
+        // ReceiveFromAsync's remote-endpoint hint must share the socket's address family, so an
+        // IPv6 relay - RFC 8656 section 6.1 via REQUESTED-ADDRESS-FAMILY - needs IPv6Any here.
+        EndPoint any = relay.AddressFamily == AddressFamily.InterNetworkV6
+            ? new IPEndPoint(IPAddress.IPv6Any, 0)
+            : new IPEndPoint(IPAddress.Any, 0);
         while (!cancellationToken.IsCancellationRequested)
         {
             SocketReceiveFromResult result;
