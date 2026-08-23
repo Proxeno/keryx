@@ -1230,6 +1230,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
         string? ufrag = null;
         string? password = null;
         var routes = new Dictionary<byte, RtpRoute>();
+        var routesByMid = new Dictionary<string, Dictionary<byte, RtpRoute>>(StringComparer.Ordinal);
+        var ssrcToMid = new Dictionary<uint, string>();
+        byte midExtensionId = 0;
         var rtxToMedia = new Dictionary<uint, uint>();
 
         foreach (var media in offer.MediaDescriptions)
@@ -1237,6 +1240,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
             ufrag ??= media.IceUfrag ?? offer.IceUfrag;
             password ??= media.IcePwd ?? offer.IcePwd;
             CollectFidAssociations(media.GetSsrcGroups(), rtxToMedia);
+
+            // The MID extension is transport-wide across the BUNDLE (RFC 8843 §9.2); the first section
+            // that carries it fixes the element id the demux reads. Consumed only — Keryx does not offer
+            // the extension on its own SDP yet, so this is populated only when the remote offered it.
+            if (midExtensionId == 0)
+            {
+                midExtensionId = FindMidExtensionId(media.GetExtMaps());
+            }
 
             lock (_lock)
             {
@@ -1255,6 +1266,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
             var kind = ToMediaKind(media.Media);
             if (kind is MediaKind.Audio or MediaKind.Video)
             {
+                var mid = media.Mid ?? string.Empty;
+                var perMid = mid.Length != 0 ? GetOrAddMidRoutes(routesByMid, mid) : null;
                 var acceptable = kind == MediaKind.Video ? _config.VideoCodecs : _config.AudioCodecs;
                 foreach (var payloadType in media.GetPayloadTypes())
                 {
@@ -1276,12 +1289,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
                             && apt is >= 0 and <= 127
                             && routes.ContainsKey((byte)apt))
                         {
-                            routes[(byte)payloadType] = new RtpRoute(
-                                media.Mid ?? string.Empty,
+                            var rtxRoute = new RtpRoute(
+                                mid,
                                 kind,
                                 (uint)rtpMap.ClockRate,
                                 IsRtx: true,
                                 AptPayloadType: (byte)apt);
+                            routes[(byte)payloadType] = rtxRoute;
+                            perMid?.TryAdd((byte)payloadType, rtxRoute);
                         }
 
                         continue;
@@ -1293,7 +1308,19 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         continue;
                     }
 
-                    routes[(byte)payloadType] = new RtpRoute(media.Mid ?? string.Empty, kind, (uint)rtpMap.ClockRate);
+                    var route = new RtpRoute(mid, kind, (uint)rtpMap.ClockRate);
+                    routes[(byte)payloadType] = route;
+                    perMid?.TryAdd((byte)payloadType, route);
+                }
+
+                // Map every SSRC the section declares (media and RTX alike) to its mid, so a packet with
+                // no MID extension still demuxes deterministically to this section (RFC 5576).
+                if (mid.Length != 0)
+                {
+                    foreach (var ssrc in media.GetSsrcs())
+                    {
+                        ssrcToMid[ssrc] = mid;
+                    }
                 }
             }
 
@@ -1308,12 +1335,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
             ice.SetRemoteCredentials(ufrag, password);
         }
 
-        Volatile.Write(ref _routes, routes);
+        Volatile.Write(ref _routeTable, new RouteTable(routes, routesByMid, ssrcToMid, midExtensionId));
         Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);
         Volatile.Write(ref _simulcastByMid, BuildSimulcastTrackers(offer));
         _logger.Log(
             KeryxLogLevel.Info,
-            $"Applied remote offer; local DTLS role {LocalDtlsRole}, {routes.Count} inbound payload type(s).");
+            $"Applied remote offer; local DTLS role {LocalDtlsRole}, {routes.Count} inbound payload type(s),"
+            + $" mid extmap {(midExtensionId == 0 ? "none" : midExtensionId.ToString(CultureInfo.InvariantCulture))}.");
     }
 
     private Dictionary<string, SimulcastReceiveTracker> BuildSimulcastTrackers(SessionDescription offer)
@@ -1385,7 +1413,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
         string? ufrag = null;
         string? password = null;
         byte? transportCcExtensionId = null;
+        byte midExtensionId = 0;
         var routes = new Dictionary<byte, RtpRoute>();
+        var routesByMid = new Dictionary<string, Dictionary<byte, RtpRoute>>(StringComparer.Ordinal);
+        var ssrcToMid = new Dictionary<uint, string>();
         var rtxToMedia = new Dictionary<uint, uint>();
 
         foreach (var media in result.Media)
@@ -1406,6 +1437,15 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         break;
                     }
                 }
+            }
+
+            // The MID extension is likewise transport-wide; the first section that kept it fixes the
+            // demux element id. Populated only when the remote (answerer) kept it — Keryx does not yet
+            // offer the extension, so on the offerer path this is typically absent and demux falls to
+            // the SSRC map the answer's a=ssrc lines provide.
+            if (midExtensionId == 0)
+            {
+                midExtensionId = FindMidExtensionId(media.HeaderExtensions);
             }
 
             lock (_lock)
@@ -1433,6 +1473,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 continue;
             }
 
+            var mid = media.Mid ?? string.Empty;
+            var perMid = mid.Length != 0 ? GetOrAddMidRoutes(routesByMid, mid) : null;
+            if (mid.Length != 0)
+            {
+                foreach (var ssrc in media.Ssrcs)
+                {
+                    ssrcToMid[ssrc] = mid;
+                }
+            }
+
             var configured = kind == MediaKind.Video ? _config.VideoCodecs : _config.AudioCodecs;
             foreach (var codec in media.Codecs)
             {
@@ -1446,7 +1496,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     continue;
                 }
 
-                routes[(byte)codec.PayloadType] = new RtpRoute(media.Mid ?? string.Empty, kind, (uint)codec.ClockRate);
+                var route = new RtpRoute(mid, kind, (uint)codec.ClockRate);
+                routes[(byte)codec.PayloadType] = route;
+                perMid?.TryAdd((byte)codec.PayloadType, route);
             }
 
             var chosen = media.Codecs.FirstOrDefault(c =>
@@ -1470,12 +1522,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     if (rtx is not null && rtx.PayloadType is >= 0 and <= 127)
                     {
                         rtxPayloadType = (byte)rtx.PayloadType;
-                        routes[(byte)rtx.PayloadType] = new RtpRoute(
-                            media.Mid ?? string.Empty,
+                        var rtxRoute = new RtpRoute(
+                            mid,
                             kind,
                             (uint)rtx.ClockRate,
                             IsRtx: true,
                             AptPayloadType: (byte)chosen.PayloadType);
+                        routes[(byte)rtx.PayloadType] = rtxRoute;
+                        perMid?.TryAdd((byte)rtx.PayloadType, rtxRoute);
                     }
                     else
                     {
@@ -1505,7 +1559,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _sendTransportCcExtensionId = transportCcExtensionId;
         _negotiatedTransportCcExtensionId = transportCcExtensionId;
 
-        Volatile.Write(ref _routes, routes);
+        Volatile.Write(ref _routeTable, new RouteTable(routes, routesByMid, ssrcToMid, midExtensionId));
         Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);
         _logger.Log(
             KeryxLogLevel.Info,
@@ -1539,6 +1593,42 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Returns the negotiated one-byte element id of the RFC 8843 §9.2 MID header extension from a
+    /// section's <c>a=extmap</c> lines, or <c>0</c> when the section did not carry it. Only the one-byte
+    /// range (1–14) is accepted, matching the range the header parser reads.
+    /// </summary>
+    private static byte FindMidExtensionId(IReadOnlyList<SdpExtMap> extMaps)
+    {
+        foreach (var extMap in extMaps)
+        {
+            if (string.Equals(extMap.Uri, RtpHeaderExtensionUri.Mid, StringComparison.Ordinal)
+                && extMap.Id is >= 1 and <= 14)
+            {
+                return (byte)extMap.Id;
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Returns the per-mid payload-type route map for <paramref name="mid"/>, creating and registering
+    /// it on first use, so the mid-first demux can resolve a payload type within its own m-section.
+    /// </summary>
+    private static Dictionary<byte, RtpRoute> GetOrAddMidRoutes(
+        Dictionary<string, Dictionary<byte, RtpRoute>> byMid,
+        string mid)
+    {
+        if (!byMid.TryGetValue(mid, out var perMid))
+        {
+            perMid = [];
+            byMid[mid] = perMid;
+        }
+
+        return perMid;
+    }
+
     private static MediaKind ToMediaKind(string mediaType) => mediaType switch
     {
         "video" => MediaKind.Video,
@@ -1562,7 +1652,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// a repair stream, <paramref name="AptPayloadType"/> carries the media payload type its <c>apt</c>
     /// names, so a decapsulated packet can be routed back onto the media stream it reconstructs.
     /// </summary>
-    private readonly record struct RtpRoute(
+    internal readonly record struct RtpRoute(
         string Mid,
         MediaKind Kind,
         uint ClockRate = 0,
