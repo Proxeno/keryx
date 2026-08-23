@@ -104,22 +104,23 @@ public sealed class DataChannel
     }
 
     /// <summary>
-    /// Closes the channel locally.
+    /// Closes the channel.
     /// </summary>
     /// <remarks>
-    /// Keryx does not implement RFC 6525 stream reset, so this does not tear anything down on the
-    /// wire: the peer is not told and the stream identifier is not reused. It only stops local
-    /// delivery and raises <see cref="OnClosed"/>. See the library notes for the gap.
+    /// When the association negotiated RFC 6525 stream reconfiguration, this drives an outgoing
+    /// RE-CONFIG that resets the channel's SCTP stream on the wire once its data has been
+    /// acknowledged; <see cref="OnClosed"/> fires and the stream identifier is freed for reuse when
+    /// the peer's response arrives. Until then the channel reports <see cref="DataChannelState.Closing"/>.
+    /// When the peer did not negotiate RE-CONFIG the channel closes immediately without a wire reset.
     /// </remarks>
     public void Close()
     {
-        if (State is DataChannelState.Closed)
+        if (State is DataChannelState.Closed or DataChannelState.Closing)
         {
             return;
         }
 
-        State = DataChannelState.Closed;
-        RaiseClosed();
+        _association.CloseChannel(this);
     }
 
     internal void AddBuffered(long delta) => Interlocked.Add(ref _bufferedAmount, delta);

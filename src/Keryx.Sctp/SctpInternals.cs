@@ -67,6 +67,21 @@ internal sealed class OutgoingChunk
         new(Tsn, StreamId, StreamSequence, PayloadProtocolId, Payload, Beginning, Ending, Unordered);
 }
 
+/// <summary>An outgoing RFC 6525 RE-CONFIG request awaiting a Re-configuration Response.</summary>
+internal sealed class OutstandingReset
+{
+    internal required uint RequestSequence { get; init; }
+
+    /// <summary>The outgoing stream identifiers this request resets.</summary>
+    internal required List<ushort> Streams { get; init; }
+
+    /// <summary>The last TSN assigned when the request was built, echoed to the peer.</summary>
+    internal required uint SendersLastAssignedTsn { get; init; }
+
+    /// <summary>The response sequence number carried by the request.</summary>
+    internal required uint ResponseSequence { get; init; }
+}
+
 /// <summary>Per-stream ordered-delivery state on the receive side.</summary>
 internal sealed class ReceiveStream
 {

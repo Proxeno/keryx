@@ -49,31 +49,35 @@ public sealed class SctpInitChunk : SctpChunk
     /// Forward-TSN-Supported parameter (0xC000) or by listing FORWARD TSN in Supported Extensions
     /// (0x8008). Chrome sends both.
     /// </summary>
-    public bool ForwardTsnSupported
+    public bool ForwardTsnSupported =>
+        FindParameter(SctpParameterType.ForwardTsnSupported) is not null || SupportsExtension(SctpChunkType.ForwardTsn);
+
+    /// <summary>
+    /// True when the peer advertised RFC 6525 stream reconfiguration by listing RE-CONFIG in the
+    /// Supported Extensions parameter (0x8008).
+    /// </summary>
+    public bool ReconfigSupported => SupportsExtension(SctpChunkType.ReConfig);
+
+    /// <summary>Returns whether the Supported Extensions parameter lists the given chunk type.</summary>
+    /// <param name="chunkType">Chunk type to look for.</param>
+    /// <returns>True when the chunk type appears in the Supported Extensions parameter.</returns>
+    public bool SupportsExtension(SctpChunkType chunkType)
     {
-        get
+        var extensions = FindParameter(SctpParameterType.SupportedExtensions);
+        if (extensions is null)
         {
-            if (FindParameter(SctpParameterType.ForwardTsnSupported) is not null)
+            return false;
+        }
+
+        foreach (var value in extensions.Value)
+        {
+            if (value == (byte)chunkType)
             {
                 return true;
             }
-
-            var extensions = FindParameter(SctpParameterType.SupportedExtensions);
-            if (extensions is null)
-            {
-                return false;
-            }
-
-            foreach (var value in extensions.Value)
-            {
-                if (value == (byte)SctpChunkType.ForwardTsn)
-                {
-                    return true;
-                }
-            }
-
-            return false;
         }
+
+        return false;
     }
 
     /// <summary>Returns the first parameter with the given type, or null.</summary>

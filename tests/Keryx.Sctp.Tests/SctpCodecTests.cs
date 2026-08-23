@@ -226,11 +226,79 @@ public class SctpCodecTests
     }
 
     [Fact]
+    public void ReConfigOutgoingResetRequestRoundTrips()
+    {
+        var request = new SctpOutgoingSsnResetRequest(
+            requestSequence: 0x11223344,
+            responseSequence: 0x55667788,
+            sendersLastAssignedTsn: 0x99AABBCC,
+            streams: new ushort[] { 0, 2, 4 });
+        var chunk = new SctpReConfigChunk(request);
+
+        ((byte)chunk.Type).Should().Be(130);
+
+        // 12 fixed value bytes + 3 stream ids (2 bytes each) = 18 value; +4 param header = 22, padded
+        // to 24; +4 chunk header = 28.
+        chunk.Length.Should().Be(4 + 24);
+
+        var parsed = (SctpReConfigChunk)RoundTrip(chunk).Chunks[0];
+        parsed.Parameters.Should().ContainSingle();
+        var outgoing = parsed.Parameters[0].Should().BeOfType<SctpOutgoingSsnResetRequest>().Subject;
+        outgoing.RequestSequence.Should().Be(0x11223344);
+        outgoing.ResponseSequence.Should().Be(0x55667788);
+        outgoing.SendersLastAssignedTsn.Should().Be(0x99AABBCC);
+        outgoing.Streams.Should().Equal((ushort)0, (ushort)2, (ushort)4);
+    }
+
+    [Fact]
+    public void ReConfigIncomingResetRequestRoundTrips()
+    {
+        var chunk = new SctpReConfigChunk(new SctpIncomingSsnResetRequest(42, new ushort[] { 7 }));
+
+        var parsed = (SctpReConfigChunk)RoundTrip(chunk).Chunks[0];
+        var incoming = parsed.Parameters[0].Should().BeOfType<SctpIncomingSsnResetRequest>().Subject;
+        incoming.RequestSequence.Should().Be(42);
+        incoming.Streams.Should().Equal((ushort)7);
+    }
+
+    [Fact]
+    public void ReConfigResponseRoundTripsWithAndWithoutTsnFields()
+    {
+        var response = new SctpReconfigResponse(0xABCDEF01, SctpReconfigResult.SuccessPerformed);
+        var parsed = (SctpReConfigChunk)RoundTrip(new SctpReConfigChunk(response)).Chunks[0];
+        var decoded = parsed.Parameters[0].Should().BeOfType<SctpReconfigResponse>().Subject;
+        decoded.ResponseSequence.Should().Be(0xABCDEF01);
+        decoded.Result.Should().Be(SctpReconfigResult.SuccessPerformed);
+        decoded.HasTsnFields.Should().BeFalse();
+
+        var withTsns = new SctpReconfigResponse(7, SctpReconfigResult.InProgress, sendersNextTsn: 100, receiversNextTsn: 200);
+        var parsedTsns = (SctpReConfigChunk)RoundTrip(new SctpReConfigChunk(withTsns)).Chunks[0];
+        var decodedTsns = parsedTsns.Parameters[0].Should().BeOfType<SctpReconfigResponse>().Subject;
+        decodedTsns.HasTsnFields.Should().BeTrue();
+        decodedTsns.Result.Should().Be(SctpReconfigResult.InProgress);
+        decodedTsns.SendersNextTsn.Should().Be(100);
+        decodedTsns.ReceiversNextTsn.Should().Be(200);
+    }
+
+    [Fact]
+    public void ReConfigCarriesTwoParametersInOneChunk()
+    {
+        var chunk = new SctpReConfigChunk(
+            new SctpOutgoingSsnResetRequest(1, 0, 500, new ushort[] { 3 }),
+            new SctpReconfigResponse(9, SctpReconfigResult.SuccessPerformed));
+
+        var parsed = (SctpReConfigChunk)RoundTrip(chunk).Chunks[0];
+        parsed.Parameters.Should().HaveCount(2);
+        parsed.Parameters[0].Should().BeOfType<SctpOutgoingSsnResetRequest>();
+        parsed.Parameters[1].Should().BeOfType<SctpReconfigResponse>();
+    }
+
+    [Fact]
     public void UnknownChunkTypeSurvivesRoundTrip()
     {
-        var unknown = new SctpUnknownChunk(0x82, new byte[] { 1, 2, 3, 4 });
+        var unknown = new SctpUnknownChunk(0x7F, new byte[] { 1, 2, 3, 4 });
         var parsed = (SctpUnknownChunk)RoundTrip(unknown).Chunks[0];
-        parsed.RawType.Should().Be(0x82);
+        parsed.RawType.Should().Be(0x7F);
         parsed.Body.Should().Equal(1, 2, 3, 4);
     }
 

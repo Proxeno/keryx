@@ -20,8 +20,9 @@ namespace Keryx.Sctp;
 /// </para>
 /// <para>
 /// <b>Scope.</b> Single-homed only: no address parameters are sent or honoured, and there is no
-/// path management beyond a liveness heartbeat. AUTH, ASCONF, I-DATA, ECN and RFC 6525 stream
-/// reset are not implemented.
+/// path management beyond a liveness heartbeat. RFC 6525 stream reset (RE-CONFIG) is supported so a
+/// closed data channel frees its stream identifier for reuse. AUTH, ASCONF, I-DATA and ECN are not
+/// implemented.
 /// </para>
 /// </remarks>
 public sealed class SctpAssociation : IDisposable
@@ -60,6 +61,13 @@ public sealed class SctpAssociation : IDisposable
     private readonly Dictionary<int, DataChannel> _channels = new();
     private readonly Dictionary<ushort, List<ReassembledMessage>> _orphanMessages = new();
 
+    // RFC 6525 stream reconfiguration (RE-CONFIG). Stream ids freed by a completed reset are
+    // held here so a later channel reuses them instead of exhausting the id space; the queue
+    // holds ids whose channels have closed and are waiting for an outgoing reset to be driven.
+    private readonly SortedSet<int> _freedStreamIds = new();
+    private readonly List<ushort> _pendingResetStreams = new();
+    private readonly List<SctpOutgoingSsnResetRequest> _deferredIncomingResets = new();
+
     private bool _started;
     private bool _disposed;
     private bool _dispatching;
@@ -78,9 +86,19 @@ public sealed class SctpAssociation : IDisposable
     private ushort _outboundStreams;
     private ushort _inboundStreams;
     private bool _peerSupportsForwardTsn;
+    private bool _peerSupportsReconfig;
     private int _nextMessageId;
     private int _nextStreamId;
     private long _receiveBufferBytes;
+
+    // Outgoing RE-CONFIG in flight, if any, plus its retransmission bookkeeping.
+    private uint _reconfigNextSeq;
+    private uint _reconfigNextExpectedRemoteSeq;
+    private bool _hasRemoteResetSeq;
+    private uint _lastRemoteResetSeq;
+    private OutstandingReset? _outstandingReset;
+    private long _reconfigExpiry;
+    private int _reconfigAttempts;
 
     private long _flightSize;
     private long _congestionWindow;
@@ -123,6 +141,7 @@ public sealed class SctpAssociation : IDisposable
         _localTag = RandomTag();
         _localInitialTsn = RandomTag();
         _nextTsn = _localInitialTsn;
+        _reconfigNextSeq = _localInitialTsn;
         _peerCumulativeAck = unchecked(_localInitialTsn - 1);
         _advancedPeerAckPoint = _peerCumulativeAck;
         _outboundStreams = config.OutboundStreams;
@@ -436,6 +455,18 @@ public sealed class SctpAssociation : IDisposable
 
     private int AllocateStreamId()
     {
+        // Prefer an identifier freed by a completed RFC 6525 reset so a long-lived peer that opens
+        // and closes many channels does not march _nextStreamId to exhaustion.
+        while (_freedStreamIds.Count > 0)
+        {
+            var candidate = _freedStreamIds.Min;
+            _freedStreamIds.Remove(candidate);
+            if (!_channels.ContainsKey(candidate))
+            {
+                return candidate;
+            }
+        }
+
         while (_channels.ContainsKey(_nextStreamId))
         {
             _nextStreamId += 2;
@@ -444,6 +475,25 @@ public sealed class SctpAssociation : IDisposable
         var id = _nextStreamId;
         _nextStreamId += 2;
         return id;
+    }
+
+    /// <summary>
+    /// Releases every trace of a stream identifier once its channel has closed and any RFC 6525
+    /// reset has completed, so a later channel can reuse it with fresh sequence-number state.
+    /// </summary>
+    private void FreeStreamId(ushort streamId)
+    {
+        _sendSequence.Remove(streamId);
+        _receiveStreams.Remove(streamId);
+        _orphanMessages.Remove(streamId);
+
+        // Only identifiers this endpoint owns (matching its allocation parity) may be handed back
+        // to AllocateStreamId; the peer allocates the other parity.
+        var ownParity = _config.UsesEvenStreamIds ? 0 : 1;
+        if (streamId % 2 == ownParity)
+        {
+            _freedStreamIds.Add(streamId);
+        }
     }
 
     private static uint RandomTag()
@@ -556,6 +606,9 @@ public sealed class SctpAssociation : IDisposable
             case SctpForwardTsnChunk forward:
                 HandleForwardTsn(forward);
                 break;
+            case SctpReConfigChunk reconfig:
+                HandleReConfig(reconfig);
+                break;
             case SctpHeartbeatChunk heartbeat when heartbeat.Type == SctpChunkType.Heartbeat:
                 _controlQueue.Add(new SctpHeartbeatChunk(SctpChunkType.HeartbeatAck, heartbeat.Info));
                 break;
@@ -615,7 +668,7 @@ public sealed class SctpAssociation : IDisposable
         initAck.Parameters.Add(new SctpParameter(SctpParameterType.ForwardTsnSupported, Array.Empty<byte>()));
         initAck.Parameters.Add(new SctpParameter(
             SctpParameterType.SupportedExtensions,
-            new[] { (byte)SctpChunkType.ForwardTsn }));
+            new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig }));
 
         SendImmediate(init.InitiateTag, initAck);
         _log.Log(KeryxLogLevel.Debug, "Answered INIT with a stateless INIT ACK.");
@@ -641,7 +694,8 @@ public sealed class SctpAssociation : IDisposable
             initAck.AdvertisedReceiverWindow,
             Math.Min(_config.OutboundStreams, initAck.NumberOfInboundStreams),
             Math.Min(_config.InboundStreams, initAck.NumberOfOutboundStreams),
-            initAck.ForwardTsnSupported);
+            initAck.ForwardTsnSupported,
+            initAck.ReconfigSupported);
 
         _pendingInit = null;
         _pendingCookieEcho = new SctpCookieEchoChunk(cookie);
@@ -653,7 +707,7 @@ public sealed class SctpAssociation : IDisposable
 
     private void HandleCookieEcho(SctpCookieEchoChunk cookieEcho)
     {
-        if (!TryReadCookie(cookieEcho.Cookie, out var peerTag, out var peerInitialTsn, out var peerRwnd, out var outbound, out var inbound, out var forwardTsn))
+        if (!TryReadCookie(cookieEcho.Cookie, out var peerTag, out var peerInitialTsn, out var peerRwnd, out var outbound, out var inbound, out var forwardTsn, out var reconfig))
         {
             _log.Log(KeryxLogLevel.Warning, "Rejecting COOKIE ECHO: cookie failed validation.");
             var abort = MakeAbort(SctpErrorCauseCode.StaleCookieError, "invalid or expired state cookie");
@@ -668,7 +722,7 @@ public sealed class SctpAssociation : IDisposable
             return;
         }
 
-        AdoptPeerParameters(peerTag, peerInitialTsn, peerRwnd, outbound, inbound, forwardTsn);
+        AdoptPeerParameters(peerTag, peerInitialTsn, peerRwnd, outbound, inbound, forwardTsn, reconfig);
         _controlQueue.Add(new SctpCookieAckChunk());
         Establish();
     }
@@ -685,14 +739,16 @@ public sealed class SctpAssociation : IDisposable
         Establish();
     }
 
-    private void AdoptPeerParameters(uint peerTag, uint peerInitialTsn, uint peerRwnd, ushort outbound, ushort inbound, bool forwardTsn)
+    private void AdoptPeerParameters(uint peerTag, uint peerInitialTsn, uint peerRwnd, ushort outbound, ushort inbound, bool forwardTsn, bool reconfig)
     {
         _peerTag = peerTag;
         _peerReceiveWindow = peerRwnd;
         _outboundStreams = outbound;
         _inboundStreams = inbound;
         _peerSupportsForwardTsn = forwardTsn;
+        _peerSupportsReconfig = reconfig;
         _cumulativeTsnReceived = unchecked(peerInitialTsn - 1);
+        _reconfigNextExpectedRemoteSeq = peerInitialTsn;
     }
 
     private void Establish()
@@ -775,6 +831,7 @@ public sealed class SctpAssociation : IDisposable
         _receiveBufferBytes += data.Payload.Length;
         AdvanceCumulativeReceive();
         TryReassemble(data.Tsn);
+        ProcessDeferredIncomingResets();
 
         // Even in-order chunks can pin memory without bound when a message never terminates
         // (a run of B/continuation fragments whose E-fragment never arrives): the cumulative
@@ -1098,6 +1155,315 @@ public sealed class SctpAssociation : IDisposable
             bufferedBytes: 0);
     }
 
+    // -------------------------------------------- stream reconfiguration (RFC 6525)
+
+    /// <summary>
+    /// Begins closing a channel. When the peer negotiated RE-CONFIG this drives an outgoing stream
+    /// reset (deferred until the channel's data is acknowledged); otherwise the channel closes
+    /// immediately. The stream identifier is freed for reuse once the reset completes.
+    /// </summary>
+    internal void CloseChannel(DataChannel channel)
+    {
+        lock (_lock)
+        {
+            if (channel.State is DataChannelState.Closed or DataChannelState.Closing)
+            {
+                return;
+            }
+
+            var streamId = (ushort)channel.StreamId;
+
+            // No association or no negotiated RE-CONFIG means there is no wire reset to drive:
+            // close locally and hand the identifier back right away.
+            if (_state != SctpAssociationState.Established || !_peerSupportsReconfig)
+            {
+                _channels.Remove(channel.StreamId);
+                channel.State = DataChannelState.Closed;
+                FreeStreamId(streamId);
+                _events.Add(channel.RaiseClosed);
+            }
+            else
+            {
+                channel.State = DataChannelState.Closing;
+                if (!_pendingResetStreams.Contains(streamId))
+                {
+                    _pendingResetStreams.Add(streamId);
+                }
+
+                TryStartOutgoingReset();
+                Flush();
+            }
+        }
+
+        DispatchEvents();
+    }
+
+    /// <summary>
+    /// Starts an outgoing RE-CONFIG for the queued streams whose data has drained, if none is
+    /// already in flight. RFC 6525 §5.1 permits only one outstanding request at a time and forbids
+    /// resetting a stream that still has unacknowledged data, so undrained streams stay queued.
+    /// </summary>
+    private void TryStartOutgoingReset()
+    {
+        if (_outstandingReset is not null || !_peerSupportsReconfig || _pendingResetStreams.Count == 0)
+        {
+            return;
+        }
+
+        var ready = new List<ushort>();
+        foreach (var streamId in _pendingResetStreams)
+        {
+            if (!HasOutstandingDataOnStream(streamId))
+            {
+                ready.Add(streamId);
+            }
+        }
+
+        if (ready.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var streamId in ready)
+        {
+            _pendingResetStreams.Remove(streamId);
+        }
+
+        var requestSeq = _reconfigNextSeq;
+        _reconfigNextSeq = unchecked(_reconfigNextSeq + 1);
+
+        _outstandingReset = new OutstandingReset
+        {
+            RequestSequence = requestSeq,
+            ResponseSequence = unchecked(_reconfigNextExpectedRemoteSeq - 1),
+            SendersLastAssignedTsn = unchecked(_nextTsn - 1),
+            Streams = ready,
+        };
+        _reconfigAttempts = 0;
+        _reconfigExpiry = NowMs + (long)_rto;
+        _controlQueue.Add(BuildOutgoingResetChunk(_outstandingReset));
+        _log.Log(KeryxLogLevel.Debug, $"Sending RE-CONFIG (seq {requestSeq}) resetting stream(s) {string.Join(",", ready)}.");
+    }
+
+    private static SctpReConfigChunk BuildOutgoingResetChunk(OutstandingReset reset) =>
+        new(new SctpOutgoingSsnResetRequest(
+            reset.RequestSequence,
+            reset.ResponseSequence,
+            reset.SendersLastAssignedTsn,
+            reset.Streams));
+
+    private bool HasOutstandingDataOnStream(ushort streamId)
+    {
+        foreach (var chunk in _out)
+        {
+            if (chunk.StreamId == streamId && !chunk.Acked && !chunk.Abandoned)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void HandleReConfig(SctpReConfigChunk chunk)
+    {
+        if (_state is SctpAssociationState.Closed or SctpAssociationState.CookieWait)
+        {
+            return;
+        }
+
+        var responses = new List<SctpReconfigParameter>();
+        foreach (var parameter in chunk.Parameters)
+        {
+            switch (parameter)
+            {
+                case SctpOutgoingSsnResetRequest request:
+                    HandleOutgoingResetRequest(request, responses);
+                    break;
+                case SctpIncomingSsnResetRequest request:
+                    HandleIncomingResetRequest(request, responses);
+                    break;
+                case SctpReconfigResponse response:
+                    HandleReconfigResponse(response);
+                    break;
+                default:
+                    _log.Log(KeryxLogLevel.Debug, $"Ignoring unhandled RE-CONFIG parameter 0x{(ushort)parameter.Type:X4}.");
+                    break;
+            }
+        }
+
+        if (responses.Count > 0)
+        {
+            _controlQueue.Add(new SctpReConfigChunk(responses.ToArray()));
+        }
+    }
+
+    /// <summary>Handles the peer resetting its outgoing streams (our incoming streams).</summary>
+    private void HandleOutgoingResetRequest(SctpOutgoingSsnResetRequest request, List<SctpReconfigParameter> responses)
+    {
+        // A retransmission of a request already performed: re-send success without resetting again.
+        if (_hasRemoteResetSeq && !Serial.Gt(request.RequestSequence, _lastRemoteResetSeq))
+        {
+            responses.Add(new SctpReconfigResponse(request.RequestSequence, SctpReconfigResult.SuccessPerformed));
+            return;
+        }
+
+        // RFC 6525 §5.2.2: defer until every TSN the peer assigned through Sender's Last Assigned
+        // TSN has been received, so the reset stays in order with the stream's data.
+        if (Serial.Gt(request.SendersLastAssignedTsn, _cumulativeTsnReceived))
+        {
+            if (!_deferredIncomingResets.Any(r => r.RequestSequence == request.RequestSequence))
+            {
+                _deferredIncomingResets.Add(request);
+            }
+
+            responses.Add(new SctpReconfigResponse(request.RequestSequence, SctpReconfigResult.InProgress));
+            return;
+        }
+
+        PerformIncomingReset(request);
+        responses.Add(new SctpReconfigResponse(request.RequestSequence, SctpReconfigResult.SuccessPerformed));
+    }
+
+    /// <summary>
+    /// Handles the peer asking this endpoint to reset its outgoing streams by queuing an outgoing
+    /// reset for them and acknowledging the request.
+    /// </summary>
+    private void HandleIncomingResetRequest(SctpIncomingSsnResetRequest request, List<SctpReconfigParameter> responses)
+    {
+        foreach (var streamId in request.Streams)
+        {
+            if (!_pendingResetStreams.Contains(streamId))
+            {
+                _pendingResetStreams.Add(streamId);
+            }
+        }
+
+        TryStartOutgoingReset();
+        responses.Add(new SctpReconfigResponse(request.RequestSequence, SctpReconfigResult.SuccessPerformed));
+    }
+
+    private void PerformIncomingReset(SctpOutgoingSsnResetRequest request)
+    {
+        var streams = request.Streams.Count > 0
+            ? (IReadOnlyList<ushort>)request.Streams
+            : _receiveStreams.Keys.ToArray();
+        foreach (var streamId in streams)
+        {
+            ResetStream(streamId, peerInitiated: true);
+        }
+
+        _hasRemoteResetSeq = true;
+        _lastRemoteResetSeq = request.RequestSequence;
+        if (Serial.Gte(request.RequestSequence, _reconfigNextExpectedRemoteSeq))
+        {
+            _reconfigNextExpectedRemoteSeq = unchecked(request.RequestSequence + 1);
+        }
+    }
+
+    /// <summary>
+    /// Resets a stream's sequence-number state. When the reset was peer-initiated and a channel is
+    /// still open on the identifier that this endpoint did not itself close, the channel is closed
+    /// and the identifier freed for reuse.
+    /// </summary>
+    private void ResetStream(ushort streamId, bool peerInitiated)
+    {
+        if (_receiveStreams.TryGetValue(streamId, out var stream))
+        {
+            stream.NextSequence = 0;
+            stream.Buffered.Clear();
+        }
+
+        if (!peerInitiated)
+        {
+            return;
+        }
+
+        if (_channels.TryGetValue(streamId, out var channel))
+        {
+            // A channel we are already resetting (Closing) is finalised by our own response path.
+            if (channel.State == DataChannelState.Closing)
+            {
+                return;
+            }
+
+            _channels.Remove(streamId);
+            if (channel.State != DataChannelState.Closed)
+            {
+                channel.State = DataChannelState.Closed;
+                _events.Add(channel.RaiseClosed);
+            }
+        }
+
+        FreeStreamId(streamId);
+    }
+
+    private void HandleReconfigResponse(SctpReconfigResponse response)
+    {
+        if (_outstandingReset is null || response.ResponseSequence != _outstandingReset.RequestSequence)
+        {
+            return;
+        }
+
+        if (response.Result == SctpReconfigResult.InProgress)
+        {
+            // The peer deferred; keep the request outstanding and let the timer retransmit.
+            return;
+        }
+
+        if (response.Result is not (SctpReconfigResult.SuccessPerformed or SctpReconfigResult.SuccessNothingToDo))
+        {
+            _log.Log(KeryxLogLevel.Warning, $"Peer rejected stream reset (result {response.Result}); freeing streams locally.");
+        }
+
+        FinalizeOutgoingReset(_outstandingReset);
+        _outstandingReset = null;
+        _reconfigExpiry = 0;
+        _reconfigAttempts = 0;
+        TryStartOutgoingReset();
+    }
+
+    private void FinalizeOutgoingReset(OutstandingReset reset)
+    {
+        foreach (var streamId in reset.Streams)
+        {
+            if (_channels.Remove(streamId, out var channel) && channel.State != DataChannelState.Closed)
+            {
+                channel.State = DataChannelState.Closed;
+                _events.Add(channel.RaiseClosed);
+            }
+
+            FreeStreamId(streamId);
+        }
+    }
+
+    private void ProcessDeferredIncomingResets()
+    {
+        if (_deferredIncomingResets.Count == 0)
+        {
+            return;
+        }
+
+        var responses = new List<SctpReconfigParameter>();
+        for (var i = 0; i < _deferredIncomingResets.Count; i++)
+        {
+            var request = _deferredIncomingResets[i];
+            if (Serial.Gt(request.SendersLastAssignedTsn, _cumulativeTsnReceived))
+            {
+                continue;
+            }
+
+            _deferredIncomingResets.RemoveAt(i--);
+            PerformIncomingReset(request);
+            responses.Add(new SctpReconfigResponse(request.RequestSequence, SctpReconfigResult.SuccessPerformed));
+        }
+
+        if (responses.Count > 0)
+        {
+            _controlQueue.Add(new SctpReConfigChunk(responses.ToArray()));
+        }
+    }
+
     private void HandleForwardTsn(SctpForwardTsnChunk forward)
     {
         _sackPending = true;
@@ -1142,6 +1508,8 @@ public sealed class SctpAssociation : IDisposable
             stream.NextSequence = unchecked((ushort)(entry.StreamSequence + 1));
             DrainOrdered(stream);
         }
+
+        ProcessDeferredIncomingResets();
     }
 
     private void HandleHeartbeatAck(SctpHeartbeatChunk ack)
@@ -1327,7 +1695,7 @@ public sealed class SctpAssociation : IDisposable
         init.Parameters.Add(new SctpParameter(SctpParameterType.ForwardTsnSupported, Array.Empty<byte>()));
         init.Parameters.Add(new SctpParameter(
             SctpParameterType.SupportedExtensions,
-            new[] { (byte)SctpChunkType.ForwardTsn }));
+            new[] { (byte)SctpChunkType.ForwardTsn, (byte)SctpChunkType.ReConfig }));
 
         _pendingInit = init;
         _state = SctpAssociationState.CookieWait;
@@ -1509,6 +1877,10 @@ public sealed class SctpAssociation : IDisposable
 
         _out.RemoveAll(c => Serial.Lte(c.Tsn, _peerCumulativeAck));
         MaybeSendForwardTsn();
+
+        // A stream reset queued while its data was still in flight can proceed now that a SACK has
+        // acknowledged more data.
+        TryStartOutgoingReset();
 
         if (!HasOutstanding())
         {
@@ -1758,6 +2130,24 @@ public sealed class SctpAssociation : IDisposable
                 }
             }
 
+            if (_reconfigExpiry != 0 && now >= _reconfigExpiry && _outstandingReset is not null)
+            {
+                if (++_reconfigAttempts > _config.MaxRetransmitAttempts)
+                {
+                    _log.Log(KeryxLogLevel.Warning, "Stream reset timed out; freeing streams locally.");
+                    FinalizeOutgoingReset(_outstandingReset);
+                    _outstandingReset = null;
+                    _reconfigExpiry = 0;
+                    _reconfigAttempts = 0;
+                    TryStartOutgoingReset();
+                }
+                else
+                {
+                    _reconfigExpiry = now + (long)_rto;
+                    _controlQueue.Add(BuildOutgoingResetChunk(_outstandingReset));
+                }
+            }
+
             if (_nextHeartbeat != 0 && now >= _nextHeartbeat && _state == SctpAssociationState.Established)
             {
                 _nextHeartbeat = now + (long)_config.HeartbeatInterval.TotalMilliseconds;
@@ -1858,7 +2248,7 @@ public sealed class SctpAssociation : IDisposable
         writer.WriteU16(outbound);
         writer.WriteU16(inbound);
         writer.WriteU8(init.ForwardTsnSupported ? (byte)1 : (byte)0);
-        writer.WriteU8(0);
+        writer.WriteU8(init.ReconfigSupported ? (byte)1 : (byte)0);
         writer.WriteU16(0);
 
         var mac = HMACSHA256.HashData(_cookieKey, cookie.AsSpan(0, CookieMacOffset));
@@ -1873,7 +2263,8 @@ public sealed class SctpAssociation : IDisposable
         out uint peerRwnd,
         out ushort outbound,
         out ushort inbound,
-        out bool forwardTsn)
+        out bool forwardTsn,
+        out bool reconfig)
     {
         peerTag = 0;
         peerInitialTsn = 0;
@@ -1881,6 +2272,7 @@ public sealed class SctpAssociation : IDisposable
         outbound = 0;
         inbound = 0;
         forwardTsn = false;
+        reconfig = false;
 
         if (cookie.Length != CookieLength)
         {
@@ -1913,6 +2305,7 @@ public sealed class SctpAssociation : IDisposable
         outbound = reader.ReadU16();
         inbound = reader.ReadU16();
         forwardTsn = reader.ReadU8() != 0;
+        reconfig = reader.ReadU8() != 0;
         return peerTag != 0;
     }
 
@@ -1937,6 +2330,12 @@ public sealed class SctpAssociation : IDisposable
         _initExpiry = 0;
         _shutdownExpiry = 0;
         _nextHeartbeat = 0;
+        _reconfigExpiry = 0;
+        _reconfigAttempts = 0;
+        _outstandingReset = null;
+        _pendingResetStreams.Clear();
+        _deferredIncomingResets.Clear();
+        _freedStreamIds.Clear();
         _pendingInit = null;
         _pendingCookieEcho = null;
         _controlQueue.Clear();

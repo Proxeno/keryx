@@ -57,7 +57,7 @@ public enum SctpChunkType : byte
     /// <summary>Address configuration acknowledgement (ASCONF ACK). Not implemented by Keryx.</summary>
     AsconfAck = 128,
 
-    /// <summary>Stream reconfiguration (RE-CONFIG, RFC 6525). Not implemented by Keryx.</summary>
+    /// <summary>Stream reconfiguration (RE-CONFIG, RFC 6525).</summary>
     ReConfig = 130,
 
     /// <summary>Forward cumulative TSN (FORWARD TSN, RFC 3758).</summary>
