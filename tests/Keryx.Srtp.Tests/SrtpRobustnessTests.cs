@@ -13,7 +13,9 @@ public class SrtpRobustnessTests
     public static TheoryData<SrtpProtectionProfileKind> Profiles => new()
     {
         SrtpProtectionProfileKind.Aes128CmHmacSha1_80,
+        SrtpProtectionProfileKind.Aes128CmHmacSha1_32,
         SrtpProtectionProfileKind.AeadAes128Gcm,
+        SrtpProtectionProfileKind.AeadAes256Gcm,
     };
 
     private static SrtpDecryptContext CreateReceiver(SrtpProtectionProfileKind kind, IKeryxLogger? logger = null)

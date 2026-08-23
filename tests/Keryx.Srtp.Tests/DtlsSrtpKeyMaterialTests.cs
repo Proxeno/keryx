@@ -11,11 +11,14 @@ public class DtlsSrtpKeyMaterialTests
     /// <summary>
     /// RFC 5764 Section 4.2: the exporter produces
     /// <c>2 * (master_key_len + master_salt_len)</c> bytes, i.e. 60 for
-    /// SRTP_AES128_CM_HMAC_SHA1_80 and 56 for SRTP_AEAD_AES_128_GCM.
+    /// SRTP_AES128_CM_HMAC_SHA1_80 and SRTP_AES128_CM_HMAC_SHA1_32 (identical key material, only the
+    /// tag differs), 56 for SRTP_AEAD_AES_128_GCM and 88 for SRTP_AEAD_AES_256_GCM.
     /// </summary>
     [Theory]
     [InlineData(SrtpProtectionProfileKind.Aes128CmHmacSha1_80, 60)]
+    [InlineData(SrtpProtectionProfileKind.Aes128CmHmacSha1_32, 60)]
     [InlineData(SrtpProtectionProfileKind.AeadAes128Gcm, 56)]
+    [InlineData(SrtpProtectionProfileKind.AeadAes256Gcm, 88)]
     public void RequiredLength_MatchesTheProfile(SrtpProtectionProfileKind kind, int expected)
     {
         DtlsSrtpKeyMaterial.RequiredLength(SrtpProtectionProfile.ForKind(kind)).Should().Be(expected);
@@ -69,7 +72,9 @@ public class DtlsSrtpKeyMaterialTests
     /// </summary>
     [Theory]
     [InlineData(SrtpProtectionProfileKind.Aes128CmHmacSha1_80)]
+    [InlineData(SrtpProtectionProfileKind.Aes128CmHmacSha1_32)]
     [InlineData(SrtpProtectionProfileKind.AeadAes128Gcm)]
+    [InlineData(SrtpProtectionProfileKind.AeadAes256Gcm)]
     public void TwoPeersKeyedFromOneExporterBlock_TalkToEachOther(SrtpProtectionProfileKind kind)
     {
         var profile = SrtpProtectionProfile.ForKind(kind);

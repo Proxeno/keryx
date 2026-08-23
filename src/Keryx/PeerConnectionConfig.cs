@@ -77,8 +77,10 @@ public sealed class PeerConnectionConfig
     public IList<SdpCodec> AudioCodecs { get; } = [SdpCodec.Opus()];
 
     /// <summary>
-    /// SRTP protection profiles to offer through DTLS <c>use_srtp</c>, most preferred first. Only the
-    /// two profiles Keryx implements end to end are supported.
+    /// SRTP protection profiles to offer through DTLS <c>use_srtp</c>, most preferred first. Keryx
+    /// implements all four profiles the DTLS layer can negotiate — <c>AES128_CM_HMAC_SHA1_80</c>,
+    /// <c>AES128_CM_HMAC_SHA1_32</c>, <c>AEAD_AES_128_GCM</c> and <c>AEAD_AES_256_GCM</c> — but only
+    /// the first and third are offered by default; add the others to prefer them.
     /// </summary>
     public IList<SrtpProtectionProfile> SrtpProfiles { get; } =
     [

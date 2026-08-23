@@ -27,9 +27,9 @@ internal static class SrtpTransformFactory
 
         return profile.Kind switch
         {
-            SrtpProtectionProfileKind.Aes128CmHmacSha1_80 =>
+            SrtpProtectionProfileKind.Aes128CmHmacSha1_80 or SrtpProtectionProfileKind.Aes128CmHmacSha1_32 =>
                 new SrtpAesCmHmacSha1Transform(profile, keys, DefaultKeyDerivationRate),
-            SrtpProtectionProfileKind.AeadAes128Gcm =>
+            SrtpProtectionProfileKind.AeadAes128Gcm or SrtpProtectionProfileKind.AeadAes256Gcm =>
                 new SrtpAeadGcmTransform(profile, keys, DefaultKeyDerivationRate),
             _ => throw new ArgumentOutOfRangeException(nameof(profile), profile.Kind, "Unsupported SRTP protection profile."),
         };

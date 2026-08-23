@@ -23,6 +23,22 @@ public class SrtpApiTests
     }
 
     [Fact]
+    public void Aes128CmHmacSha1_32Profile_HasTheRfc3711Parameters()
+    {
+        var profile = SrtpProtectionProfile.Aes128CmHmacSha1_32;
+
+        profile.Kind.Should().Be(SrtpProtectionProfileKind.Aes128CmHmacSha1_32);
+        profile.Name.Should().Be("SRTP_AES128_CM_HMAC_SHA1_32");
+        profile.MasterKeyLength.Should().Be(16);
+        profile.MasterSaltLength.Should().Be(14, "RFC 3711 Section 5.2 specifies a 112-bit master salt");
+        profile.SessionSaltLength.Should().Be(14);
+        profile.AuthenticationKeyLength.Should().Be(20, "HMAC-SHA1 takes a 160-bit session auth key regardless of tag length");
+        profile.TagLength.Should().Be(4, "the tag is HMAC-SHA1 truncated to 32 bits");
+        profile.RtpOverhead.Should().Be(4);
+        profile.RtcpOverhead.Should().Be(8, "4 octets of E-flag/index word plus the 4-octet tag");
+    }
+
+    [Fact]
     public void AeadGcmProfile_HasTheRfc7714Parameters()
     {
         var profile = SrtpProtectionProfile.AeadAes128Gcm;
@@ -37,12 +53,29 @@ public class SrtpApiTests
         profile.RtcpOverhead.Should().Be(20);
     }
 
+    [Fact]
+    public void AeadAes256GcmProfile_HasTheRfc7714Parameters()
+    {
+        var profile = SrtpProtectionProfile.AeadAes256Gcm;
+
+        profile.Kind.Should().Be(SrtpProtectionProfileKind.AeadAes256Gcm);
+        profile.Name.Should().Be("SRTP_AEAD_AES_256_GCM");
+        profile.MasterKeyLength.Should().Be(32, "RFC 7714 Table 2 specifies a 256-bit master key");
+        profile.MasterSaltLength.Should().Be(12, "RFC 7714 Table 2 specifies a 96-bit master salt, same as the 128-bit variant");
+        profile.AuthenticationKeyLength.Should().Be(0, "AEAD authenticates with the cipher itself");
+        profile.TagLength.Should().Be(16, "the AEAD tag stays 128 bits regardless of key size");
+        profile.RtpOverhead.Should().Be(16);
+        profile.RtcpOverhead.Should().Be(20);
+    }
+
     /// <summary>The enum values are the DTLS-SRTP code points from the IANA registry.</summary>
     [Fact]
     public void ProfileKinds_UseTheIanaCodePoints()
     {
         ((int)SrtpProtectionProfileKind.Aes128CmHmacSha1_80).Should().Be(0x0001);
+        ((int)SrtpProtectionProfileKind.Aes128CmHmacSha1_32).Should().Be(0x0002);
         ((int)SrtpProtectionProfileKind.AeadAes128Gcm).Should().Be(0x0007);
+        ((int)SrtpProtectionProfileKind.AeadAes256Gcm).Should().Be(0x0008);
     }
 
     [Fact]

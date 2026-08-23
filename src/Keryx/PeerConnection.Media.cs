@@ -571,7 +571,10 @@ public sealed partial class PeerConnection
         // after the point where the failure could be explained. Refuse up front instead.
         foreach (var configured in _config.SrtpProfiles)
         {
-            if (configured is not (DtlsSrtpProfile.Aes128CmHmacSha1Tag80 or DtlsSrtpProfile.AeadAes128Gcm))
+            if (configured is not (DtlsSrtpProfile.Aes128CmHmacSha1Tag80
+                or DtlsSrtpProfile.Aes128CmHmacSha1Tag32
+                or DtlsSrtpProfile.AeadAes128Gcm
+                or DtlsSrtpProfile.AeadAes256Gcm))
             {
                 Fail($"SrtpProfiles contains {configured}, which Keryx does not implement end to end.");
                 return;
@@ -812,7 +815,9 @@ public sealed partial class PeerConnection
     private static SrtpProfile MapSrtpProfile(DtlsSrtpProfile profile) => profile switch
     {
         DtlsSrtpProfile.Aes128CmHmacSha1Tag80 => SrtpProfile.Aes128CmHmacSha1_80,
+        DtlsSrtpProfile.Aes128CmHmacSha1Tag32 => SrtpProfile.Aes128CmHmacSha1_32,
         DtlsSrtpProfile.AeadAes128Gcm => SrtpProfile.AeadAes128Gcm,
+        DtlsSrtpProfile.AeadAes256Gcm => SrtpProfile.AeadAes256Gcm,
         _ => throw new InvalidOperationException($"Keryx does not implement the SRTP profile {profile}."),
     };
 

@@ -12,7 +12,9 @@ public class SrtpRoundTripTests
     public static TheoryData<SrtpProtectionProfileKind> Profiles => new()
     {
         SrtpProtectionProfileKind.Aes128CmHmacSha1_80,
+        SrtpProtectionProfileKind.Aes128CmHmacSha1_32,
         SrtpProtectionProfileKind.AeadAes128Gcm,
+        SrtpProtectionProfileKind.AeadAes256Gcm,
     };
 
     private static (SrtpEncryptContext Sender, SrtpDecryptContext Receiver) CreatePair(
@@ -187,6 +189,43 @@ public class SrtpRoundTripTests
         }
 
         // The untouched packet still verifies: the rejections above left no poisoned state.
+        var clean = new byte[wire.Length];
+        r.TryUnprotectRtp(wire, clean, out var length).Should().BeTrue();
+        clean.AsSpan(0, length).ToArray().Should().Equal(packet);
+    }
+
+    /// <summary>
+    /// SRTP_AES128_CM_HMAC_SHA1_32 truncates the tag to 4 octets instead of 10. This pins the
+    /// overhead at exactly 4 bytes and confirms a bit flipped anywhere in the 4-octet tag itself —
+    /// not just the payload — is still caught, even though there is far less tag material to work
+    /// with than the 80-bit profile.
+    /// </summary>
+    [Fact]
+    public void Sha1_32Profile_AppendsAFourByteTagAndRejectsATamperedTag()
+    {
+        var (sender, receiver) = CreatePair(SrtpProtectionProfileKind.Aes128CmHmacSha1_32);
+        using var s = sender;
+        using var r = receiver;
+
+        s.Profile.TagLength.Should().Be(4);
+        s.Profile.RtpOverhead.Should().Be(4);
+
+        var packet = TestPackets.Rtp(0x0A0B0C0D, 77, 1000, TestPackets.RandomBytes(new Random(3), 100));
+        var buffer = new byte[packet.Length + s.Profile.RtpOverhead];
+        var protectedLength = s.ProtectRtp(packet, buffer);
+        protectedLength.Should().Be(packet.Length + 4);
+        var wire = buffer.AsSpan(0, protectedLength).ToArray();
+
+        for (var tagByte = 0; tagByte < 4; tagByte++)
+        {
+            var tampered = (byte[])wire.Clone();
+            tampered[protectedLength - 1 - tagByte] ^= 0x01;
+
+            var output = new byte[tampered.Length];
+            r.TryUnprotectRtp(tampered, output, out _)
+                .Should().BeFalse($"flipping tag byte {tagByte} must fail authentication despite the short tag");
+        }
+
         var clean = new byte[wire.Length];
         r.TryUnprotectRtp(wire, clean, out var length).Should().BeTrue();
         clean.AsSpan(0, length).ToArray().Should().Equal(packet);

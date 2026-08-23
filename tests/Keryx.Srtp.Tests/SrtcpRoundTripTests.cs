@@ -10,7 +10,9 @@ public class SrtcpRoundTripTests
     public static TheoryData<SrtpProtectionProfileKind> Profiles => new()
     {
         SrtpProtectionProfileKind.Aes128CmHmacSha1_80,
+        SrtpProtectionProfileKind.Aes128CmHmacSha1_32,
         SrtpProtectionProfileKind.AeadAes128Gcm,
+        SrtpProtectionProfileKind.AeadAes256Gcm,
     };
 
     private static (SrtpEncryptContext Sender, SrtpDecryptContext Receiver) CreatePair(
@@ -66,9 +68,9 @@ public class SrtcpRoundTripTests
             var buffer = new byte[packet.Length + profile.RtcpOverhead];
             var protectedLength = s.ProtectRtcp(packet, buffer);
 
-            // The AES-CM profile puts the E/index word before the tag (RFC 3711 Figure 2); the AEAD
-            // profile puts it at the very end (RFC 7714 Section 17).
-            var wordOffset = kind == SrtpProtectionProfileKind.Aes128CmHmacSha1_80
+            // The AES-CM profiles put the E/index word before the tag (RFC 3711 Figure 2); the AEAD
+            // profiles put it at the very end (RFC 7714 Section 17).
+            var wordOffset = kind is SrtpProtectionProfileKind.Aes128CmHmacSha1_80 or SrtpProtectionProfileKind.Aes128CmHmacSha1_32
                 ? protectedLength - profile.TagLength - SrtpProtectionProfile.SrtcpIndexLength
                 : protectedLength - SrtpProtectionProfile.SrtcpIndexLength;
             var word = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(wordOffset, 4));
@@ -210,7 +212,9 @@ public class SrtcpUnencryptedTests
     public static TheoryData<SrtpProtectionProfileKind> Profiles => new()
     {
         SrtpProtectionProfileKind.Aes128CmHmacSha1_80,
+        SrtpProtectionProfileKind.Aes128CmHmacSha1_32,
         SrtpProtectionProfileKind.AeadAes128Gcm,
+        SrtpProtectionProfileKind.AeadAes256Gcm,
     };
 
     [Theory]
@@ -232,7 +236,7 @@ public class SrtcpUnencryptedTests
         // With E = 0 the body travels in the clear.
         buffer.AsSpan(0, packet.Length).ToArray().Should().Equal(packet);
 
-        var wordOffset = kind == SrtpProtectionProfileKind.Aes128CmHmacSha1_80
+        var wordOffset = kind is SrtpProtectionProfileKind.Aes128CmHmacSha1_80 or SrtpProtectionProfileKind.Aes128CmHmacSha1_32
             ? protectedLength - profile.TagLength - SrtpProtectionProfile.SrtcpIndexLength
             : protectedLength - SrtpProtectionProfile.SrtcpIndexLength;
         var word = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(wordOffset, 4));
