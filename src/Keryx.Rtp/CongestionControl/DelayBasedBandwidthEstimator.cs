@@ -11,13 +11,11 @@ namespace Keryx.Rtp.CongestionControl;
 public sealed class DelayBasedBandwidthEstimator
 {
     private readonly TimeProvider _time;
+    private readonly InterArrival _interArrival = new();
     private readonly TrendlineEstimator _trendline;
     private readonly OveruseDetector _detector = new();
     private readonly AimdRateController _rateController;
 
-    private bool _hasPrevious;
-    private long _previousArrivalMicroseconds;
-    private long _previousSendMicroseconds;
     private bool _hasLastUpdate;
     private long _lastUpdateTimestamp;
 
@@ -43,8 +41,9 @@ public sealed class DelayBasedBandwidthEstimator
     public long ThroughputBitsPerSecond { get; private set; }
 
     /// <summary>
-    /// Processes one transport-cc feedback packet: feeds every received packet's delay variation to the
-    /// filter, updates the throughput estimate, and advances the rate controller once.
+    /// Processes one transport-cc feedback packet: groups the received packets into ~5 ms inter-arrival
+    /// bursts, feeds each completed group's delay variation to the filter, updates the throughput
+    /// estimate, and advances the rate controller once.
     /// </summary>
     /// <param name="feedback">The parsed feedback packet, arrival times reconstructed.</param>
     /// <param name="sendHistory">The send-time table populated by the send path.</param>
@@ -77,21 +76,20 @@ public sealed class DelayBasedBandwidthEstimator
 
             lastArrival = arrivalMicroseconds;
 
-            if (_hasPrevious)
+            // Group packets into ~5 ms bursts; only feed the filter when a group completes, using the
+            // delay variation measured between consecutive completed groups.
+            if (_interArrival.ComputeDeltas(
+                    sendMicroseconds, arrivalMicroseconds, sizeBytes,
+                    out var sendDeltaMicroseconds, out var arrivalDeltaMicroseconds, out _))
             {
-                var arrivalDeltaMs = (arrivalMicroseconds - _previousArrivalMicroseconds) / 1000.0;
-                var sendDeltaMs = (sendMicroseconds - _previousSendMicroseconds) / 1000.0;
-                var delayVariationMs = arrivalDeltaMs - sendDeltaMs;
-                _trendline.Add(delayVariationMs, arrivalMicroseconds / 1000.0);
+                var delayVariationMs = (arrivalDeltaMicroseconds - sendDeltaMicroseconds) / 1000.0;
+                var arrivalMilliseconds = arrivalMicroseconds / 1000.0;
+                _trendline.Add(delayVariationMs, arrivalMilliseconds);
                 if (_trendline.HasEstimate)
                 {
-                    _detector.Detect(_trendline.ModifiedTrend, arrivalMicroseconds / 1000.0);
+                    _detector.Detect(_trendline.ModifiedTrend, arrivalMilliseconds);
                 }
             }
-
-            _hasPrevious = true;
-            _previousArrivalMicroseconds = arrivalMicroseconds;
-            _previousSendMicroseconds = sendMicroseconds;
         }
 
         if (hasSpan && lastArrival > firstArrival)
