@@ -46,6 +46,10 @@ jobs:
   # the graceful skip local dev gets, so an interop regression fails the build rather than passing.
   pion-interop:
     runs-on: ubuntu-latest
+    # Safety bound: the PionInterop test carries its own ~75s handshake deadline, so a healthy run
+    # finishes in a couple of minutes. This ceiling guarantees a future regression can never again
+    # hang the job for the six-hour GitHub default and burn CI minutes.
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4

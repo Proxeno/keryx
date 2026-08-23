@@ -190,11 +190,13 @@ func wireCallbacks(pc *webrtc.PeerConnection, st *state) {
 		st.mu.Lock()
 		st.connectionState = cs.String()
 		st.mu.Unlock()
+		log.Printf("pion: connection state -> %s", cs)
 	})
 	pc.OnICEConnectionStateChange(func(cs webrtc.ICEConnectionState) {
 		st.mu.Lock()
 		st.iceState = cs.String()
 		st.mu.Unlock()
+		log.Printf("pion: ICE state -> %s", cs)
 	})
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -206,6 +208,8 @@ func wireCallbacks(pc *webrtc.PeerConnection, st *state) {
 			st.trackAudio = true
 		}
 		st.mu.Unlock()
+
+		log.Printf("pion: track %s ssrc=%d codec=%s", track.Kind(), track.SSRC(), track.Codec().MimeType)
 
 		if track.Kind() != webrtc.RTPCodecTypeVideo {
 			return
@@ -243,11 +247,13 @@ func wireCallbacks(pc *webrtc.PeerConnection, st *state) {
 		st.mu.Lock()
 		st.channels[dc.Label()] = entry
 		st.mu.Unlock()
+		log.Printf("pion: data channel %q (%s)", dc.Label(), dc.ReadyState())
 
 		dc.OnOpen(func() {
 			st.mu.Lock()
 			entry.ReadyState = dc.ReadyState().String()
 			st.mu.Unlock()
+			log.Printf("pion: data channel %q open", dc.Label())
 		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			st.mu.Lock()
@@ -274,10 +280,12 @@ func runAnswerer(pc *webrtc.PeerConnection, st *state, signal string) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	st.setPhase("fetching-offer")
+	log.Printf("pion: fetching offer from %s", signal+"/offer")
 	offerSDP, err := fetchOffer(client, signal+"/offer")
 	if err != nil {
 		return err
 	}
+	log.Printf("pion: offer fetched (%d bytes)", len(offerSDP))
 
 	st.setPhase("set-remote")
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
@@ -299,6 +307,7 @@ func runAnswerer(pc *webrtc.PeerConnection, st *state, signal string) error {
 		return err
 	}
 	<-gatherComplete
+	log.Printf("pion: ICE gathering complete; posting answer")
 
 	st.setPhase("posting-answer")
 	local := pc.LocalDescription()
@@ -307,6 +316,7 @@ func runAnswerer(pc *webrtc.PeerConnection, st *state, signal string) error {
 	}
 
 	st.setPhase("negotiated")
+	log.Printf("pion: answer posted; negotiated")
 	return nil
 }
 

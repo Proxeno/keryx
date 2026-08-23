@@ -20,12 +20,22 @@ namespace Keryx.IntegrationTests;
 /// Excluded from the default CI filter (<c>Category=PionInterop</c>): it needs the Go toolchain to
 /// build the peer. Its absence skips locally and — when the CI job sets <c>KERYX_REQUIRE_PION=1</c>
 /// — fails. A prebuilt peer can be supplied with <c>KERYX_PION_PEER</c>.
+///
+/// <para>The whole handshake is bounded by a single deadline (<see cref="DeadlineSeconds"/>): every
+/// await either takes the deadline token or has its own shorter timeout, so a peer that never
+/// connects — or a data channel that never opens — fails the test with a diagnostic instead of
+/// hanging CI. Progress is logged from both sides (Keryx connection/ICE/DTLS state transitions and
+/// the pion peer's periodic report) so the CI log shows exactly where a stall happens.</para>
 /// </remarks>
 public sealed class PionInteropTests
 {
     private const int HttpPort = 7984;
     private const int PionPortMin = 7800;
     private const int PionPortMax = 7899;
+
+    // One hard budget for the whole handshake. Kept under a couple of minutes so a stall fails fast
+    // in CI rather than burning the job's default six-hour ceiling.
+    private const int DeadlineSeconds = 75;
 
     private readonly ITestOutputHelper _output;
 
@@ -44,10 +54,19 @@ public sealed class PionInteropTests
             return;
         }
 
-        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        var stopwatch = Stopwatch.StartNew();
+        void Log(string message) => _output.WriteLine($"[{stopwatch.Elapsed:mm\\:ss\\.f}] {message}");
+
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(DeadlineSeconds));
         var cancellationToken = shutdown.Token;
 
         await using var peer = new PeerConnection(TestSupport.NewConfig());
+
+        // Keryx-side progress: log every connection-state transition with the ICE/DTLS state at the
+        // time, so a stall shows exactly how far the handshake got.
+        peer.OnConnectionStateChanged += (_, state) =>
+            Log($"keryx connection state -> {state} (ice={peer.IceState} dtls={peer.DtlsState})");
+
         var controllerTask = peer.CreateDataChannel("controller", ordered: false, maxRetransmits: 0);
         var telemetryTask = peer.CreateDataChannel("telemetry");
 
@@ -55,7 +74,9 @@ public sealed class PionInteropTests
         // assertion from Keryx's own side, proving the SCTP/DTLS data path both directions.
         var controllerEchoes = 0;
         var telemetryEchoes = 0;
-        void CountEcho(bool isBinary, ReadOnlySpan<byte> payload, ref int counter)
+        var controllerFirstEcho = 0;
+        var telemetryFirstEcho = 0;
+        void CountEcho(bool isBinary, ReadOnlySpan<byte> payload, ref int counter, ref int firstSeen, string label)
         {
             if (isBinary)
             {
@@ -65,20 +86,21 @@ public sealed class PionInteropTests
             if (Encoding.UTF8.GetString(payload).StartsWith("echo:", StringComparison.Ordinal))
             {
                 Interlocked.Increment(ref counter);
+                if (Interlocked.Exchange(ref firstSeen, 1) == 0)
+                {
+                    Log($"first echo on '{label}' channel");
+                }
             }
         }
 
-        var controller = await controllerTask;
-        var telemetry = await telemetryTask;
-        controller.OnMessage += (bool b, ReadOnlySpan<byte> p) => CountEcho(b, p, ref controllerEchoes);
-        telemetry.OnMessage += (bool b, ReadOnlySpan<byte> p) => CountEcho(b, p, ref telemetryEchoes);
-
-        var offerSdp = await peer.CreateOfferAsync(cancellationToken);
-
-        // ------------------------------------------------------------------ HTTP signaling host
+        // ------------------------------------------------------------------ signaling host state
         var reportLock = new object();
         string? latestReportJson = null;
         var answerApplied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Log("creating offer");
+        var offerSdp = await peer.CreateOfferAsync(cancellationToken);
+        Log("offer created; starting signaling host");
 
         using var listener = new HttpListener();
         listener.Prefixes.Add($"http://127.0.0.1:{HttpPort}/");
@@ -103,7 +125,7 @@ public sealed class PionInteropTests
                 }
                 catch (Exception ex)
                 {
-                    _output.WriteLine($"signaling host error: {ex.Message}");
+                    Log($"signaling host error: {ex.Message}");
                 }
             }
         });
@@ -125,6 +147,7 @@ public sealed class PionInteropTests
                         var body = await reader.ReadToEndAsync();
                         using var doc = JsonDocument.Parse(body);
                         var sdp = doc.RootElement.GetProperty("sdp").GetString()!;
+                        Log("answer received from pion; applying remote description");
                         await peer.SetRemoteDescriptionAsync(sdp, SdpType.Answer, cancellationToken);
                         answerApplied.TrySetResult();
                     }
@@ -149,11 +172,43 @@ public sealed class PionInteropTests
             response.Close();
         }
 
+        string? Report()
+        {
+            lock (reportLock)
+            {
+                return latestReportJson;
+            }
+        }
+
         // ------------------------------------------------------------------ pion peer
         var pionOutput = new StringBuilder();
         Process? pion = null;
+
+        // Background progress logger: every few seconds, print Keryx's view and the pion peer's
+        // latest report so a stalled handshake is diagnosable straight from the CI log.
+        using var progressStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var progressTask = Task.Run(async () =>
+        {
+            while (!progressStop.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(3000, progressStop.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                Log($"progress: keryx state={peer.State} ice={peer.IceState} dtls={peer.DtlsState} "
+                    + $"ctrlEcho={Volatile.Read(ref controllerEchoes)} telEcho={Volatile.Read(ref telemetryEchoes)}; "
+                    + $"pion report={Report() ?? "(none yet)"}");
+            }
+        });
+
         try
         {
+            Log("launching pion peer");
             pion = PionPeer.Launch(peerPath, $"http://127.0.0.1:{HttpPort}", PionPortMin, PionPortMax);
             pion.OutputDataReceived += (_, e) => { if (e.Data is not null) { lock (pionOutput) { pionOutput.AppendLine(e.Data); } } };
             pion.ErrorDataReceived += (_, e) => { if (e.Data is not null) { lock (pionOutput) { pionOutput.AppendLine(e.Data); } } };
@@ -161,13 +216,21 @@ public sealed class PionInteropTests
             pion.BeginErrorReadLine();
 
             (await Task.WhenAny(answerApplied.Task, Task.Delay(TimeSpan.FromSeconds(30), cancellationToken)))
-                .Should().Be(answerApplied.Task, "the pion peer should fetch the offer and post an answer");
+                .Should().Be(answerApplied.Task, $"the pion peer should fetch the offer and post an answer; last report: {Report()}");
 
             (await peer.WaitForConnectedAsync(TimeSpan.FromSeconds(30), cancellationToken))
-                .Should().BeTrue("ICE + DTLS should complete against pion");
-            _output.WriteLine(
-                $"connected: dtlsRole={peer.LocalDtlsRole} srtp={peer.NegotiatedSrtpProfile} "
+                .Should().BeTrue($"ICE + DTLS should complete against pion; last report: {Report()}");
+            Log($"connected: dtlsRole={peer.LocalDtlsRole} srtp={peer.NegotiatedSrtpProfile} "
                 + $"remoteFp={peer.RemoteFingerprint?[..Math.Min(23, peer.RemoteFingerprint!.Length)]}...");
+
+            // The data channels were requested before the handshake, so their tasks stayed pending
+            // until SCTP came up (right after DTLS connected). Await them now, bounded, so a channel
+            // that never materializes fails fast instead of hanging.
+            var controller = await controllerTask.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+            var telemetry = await telemetryTask.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
+            Log($"data channels resolved (controller={controller.State} telemetry={telemetry.State})");
+            controller.OnMessage += (bool b, ReadOnlySpan<byte> p) => CountEcho(b, p, ref controllerEchoes, ref controllerFirstEcho, "controller");
+            telemetry.OnMessage += (bool b, ReadOnlySpan<byte> p) => CountEcho(b, p, ref telemetryEchoes, ref telemetryFirstEcho, "telemetry");
 
             // -------------------------------------------------------------- media + ping pumps
             var accessUnits = H264TestStream.ReadAccessUnits(maxAccessUnits: 90); // the full 3 s asset
@@ -220,12 +283,7 @@ public sealed class PionInteropTests
             var healthy = await TestSupport.WaitForAsync(
                 () =>
                 {
-                    string? json;
-                    lock (reportLock)
-                    {
-                        json = latestReportJson;
-                    }
-
+                    var json = Report();
                     if (json is null)
                     {
                         return false;
@@ -246,14 +304,9 @@ public sealed class PionInteropTests
                 },
                 timeoutMilliseconds: 45_000);
 
-            string? lastJson;
-            lock (reportLock)
-            {
-                lastJson = latestReportJson;
-            }
-
-            _output.WriteLine($"final pion report: {lastJson ?? "(none)"}");
-            _output.WriteLine($"keryx echoes: controller={Volatile.Read(ref controllerEchoes)} telemetry={Volatile.Read(ref telemetryEchoes)}");
+            var lastJson = Report();
+            Log($"final pion report: {lastJson ?? "(none)"}");
+            Log($"keryx echoes: controller={Volatile.Read(ref controllerEchoes)} telemetry={Volatile.Read(ref telemetryEchoes)}");
 
             healthy.Should().BeTrue(
                 $"pion should decode Keryx video and echo on both channels; last report: {lastJson}");
@@ -268,12 +321,11 @@ public sealed class PionInteropTests
 
             var stats = peer.GetStats();
             stats.Video.Should().NotBeNull();
-            var video = stats.Video!.Value;
-            video.PacketsSent.Should().BeGreaterThan(60);
+            var videoStats = stats.Video!.Value;
+            videoStats.PacketsSent.Should().BeGreaterThan(60);
             Volatile.Read(ref controllerEchoes).Should().BeGreaterThan(2, "the controller channel must round-trip");
             Volatile.Read(ref telemetryEchoes).Should().BeGreaterThan(2, "the telemetry channel must round-trip");
-            _output.WriteLine(
-                $"keryx stats: videoPkts={video.PacketsSent} videoBytes={video.BytesSent} "
+            Log($"keryx stats: videoPkts={videoStats.PacketsSent} videoBytes={videoStats.BytesSent} "
                 + $"pli={stats.Feedback.PictureLossIndications} rr={stats.Feedback.ReceiverReports}");
 
             shutdown.Cancel();
@@ -281,6 +333,9 @@ public sealed class PionInteropTests
         }
         finally
         {
+            progressStop.Cancel();
+            await Task.WhenAny(progressTask, Task.Delay(2000));
+
             lock (pionOutput)
             {
                 if (pionOutput.Length > 0)
@@ -289,6 +344,7 @@ public sealed class PionInteropTests
                 }
             }
 
+            _output.WriteLine($"last pion report: {Report() ?? "(none)"}");
             PionPeer.Cleanup(pion);
             listener.Stop();
             await Task.WhenAny(serverTask, Task.Delay(2000));
