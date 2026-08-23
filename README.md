@@ -99,21 +99,7 @@ raw RTCP parsing in your application:
 
 ## Architecture
 
-```mermaid
-graph TD
-    PC["Keryx — PeerConnection"]
-    SDP["Keryx.Sdp"]
-    RTP["Keryx.Rtp"]
-    SRTP["Keryx.Srtp"]
-    SCTP["Keryx.Sctp"]
-    DTLS["Keryx.Dtls"]
-    ICE["Keryx.Ice"]
-    STUN["Keryx.Stun"]
-    CORE["Keryx.Core"]
-    PC --> SDP & RTP & SRTP & SCTP & DTLS & ICE
-    ICE --> STUN
-    SDP & RTP & SRTP & SCTP & DTLS & STUN --> CORE
-```
+![Keryx architecture — the PeerConnection composition root built on Sdp, Rtp, Srtp, Sctp, Dtls, and Ice (over Stun), all resting on Keryx.Core](https://raw.githubusercontent.com/Proxeno/keryx/main/docs/assets/architecture.png)
 
 At runtime everything multiplexes over one UDP socket (BUNDLE + rtcp-mux): ICE consumes STUN,
 DTLS records (first byte 20–63) carry SCTP, and SRTP/SRTCP (128–191) carry media — see
