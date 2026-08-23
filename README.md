@@ -208,7 +208,7 @@ transport primitives (RID / `a=simulcast` negotiation and ingest demux are compl
 forwarding is scaffolded).
 
 **Not implemented (yet, honestly):** ULPFEC and RED, REMB generation, regular (non-aggressive)
-nomination, renegotiation and ICE restart, IPv6 *relay* allocation, SCTP stream reset (RE-CONFIG),
+nomination, renegotiation and ICE restart, IPv6 *relay* allocation,
 jitter buffering on the receive surface, audio receive processing. Per-layer simplifications are
 documented in [docs/layers/](docs/layers).
 

@@ -85,6 +85,7 @@ public abstract class SctpChunk
             SctpChunkType.CookieAck => new SctpCookieAckChunk(),
             SctpChunkType.ShutdownComplete => new SctpShutdownCompleteChunk(),
             SctpChunkType.ForwardTsn => SctpForwardTsnChunk.ParseBody(body),
+            SctpChunkType.ReConfig => SctpReConfigChunk.ParseBody(body),
             _ => new SctpUnknownChunk(type, body.ToArray()),
         };
 

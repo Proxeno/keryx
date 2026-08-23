@@ -25,12 +25,26 @@ than for kernel-grade SCTP.
 ## Simplifications (documented, deliberate)
 
 - Congestion control is honest-but-simplified slow start/congestion avoidance, not a tuned stack.
-- No RE-CONFIG/stream reset: closing a single channel does not reset the stream on the wire.
 - INIT collision handled for the simple case only (our deployments have a known initiator).
+
+## Stream reset (RFC 6525 RE-CONFIG)
+
+- Advertised in INIT/INIT-ACK via the Supported Extensions parameter (chunk type 130) and
+  negotiated per association; a reset is only driven when the peer advertised it too.
+- Closing a `DataChannel` drives an outgoing RE-CONFIG carrying an Outgoing SSN Reset Request for
+  its stream once that stream's data has been acknowledged (queued behind in-flight data, one
+  request outstanding at a time). The identifier is freed on the Re-configuration Response and
+  reused by the next channel, so a long-lived peer that opens/closes many channels does not
+  exhaust the id space.
+- A peer-initiated reset resets the matching incoming stream, closes the mirror channel, and is
+  answered with a Re-configuration Response; a request whose Sender's Last Assigned TSN has not yet
+  been received is deferred until it has.
 
 ## Testing
 
-45 tests: CRC32c check vectors (cited), codec round-trips for every chunk incl. padding rules,
-DCEP byte vectors, and loopback association suites over in-memory transports: fragmentation
-(large messages), unordered delivery under reordering, maxRetransmits=0 abandonment under loss
-with continued flow (FORWARD-TSN), reliable delivery through drops, shutdown/abort.
+58 tests: CRC32c check vectors (cited), codec round-trips for every chunk incl. padding rules and
+the RE-CONFIG parameters, DCEP byte vectors, and loopback association suites over in-memory
+transports: fragmentation (large messages), unordered delivery under reordering, maxRetransmits=0
+abandonment under loss with continued flow (FORWARD-TSN), reliable delivery through drops,
+shutdown/abort, and stream reset (RE-CONFIG advertised in INIT, channels closed then their ids
+reused, peer-initiated reset answered).
