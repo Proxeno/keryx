@@ -33,7 +33,7 @@ public sealed class ChromeInteropTests
     [Trait("Category", "ChromeInterop")]
     public async Task ChromeDecodesKeryxVideoAndDataChannelsRoundTrip()
     {
-        var chromePath = ChromeBrowser.Find();
+        var chromePath = ChromeBrowser.Require();
         if (chromePath is null)
         {
             _output.WriteLine("SKIPPED: Google Chrome not found (set KERYX_CHROME_PATH to enable).");
@@ -144,14 +144,10 @@ public sealed class ChromeInteropTests
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
-        chrome.StartInfo.ArgumentList.Add("--headless=new");
-        chrome.StartInfo.ArgumentList.Add("--disable-gpu");
-        chrome.StartInfo.ArgumentList.Add("--mute-audio");
-        chrome.StartInfo.ArgumentList.Add("--no-first-run");
-        chrome.StartInfo.ArgumentList.Add("--no-default-browser-check");
-        chrome.StartInfo.ArgumentList.Add("--autoplay-policy=no-user-gesture-required");
-        chrome.StartInfo.ArgumentList.Add($"--user-data-dir={userDataDir}");
-        chrome.StartInfo.ArgumentList.Add($"http://127.0.0.1:{HttpPort}/");
+        foreach (var argument in ChromeBrowser.Arguments($"http://127.0.0.1:{HttpPort}/", userDataDir))
+        {
+            chrome.StartInfo.ArgumentList.Add(argument);
+        }
 
         try
         {

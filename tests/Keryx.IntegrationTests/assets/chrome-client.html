@@ -1,12 +1,29 @@
 <!doctype html>
 <!--
   Keryx Chrome interop client. Served by the integration test host; drives a real
-  RTCPeerConnection against a Keryx peer over HTTP signaling:
-    GET  /offer   -> { type: "offer", sdp }        (Keryx is always the offerer)
-    POST /answer  <- { type: "answer", sdp }       (sent once ICE gathering completes)
-    POST /report  <- periodic JSON status snapshots the test asserts on
-  Data channels are opened by Keryx ("controller", "telemetry"); every received
-  message "ping:N" is echoed back as "echo:N".
+  RTCPeerConnection against a Keryx peer over HTTP signaling. One role-flexible
+  fixture: the ?role= query string picks who offers and in which direction, so the
+  same page covers the media-server shape (Keryx offers) and the SFU shapes (the
+  browser offers, Keryx answers). A sibling project extends this same page — do not
+  fork it.
+
+    ?role=answer      (default) Keryx offers; the browser answers.
+        GET  /offer   -> { type: "offer",  sdp }   (Keryx is the offerer)
+        POST /answer  <- { type: "answer", sdp }   (sent once ICE gathering completes)
+
+    ?role=offer-send  the browser offers sendonly; Keryx answers and receives.
+        POST /offer   <- { type: "offer",  sdp }   (browser offer, ICE embedded)
+                      -> { type: "answer", sdp }   (Keryx's answer, in the response)
+        A synthetic canvas video track is sent, so Keryx sees inbound RTP.
+
+    ?role=offer-recv  the browser offers recvonly; Keryx answers sendonly and forwards.
+        POST /offer   <- { type: "offer",  sdp }   (browser offer, ICE embedded)
+                      -> { type: "answer", sdp }   (Keryx's sendonly answer)
+        Keryx forwards RTP with TryForwardRtp(); the browser reports what it received.
+
+  In every role the browser POSTs periodic JSON status snapshots to /report that the
+  test asserts on. Data channels Keryx opens ("controller", "telemetry") are echoed:
+  every "ping:N" comes back as "echo:N".
 -->
 <html>
 <head><meta charset="utf-8"><title>keryx interop</title></head>
@@ -14,8 +31,10 @@
 <video id="v" autoplay muted playsinline></video>
 <script>
 "use strict";
+const role = new URLSearchParams(location.search).get("role") || "answer";
 const state = {
   phase: "boot",
+  role,
   error: null,
   connectionState: "new",
   iceConnectionState: "new",
@@ -26,7 +45,9 @@ const state = {
            frameWidth: 0, frameHeight: 0, packetsReceived: 0, packetsLost: 0,
            pliCount: 0, nackCount: 0, keyFramesDecoded: 0, decoderImplementation: "",
            framesPerSecond: 0, jitter: 0, freezeCount: 0, ssrc: 0,
-           retransmittedPacketsReceived: 0, retransmittedBytesReceived: 0 },
+           retransmittedPacketsReceived: 0, retransmittedBytesReceived: 0,
+           // Outbound counters, meaningful when the browser is the sender (offer-send).
+           packetsSent: 0, bytesSent: 0, framesEncoded: 0 },
   // A rolling trajectory, so the test can see decoding keep up rather than only its end state.
   samples: [],
   videoElement: { width: 0, height: 0, readyState: 0 },
@@ -51,6 +72,22 @@ function wireChannel(dc) {
       entry.echoed += 1;
     }
   };
+}
+
+// A moving, always-changing picture so Chrome's encoder produces a steady RTP stream
+// (a still frame would be encoded once and then go quiet). Used only by role=offer-send.
+function makeSyntheticVideoTrack() {
+  const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 240 });
+  const ctx = canvas.getContext("2d");
+  let f = 0;
+  setInterval(() => {
+    f = (f + 1) & 0xff;
+    ctx.fillStyle = "rgb(" + f + "," + ((f * 2) & 255) + "," + ((f * 3) & 255) + ")";
+    ctx.fillRect(0, 0, 320, 240);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(f % 296, (f * 2) % 216, 24, 24);
+  }, 33);
+  return canvas.captureStream(30).getVideoTracks()[0];
 }
 
 async function pollStats(pc) {
@@ -88,9 +125,64 @@ async function pollStats(pc) {
     if (r.type === "inbound-rtp" && r.kind === "audio") {
       state.stats.audioBytesReceived = r.bytesReceived ?? 0;
     }
+    if (r.type === "outbound-rtp" && r.kind === "video") {
+      state.stats.packetsSent = r.packetsSent ?? 0;
+      state.stats.bytesSent = r.bytesSent ?? 0;
+      state.stats.framesEncoded = r.framesEncoded ?? 0;
+    }
   }
   const v = document.getElementById("v");
   state.videoElement = { width: v.videoWidth, height: v.videoHeight, readyState: v.readyState };
+}
+
+async function gatherIce(pc) {
+  if (pc.iceGatheringState === "complete") { return; }
+  await new Promise((resolve) => {
+    const check = () => { if (pc.iceGatheringState === "complete") { resolve(); } };
+    pc.onicegatheringstatechange = check;
+    setTimeout(resolve, 3000); // localhost gathering is fast; don't hang forever
+    check();
+  });
+}
+
+// role=answer: Keryx is the offerer; the browser fetches the offer and answers it.
+async function runAnswerer(pc) {
+  state.phase = "fetching-offer";
+  const offer = await (await fetch("/offer")).json();
+  state.phase = "have-offer";
+  await pc.setRemoteDescription(offer);
+  state.phase = "set-remote";
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  state.phase = "gathering";
+  await gatherIce(pc);
+  state.phase = "posting-answer";
+  await fetch("/answer", { method: "POST", headers: { "content-type": "application/json" },
+                           body: JSON.stringify({ type: "answer", sdp: pc.localDescription.sdp }) });
+  state.phase = "negotiated";
+}
+
+// role=offer-send / offer-recv: the browser is the offerer (the SFU shapes). It POSTs the
+// offer with ICE embedded and Keryx returns its answer in the same response.
+async function runOfferer(pc, direction) {
+  if (direction === "sendonly") {
+    const track = makeSyntheticVideoTrack();
+    pc.addTransceiver(track, { direction: "sendonly" });
+  } else {
+    pc.addTransceiver("video", { direction: "recvonly" });
+  }
+  state.phase = "creating-offer";
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  state.phase = "gathering";
+  await gatherIce(pc);
+  state.phase = "posting-offer";
+  const resp = await fetch("/offer", { method: "POST", headers: { "content-type": "application/json" },
+                                       body: JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }) });
+  const answer = await resp.json();
+  state.phase = "have-answer";
+  await pc.setRemoteDescription(answer);
+  state.phase = "negotiated";
 }
 
 async function main() {
@@ -106,26 +198,14 @@ async function main() {
     }
   };
 
-  state.phase = "fetching-offer";
-  const offer = await (await fetch("/offer")).json();
-  state.phase = "have-offer";
-  await pc.setRemoteDescription(offer);
-  state.phase = "set-remote";
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  state.phase = "gathering";
-  if (pc.iceGatheringState !== "complete") {
-    await new Promise((resolve) => {
-      const check = () => { if (pc.iceGatheringState === "complete") { resolve(); } };
-      pc.onicegatheringstatechange = check;
-      setTimeout(resolve, 3000); // localhost gathering is fast; don't hang forever
-      check();
-    });
+  if (role === "offer-send") {
+    await runOfferer(pc, "sendonly");
+  } else if (role === "offer-recv") {
+    await runOfferer(pc, "recvonly");
+  } else {
+    await runAnswerer(pc);
   }
-  state.phase = "posting-answer";
-  await fetch("/answer", { method: "POST", headers: { "content-type": "application/json" },
-                           body: JSON.stringify({ type: "answer", sdp: pc.localDescription.sdp }) });
-  state.phase = "negotiated";
+
   setInterval(() => pollStats(pc).catch(() => {}), 250);
   setInterval(report, 400);
 }
