@@ -186,10 +186,18 @@ public sealed class RtxLossSweepTests
         report.MalformedRepairs.Should().Be(0);
 
         // A duplicated datagram is a replayed SRTP packet: RFC 3711 §3.3.2 makes the receiver's
-        // replay list refuse it before it can reach the media path, so it is never counted twice and
-        // never mistaken for a second packet.
-        report.DuplicateArrivals.Should().Be(0);
+        // replay list refuse it before it can reach the media path, so a link-level duplicate is never
+        // mistaken for a second media packet.
         report.ReceiverSrtpRejections.Should().BeGreaterThanOrEqualTo(report.PacketsDuplicated);
-        report.ArrivedDirectly.Should().Be(report.WindowSize - report.RecoveredByRtx);
+
+        // Nothing was dropped, so nothing was truly lost: every packet arrived directly.
+        report.RecoveredByRtx.Should().Be(0);
+        report.ArrivedDirectly.Should().Be(report.WindowSize);
+
+        // The only duplicate deliveries are decapsulated RTX repairs the receiver served into the media
+        // path for packets a NACK asked for during their reorder delay and that then also arrived
+        // directly — at most one per retransmitted packet, and never a link-level replay.
+        report.DuplicateArrivals.Should().BeLessThanOrEqualTo(
+            (int)report.Retransmission!.Value.PacketsRetransmitted);
     }
 }

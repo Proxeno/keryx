@@ -201,7 +201,7 @@ public sealed class RetransmissionTests
         await using var answerer = new PeerConnection(TestSupport.NewConfig());
 
         var videoSequenceNumbers = new ConcurrentQueue<ushort>();
-        var repairs = new ConcurrentQueue<(byte PayloadType, uint Ssrc, ushort OriginalSequenceNumber)>();
+        var deliveries = new ConcurrentDictionary<ushort, int>();
 
         offerer.OnLocalIceCandidate += (_, e) => answerer.AddIceCandidate(e.Candidate, e.SdpMid);
         answerer.OnRtpPacketReceived += (in RtpPacketInfo info, ReadOnlySpan<byte> payload) =>
@@ -211,15 +211,11 @@ public sealed class RetransmissionTests
                 return;
             }
 
-            if (info.PayloadType == offerer.NegotiatedVideoRtxPayloadType
-                && RtxPacket.TryReadOriginalSequenceNumber(payload, out var osn))
-            {
-                repairs.Enqueue((info.PayloadType, info.Ssrc, osn));
-            }
-            else
-            {
-                videoSequenceNumbers.Enqueue(info.SequenceNumber);
-            }
+            // The receiver decapsulates RTX itself now: a repair arrives as ordinary media on its
+            // original sequence number and the media payload type, never as a raw rtx-payload-type
+            // packet, so a NACKed packet already delivered once is simply delivered again.
+            deliveries.AddOrUpdate(info.SequenceNumber, 1, (_, count) => count + 1);
+            videoSequenceNumbers.Enqueue(info.SequenceNumber);
         };
 
         var offer = await offerer.CreateOfferAsync(cancellationToken);
@@ -245,16 +241,15 @@ public sealed class RetransmissionTests
 
         // Ask for three packets the receiver did in fact get: the sender cannot tell the difference,
         // and this keeps the test independent of whether the loopback ever loses anything.
-        var seen = videoSequenceNumbers.ToArray();
+        var seen = videoSequenceNumbers.Distinct().ToArray();
         var wanted = new[] { seen[0], seen[1], seen[3] };
         answerer.SendNack(offerer.VideoSsrc, wanted).Should().BeTrue();
 
-        (await TestSupport.WaitForAsync(() => repairs.Count >= 3)).Should().BeTrue();
-
-        var repaired = repairs.ToArray();
-        repaired.Should().OnlyContain(r => r.Ssrc == offerer.VideoRtxSsrc);
-        repaired.Should().OnlyContain(r => r.PayloadType == 97);
-        repaired.Select(r => r.OriginalSequenceNumber).Should().Contain(wanted);
+        // The sender served each NACKed packet as an RTX repair and the answerer decapsulated it back to
+        // the original media packet: every one, already delivered once directly, is delivered a second
+        // time on its original sequence number.
+        (await TestSupport.WaitForAsync(() => wanted.All(seq => deliveries.GetValueOrDefault(seq) >= 2)))
+            .Should().BeTrue();
 
         var retransmission = offerer.GetStats().Video!.Value.Retransmission!.Value;
         retransmission.RtxSsrc.Should().Be(offerer.VideoRtxSsrc);

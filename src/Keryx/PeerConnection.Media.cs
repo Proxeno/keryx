@@ -28,6 +28,11 @@ public sealed partial class PeerConnection
 
     private readonly object _sendLock = new();
     private readonly byte[] _rxPlain = new byte[2048];
+
+    // Scratch buffer the reconstructed media packet is written into when an inbound RFC 4588 RTX packet
+    // is decapsulated. Distinct from _rxPlain (which still holds the RTX packet being read) so the two
+    // never overlap, and touched only from the single ICE receive loop that drives HandleRtp.
+    private readonly byte[] _rtxRecovered = new byte[2048];
     private readonly byte[] _rtcpTx = new byte[1500];
 
     /// <summary>The <c>a=extmap</c> id offered for the transport-wide congestion-control extension.</summary>
@@ -44,6 +49,11 @@ public sealed partial class PeerConnection
     private RtpForwarderHandle _videoForwarder = null!;
     private RtpForwarderHandle _audioForwarder = null!;
     private Dictionary<byte, RtpRoute> _routes = [];
+
+    // Maps a remote RFC 4588 repair SSRC to the media SSRC it repairs, learned from the peer's
+    // a=ssrc-group:FID lines (RFC 5576 §4.2). An inbound RTX packet is decapsulated onto this media
+    // source. Volatile-published from the negotiation path; only read from the ICE receive loop.
+    private Dictionary<uint, uint> _rtxSsrcToMediaSsrc = [];
     private Dictionary<string, SimulcastReceiveTracker> _simulcastByMid = new(StringComparer.Ordinal);
 
     // The most recently demultiplexed remote SSRC per media kind, boxed so a reference write/read is
@@ -896,14 +906,93 @@ public sealed partial class PeerConnection
 
         Interlocked.Increment(ref _rtpReceived);
 
-        var payloadType = packet.Header.PayloadType;
         var routes = Volatile.Read(ref _routes);
-        var route = routes.TryGetValue(payloadType, out var found) ? found : new RtpRoute(string.Empty, MediaKind.Unknown);
+        var route = routes.TryGetValue(packet.Header.PayloadType, out var found)
+            ? found
+            : new RtpRoute(string.Empty, MediaKind.Unknown);
+
+        // RFC 4588 §4: an inbound RTX packet repeats an original media packet on its own SSRC, payload
+        // type and sequence space. Turn it back into the packet it repairs and feed *that* through the
+        // ordinary receive path, so a recovered packet reaches the depacketizer, updates reception
+        // statistics and fills the loss detector's gap exactly as a directly received packet would — and
+        // so it is not re-NACKed. The raw repair packet is never surfaced to the application handler.
+        if (route.IsRtx)
+        {
+            HandleInboundRtx(route, packet, _rxPlain.AsSpan(0, length), routes);
+            return;
+        }
+
+        DeliverInboundMedia(route, packet, routes);
+    }
+
+    /// <summary>
+    /// Decapsulates one inbound RFC 4588 RTX packet back to the media packet it repairs and delivers it
+    /// through the ordinary receive path. The repair carries its own SSRC, payload type and sequence
+    /// number; the media SSRC is recovered from the RFC 5576 FID association (falling back to the last
+    /// media SSRC learned for this kind), the media payload type from the repair route's <c>apt</c>, and
+    /// the original sequence number from the RTX payload's OSN prefix.
+    /// </summary>
+    private void HandleInboundRtx(
+        RtpRoute route,
+        in RtpPacket rtxPacket,
+        ReadOnlySpan<byte> rtxDatagram,
+        Dictionary<byte, RtpRoute> routes)
+    {
+        var rtxToMedia = Volatile.Read(ref _rtxSsrcToMediaSsrc);
+        if (!rtxToMedia.TryGetValue(rtxPacket.Header.Ssrc, out var mediaSsrc))
+        {
+            // No FID association for this repair SSRC. A non-simulcast section carries a single media
+            // source, so the last media SSRC learned for the kind is the one being repaired; without
+            // even that, there is no source to attribute the repair to, so drop it rather than guess.
+            var learned = route.Kind switch
+            {
+                MediaKind.Video => (uint?)_remoteVideoSsrc,
+                MediaKind.Audio => (uint?)_remoteAudioSsrc,
+                _ => null,
+            };
+
+            if (learned is not { } knownMediaSsrc)
+            {
+                return;
+            }
+
+            mediaSsrc = knownMediaSsrc;
+        }
+
+        if (!RtxPacket.TryDecapsulate(
+                rtxDatagram,
+                mediaSsrc,
+                route.AptPayloadType,
+                _rtxRecovered,
+                out var recoveredLength,
+                out _)
+            || !RtpPacket.TryParse(_rtxRecovered.AsSpan(0, recoveredLength), out var recovered))
+        {
+            return;
+        }
+
+        // Route the reconstructed packet by its recovered (media) payload type so it lands on the media
+        // stream's kind, mid and clock rate rather than the repair route it arrived on.
+        var mediaRoute = routes.TryGetValue(recovered.Header.PayloadType, out var mediaFound)
+            ? mediaFound
+            : route with { IsRtx = false };
+
+        DeliverInboundMedia(mediaRoute, recovered, routes);
+    }
+
+    /// <summary>
+    /// Delivers one received media packet through the receive path: it moves the per-kind remote SSRC
+    /// snapshot, folds into the RFC 3550 reception statistics and inbound loss detector, and — when a
+    /// handler is attached — dispatches it in arrival order or through the per-source jitter buffer. Both
+    /// directly received packets and packets reconstructed from an RTX repair flow through here.
+    /// </summary>
+    private void DeliverInboundMedia(RtpRoute route, in RtpPacket packet, Dictionary<byte, RtpRoute> routes)
+    {
+        var payloadType = packet.Header.PayloadType;
 
         // Track the sender's SSRC per kind for GetRemoteSsrc, straight off the same demux resolution
         // OnRtpPacketReceived is about to see. This is a plain last-writer-wins snapshot, not a full
-        // source table: an RTX repair stream routes to the same kind as its media stream, so it can
-        // also move this value, matching the demux's existing kind resolution.
+        // source table.
         if (route.Kind == MediaKind.Video)
         {
             _remoteVideoSsrc = packet.Header.Ssrc;
@@ -918,14 +1007,6 @@ public sealed partial class PeerConnection
             packet.Header.Ssrc,
             packet.Header.SequenceNumber,
             packet.Header.Timestamp);
-
-        // A repair arriving for a packet the loss detector NACKed clears it from the missing set, so it is
-        // not asked for again. RFC 4588 §4: the RTX payload is prefixed with the original sequence number.
-        if (_config.EnableReceiverNack && route is { IsRtx: true, Kind: MediaKind.Video }
-            && RtxPacket.TryReadOriginalSequenceNumber(packet.Payload, out var recoveredSequenceNumber))
-        {
-            MarkRtxRecovered(recoveredSequenceNumber);
-        }
 
         var handler = OnRtpPacketReceived;
 
@@ -1085,26 +1166,6 @@ public sealed partial class PeerConnection
         if (_receiverNackScratch.Count > 0 && SendNack(ssrc, _receiverNackScratch))
         {
             Interlocked.Increment(ref _receiverNacksSent);
-        }
-    }
-
-    /// <summary>
-    /// Marks an original media sequence number recovered when its RFC 4588 repair arrives, so the inbound
-    /// loss detector stops NACKing it. The repair travels on the RTX SSRC and sequence space, a different
-    /// source than the media stream, so it never reaches the media source's detector on its own; this
-    /// bridges it back by the original sequence number it reconstructs.
-    /// </summary>
-    private void MarkRtxRecovered(ushort originalSequenceNumber)
-    {
-        lock (_receiveStatsLock)
-        {
-            foreach (var (_, stats) in _receiveStats)
-            {
-                if (stats.Kind == MediaKind.Video)
-                {
-                    stats.NackTracker?.OnRecovered(originalSequenceNumber);
-                }
-            }
         }
     }
 

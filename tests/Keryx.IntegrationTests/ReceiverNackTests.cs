@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using FluentAssertions;
-using Keryx.Rtp;
 using Keryx.Sdp;
 using Xunit;
 
@@ -27,6 +26,7 @@ public sealed class ReceiverNackTests
         // The sender serves RFC 4588 retransmission; a fault injector under its SRTP drops a fraction of
         // the video media stream so the receiver has real gaps to detect.
         uint mediaSsrc = 0;
+        var dropped = new ConcurrentDictionary<ushort, byte>();
         var senderConfig = TestSupport.NewConfig();
         senderConfig.TransportInterceptor = inner => new FaultInjectingDatagramTransport(
             inner,
@@ -35,6 +35,17 @@ public sealed class ReceiverNackTests
                 DropProbability = 0.06,
                 Selector = datagram => DatagramClassifier.IsSrtpMedia(datagram)
                     && DatagramClassifier.ReadSsrc(datagram) == Volatile.Read(ref mediaSsrc),
+
+                // Record which media sequence numbers were dropped outright, so the test can prove a
+                // genuinely lost packet — never delivered directly — still reached the handler as normal
+                // media once its RTX repair was decapsulated on the receiver.
+                Observer = (fault, datagram) =>
+                {
+                    if (fault is DatagramFault.Dropped or DatagramFault.BurstDropped)
+                    {
+                        dropped[DatagramClassifier.ReadSequenceNumber(datagram)] = 1;
+                    }
+                },
             },
             seed: 20260823);
 
@@ -48,11 +59,12 @@ public sealed class ReceiverNackTests
         Volatile.Write(ref mediaSsrc, sender.VideoSsrc);
 
         var arrived = new ConcurrentDictionary<ushort, byte>();
-        var recovered = new ConcurrentDictionary<ushort, byte>();
         byte? rtxPayloadType = null;
 
         sender.OnLocalIceCandidate += (_, e) => receiver.AddIceCandidate(e.Candidate, e.SdpMid);
 
+        // The receiver now decapsulates RTX repairs itself: a recovered packet is delivered as ordinary
+        // media on its original SSRC/sequence/payload type, not as a raw rtx-payload-type packet.
         receiver.OnRtpPacketReceived += (in RtpPacketInfo info, ReadOnlySpan<byte> payload) =>
         {
             if (info.Kind != MediaKind.Video)
@@ -60,14 +72,9 @@ public sealed class ReceiverNackTests
                 return;
             }
 
-            if (rtxPayloadType is { } rtxPt && info.PayloadType == rtxPt)
+            if (rtxPayloadType is { } rtxPt)
             {
-                if (RtxPacket.TryReadOriginalSequenceNumber(payload, out var osn))
-                {
-                    recovered[osn] = 1;
-                }
-
-                return;
+                info.PayloadType.Should().NotBe(rtxPt, "decapsulated packets carry the media payload type");
             }
 
             arrived[info.SequenceNumber] = 1;
@@ -95,11 +102,12 @@ public sealed class ReceiverNackTests
         }
 
         // The receiver detected gaps and emitted NACKs of its own accord, the sender served RTX repairs,
-        // and at least one genuinely lost packet (never seen directly) came back as a repair.
+        // and at least one genuinely lost packet — dropped outright, so never delivered directly — was
+        // recovered from its RTX repair and delivered as ordinary media.
         (await TestSupport.WaitForAsync(
                 () => receiver.GetStats().Feedback.NacksSent > 0
                     && sender.GetStats().Video!.Value.Retransmission!.Value.PacketsRetransmitted > 0
-                    && recovered.Keys.Any(seq => !arrived.ContainsKey(seq)),
+                    && dropped.Keys.Any(arrived.ContainsKey),
                 15_000))
             .Should().BeTrue();
 
