@@ -1,0 +1,25 @@
+%% Source for the README architecture diagram (rendered to architecture.png).
+%% nuget.org does not render ```mermaid fences, so the README embeds the PNG.
+%% Regenerate after editing:
+%%   mmdc -i docs/assets/architecture.mmd -o docs/assets/architecture.png \
+%%        -c docs/assets/mermaid.config.json -b "#f6f4f0" -s 3
+graph TD
+    PC["Keryx — PeerConnection"]
+    SDP["Keryx.Sdp"]
+    RTP["Keryx.Rtp"]
+    SRTP["Keryx.Srtp"]
+    SCTP["Keryx.Sctp"]
+    DTLS["Keryx.Dtls"]
+    ICE["Keryx.Ice"]
+    STUN["Keryx.Stun"]
+    CORE["Keryx.Core"]
+    PC --> SDP & RTP & SRTP & SCTP & DTLS & ICE
+    ICE --> STUN
+    SDP & RTP & SRTP & SCTP & DTLS & STUN --> CORE
+
+    classDef root fill:#e8912d,stroke:#b46f1f,stroke-width:2px,color:#1a1305,font-weight:bold;
+    classDef base fill:#2b2b33,stroke:#4a4a55,stroke-width:1.5px,color:#f2efe9;
+    classDef layer fill:#ffffff,stroke:#c9c4ba,stroke-width:1.5px,color:#26231d;
+    class PC root;
+    class CORE base;
+    class SDP,RTP,SRTP,SCTP,DTLS,ICE,STUN layer;

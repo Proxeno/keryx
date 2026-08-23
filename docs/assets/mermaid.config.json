@@ -1,0 +1,9 @@
+{
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "-apple-system, Segoe UI, Helvetica, Arial, sans-serif",
+    "fontSize": "16px",
+    "lineColor": "#9a948a"
+  },
+  "flowchart": { "curve": "basis", "nodeSpacing": 45, "rankSpacing": 55 }
+}
