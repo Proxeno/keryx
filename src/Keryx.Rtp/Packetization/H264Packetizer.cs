@@ -69,8 +69,11 @@ public sealed class H264Packetizer : IRtpPayloadizer
     /// <inheritdoc />
     /// <exception cref="ArgumentNullException"><paramref name="writer"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxPayloadSize"/> leaves no room for a FU-A header.</exception>
-    public int Packetize(ReadOnlySpan<byte> frame, int maxPayloadSize, IRtpPayloadWriter writer)
+    public int Packetize(ReadOnlySpan<byte> frame, uint rtpTimestamp, int maxPayloadSize, IRtpPayloadWriter writer)
     {
+        // H.264's marker bit means end-of-access-unit, not talkspurt start, so the RTP timestamp plays
+        // no part in it: rtpTimestamp is ignored here and the marker stays keyed off the last NAL unit.
+        _ = rtpTimestamp;
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxPayloadSize, FuAHeaderLength + 1);
 
