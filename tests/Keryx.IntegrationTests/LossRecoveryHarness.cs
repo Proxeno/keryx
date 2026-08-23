@@ -456,33 +456,39 @@ internal static class LossRecoveryHarness
         }
 
         // ------------------------------------------------------------------ settle: keep re-NACKing the tail
+        bool NoGapsInWindow()
+        {
+            var start = Volatile.Read(ref first);
+            var top = Volatile.Read(ref highest);
+            for (var i = 0; i < top; i++)
+            {
+                var sequenceNumber = unchecked((ushort)(start + i));
+                if (!arrived.Contains(sequenceNumber) && !recovered.Contains(sequenceNumber))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         var settleDeadline = Environment.TickCount64 + scenario.SettleMilliseconds;
         await TestSupport.WaitForAsync(
-            () =>
-            {
-                if (Environment.TickCount64 >= settleDeadline)
-                {
-                    return true;
-                }
-
-                var start = Volatile.Read(ref first);
-                var top = Volatile.Read(ref highest);
-                for (var i = 0; i < top; i++)
-                {
-                    var sequenceNumber = unchecked((ushort)(start + i));
-                    if (!arrived.Contains(sequenceNumber) && !recovered.Contains(sequenceNumber))
-                    {
-                        return false;
-                    }
-                }
-
-                return true;
-            },
+            () => Environment.TickCount64 >= settleDeadline || NoGapsInWindow(),
             scenario.SettleMilliseconds).ConfigureAwait(false);
 
         await nackLoop.CancelAsync().ConfigureAwait(false);
         await nackTask.ConfigureAwait(false);
         injector?.Flush();
+
+        // Flush() only hands a held-for-reorder or still-delayed datagram to the socket; it does not
+        // wait for the receiver's callback to run. A packet that the injector was still sitting on at
+        // the settle deadline (e.g. a reorder hold too close to the end of the stream to reach its
+        // release countdown on its own) lands on the wire here, but its arrival on the receiver thread
+        // can still be a beat behind this point. Scoring immediately below would then see a real,
+        // in-flight packet as a hole — a race, not a loss — so give it the same bounded, early-exit
+        // wait the settle loop above uses. This costs nothing when Flush() had nothing left to release.
+        await TestSupport.WaitForAsync(NoGapsInWindow, 2_000).ConfigureAwait(false);
 
         // ------------------------------------------------------------------ score
         // The detectable window runs from the lowest packet the receiver saw to the highest. Anything
