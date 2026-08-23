@@ -133,12 +133,17 @@ public readonly record struct MediaTrackStats(
 /// <param name="Nacks">Generic NACK packets received.</param>
 /// <param name="TransportCcFeedbacks">Transport-wide congestion control feedback packets received.</param>
 /// <param name="ReceiverReports">Receiver reports (and sender reports carrying report blocks) received.</param>
+/// <param name="NacksSent">
+/// Generic NACK packets this endpoint generated automatically from its inbound loss detector, when
+/// <see cref="PeerConnectionConfig.EnableReceiverNack"/> is set; zero otherwise.
+/// </param>
 public readonly record struct FeedbackStats(
     long PictureLossIndications,
     long FullIntraRequests,
     long Nacks,
     long TransportCcFeedbacks,
-    long ReceiverReports);
+    long ReceiverReports,
+    long NacksSent = 0);
 
 /// <summary>A small point-in-time snapshot of a <see cref="PeerConnection"/>.</summary>
 /// <param name="State">The connection state.</param>
