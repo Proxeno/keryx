@@ -3,6 +3,7 @@ using Keryx.Core;
 using Keryx.Dtls;
 using Keryx.Rtp;
 using Keryx.Rtp.CongestionControl;
+using Keryx.Rtp.Rtcp;
 using Keryx.Sdp;
 using Keryx.Turn;
 
@@ -215,6 +216,35 @@ public sealed class PeerConnectionConfig
     /// when <see cref="EnableReceiveJitterBuffer"/> is set. Ignored when it is not.
     /// </summary>
     public JitterBufferOptions ReceiveJitterBuffer { get; } = new();
+
+    /// <summary>
+    /// Automatically generate RFC 4585 Generic NACK feedback for gaps detected in the inbound video
+    /// sequence stream, so a remote sender's RFC 4588 retransmission can repair the loss without the
+    /// application running its own loss detector. Detection is per received video SSRC, on the raw
+    /// arrival sequence <see cref="PeerConnection.OnRtpPacketReceived"/> sees, rate-limited and bounded to
+    /// a recovery window by <see cref="ReceiverNack"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Off by default, and opt-in for the same reason the receive jitter buffer and congestion control
+    /// are: it adds behaviour to the receive path — emitting RTCP the endpoint never sent before — that a
+    /// receiver driving its own loss detection, or one that never wants to spend uplink on repair
+    /// requests, should not have forced on it. Enabling it keeps the default caller-driven
+    /// <see cref="PeerConnection.SendNack"/> path allocation-free and untouched.
+    /// </para>
+    /// <para>
+    /// Only video is tracked: RFC 4588 retransmission is negotiated for video alone (Opus repairs
+    /// isolated loss with in-band FEC), so a NACK for an audio stream would ask for a repair no sender in
+    /// this stack serves.
+    /// </para>
+    /// </remarks>
+    public bool EnableReceiverNack { get; set; }
+
+    /// <summary>
+    /// Rate and window limits for automatic receiver NACK generation, applied to every inbound video
+    /// stream when <see cref="EnableReceiverNack"/> is set. Ignored when it is not.
+    /// </summary>
+    public ReceiverNackOptions ReceiverNack { get; } = new();
 
     /// <summary>
     /// A testing and diagnostics seam: called once with the ICE agent's datagram transport, and the

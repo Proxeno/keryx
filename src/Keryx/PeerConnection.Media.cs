@@ -63,6 +63,12 @@ public sealed partial class PeerConnection
     private readonly object _receiveStatsLock = new();
     private readonly Dictionary<uint, InboundSourceStats> _receiveStats = [];
 
+    // Scratch list the inbound loss detector fills with the sequence numbers due for a NACK. Only touched
+    // from the single ICE receive loop that drives HandleRtp, so it needs no synchronisation; it stays
+    // empty unless PeerConnectionConfig.EnableReceiverNack is set and a gap is detected.
+    private readonly List<ushort> _receiverNackScratch = [];
+    private long _receiverNacksSent;
+
     private Timer? _rtcpTimer;
     private int _firSequence;
 
@@ -913,6 +919,14 @@ public sealed partial class PeerConnection
             packet.Header.SequenceNumber,
             packet.Header.Timestamp);
 
+        // A repair arriving for a packet the loss detector NACKed clears it from the missing set, so it is
+        // not asked for again. RFC 4588 §4: the RTX payload is prefixed with the original sequence number.
+        if (_config.EnableReceiverNack && route is { IsRtx: true, Kind: MediaKind.Video }
+            && RtxPacket.TryReadOriginalSequenceNumber(packet.Payload, out var recoveredSequenceNumber))
+        {
+            MarkRtxRecovered(recoveredSequenceNumber);
+        }
+
         var handler = OnRtpPacketReceived;
 
         // Ingest demux: when the section is simulcast, key the packet to its layer (learning the
@@ -1044,6 +1058,11 @@ public sealed partial class PeerConnection
         var arrivalMilliseconds = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var arrivalTimestamp = unchecked((uint)(arrivalMilliseconds * route.ClockRate / 1000));
 
+        // Automatic NACK generation is video-only: RFC 4588 retransmission is negotiated for video alone,
+        // so a NACK for audio would ask for a repair no sender in this stack serves.
+        var detectLoss = _config.EnableReceiverNack && route.Kind == MediaKind.Video;
+        _receiverNackScratch.Clear();
+
         lock (_receiveStatsLock)
         {
             if (!_receiveStats.TryGetValue(ssrc, out var stats))
@@ -1053,6 +1072,39 @@ public sealed partial class PeerConnection
             }
 
             stats.Statistics.OnRtpPacket(sequenceNumber, rtpTimestamp, arrivalTimestamp);
+
+            if (detectLoss)
+            {
+                var tracker = stats.NackTracker ??= new ReceiverNackTracker(_config.ReceiverNack);
+                tracker.OnPacket(sequenceNumber, Environment.TickCount64, _receiverNackScratch);
+            }
+        }
+
+        // Emit the NACK outside the reception-stats lock: SendNack takes the send lock, and keeping the
+        // two locks unnested keeps this path's ordering identical to the periodic report path.
+        if (_receiverNackScratch.Count > 0 && SendNack(ssrc, _receiverNackScratch))
+        {
+            Interlocked.Increment(ref _receiverNacksSent);
+        }
+    }
+
+    /// <summary>
+    /// Marks an original media sequence number recovered when its RFC 4588 repair arrives, so the inbound
+    /// loss detector stops NACKing it. The repair travels on the RTX SSRC and sequence space, a different
+    /// source than the media stream, so it never reaches the media source's detector on its own; this
+    /// bridges it back by the original sequence number it reconstructs.
+    /// </summary>
+    private void MarkRtxRecovered(ushort originalSequenceNumber)
+    {
+        lock (_receiveStatsLock)
+        {
+            foreach (var (_, stats) in _receiveStats)
+            {
+                if (stats.Kind == MediaKind.Video)
+                {
+                    stats.NackTracker?.OnRecovered(originalSequenceNumber);
+                }
+            }
         }
     }
 
@@ -1100,6 +1152,9 @@ public sealed partial class PeerConnection
         internal MediaKind Kind { get; } = kind;
 
         internal ReceptionStatistics Statistics { get; } = new();
+
+        /// <summary>The inbound loss detector, built lazily when automatic NACK generation is enabled.</summary>
+        internal ReceiverNackTracker? NackTracker { get; set; }
     }
 
     private void HandleRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram)
