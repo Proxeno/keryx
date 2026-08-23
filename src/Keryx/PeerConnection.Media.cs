@@ -1276,7 +1276,7 @@ public sealed partial class PeerConnection
         {
             _timestamp = timestamp;
             Stream.Timestamp = timestamp;
-            var packets = _payloadizer.Packetize(frame, _maxPayload, this);
+            var packets = _payloadizer.Packetize(frame, timestamp, _maxPayload, this);
             _frames++;
             return packets;
         }

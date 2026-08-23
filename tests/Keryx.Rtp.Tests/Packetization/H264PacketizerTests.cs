@@ -43,7 +43,8 @@ public class H264PacketizerTests
     {
         var writer = new CollectingRtpPayloadWriter();
         var packetizer = new H264Packetizer();
-        var count = packetizer.Packetize(accessUnit, maxPayloadSize, writer);
+        // H.264 ignores the RTP timestamp; its marker is keyed off end-of-access-unit.
+        var count = packetizer.Packetize(accessUnit, 0, maxPayloadSize, writer);
         count.Should().Be(writer.Payloads.Count);
         return writer.Payloads;
     }
@@ -267,7 +268,7 @@ public class H264PacketizerTests
         var packetizer = new H264Packetizer();
         var writer = new CollectingRtpPayloadWriter();
         var accessUnit = AnnexBAccessUnit(Idr);
-        var act = () => packetizer.Packetize(accessUnit, 2, writer);
+        var act = () => packetizer.Packetize(accessUnit, 0, 2, writer);
         act.Should().Throw<ArgumentOutOfRangeException>();
     }
 }
