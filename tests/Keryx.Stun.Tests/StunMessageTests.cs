@@ -119,6 +119,31 @@ public sealed class StunMessageTests
     }
 
     [Fact]
+    public void Encode_AppliesTheDummyLengthRuleForMessageIntegritySha256AndFingerprint()
+    {
+        // RFC 8489 section 14.6 and RFC 5389 section 15.5: same dummy-length rule as MESSAGE-INTEGRITY,
+        // but with the 36-byte MESSAGE-INTEGRITY-SHA256 attribute (4-byte header, 32-byte digest).
+        var key = StunCredentials.LongTermKey("user", "realm", "pass", StunPasswordAlgorithm.Sha256);
+        var encoded = new StunMessage(StunClass.Request, StunMethod.Binding)
+            .Add(new StunUsernameAttribute("a:b"))
+            .Encode(key, appendFingerprint: true, useMessageIntegritySha256: true);
+
+        var declaredLength = (encoded[2] << 8) | encoded[3];
+        (declaredLength + StunMessage.HeaderLength).Should().Be(encoded.Length);
+
+        StunMessage.ValidateMessageIntegritySha256(encoded, key).Should().BeTrue();
+        StunMessage.ValidateMessageIntegrity(encoded, key).Should().BeFalse();
+        StunMessage.ValidateFingerprint(encoded).Should().BeTrue();
+
+        var decoded = StunMessage.Decode(encoded);
+        decoded.GetAttribute<StunMessageIntegritySha256Attribute>()!.Digest.Should().HaveCount(32);
+        decoded.HasAttribute(StunAttributeType.MessageIntegrity).Should().BeFalse();
+        decoded.ValidateMessageIntegritySha256(key).Should().BeTrue();
+        decoded.ValidateMessageIntegritySha256(StunCredentials.LongTermKey("user", "realm", "other", StunPasswordAlgorithm.Sha256))
+            .Should().BeFalse();
+    }
+
+    [Fact]
     public void ValidateFingerprint_FailsWhenAnyByteIsFlipped()
     {
         var encoded = new StunMessage(StunClass.Request, StunMethod.Binding)

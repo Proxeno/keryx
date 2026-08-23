@@ -14,7 +14,7 @@ namespace Keryx.Stun;
 /// <para>
 /// MESSAGE-INTEGRITY and FINGERPRINT are not ordinary attributes: their values cover the bytes
 /// that precede them, and the header length field must, while they are being computed, already
-/// count the attribute being computed. <see cref="Encode(byte[], bool)"/> handles that dummy-length
+/// count the attribute being computed. <see cref="Encode(byte[], bool, bool)"/> handles that dummy-length
 /// rule and always appends them last, in that order, ignoring any instance the caller put in
 /// <see cref="Attributes"/>.
 /// </para>
@@ -33,8 +33,10 @@ public sealed class StunMessage
     public const int HeaderLength = 20;
 
     private const ushort MessageIntegrityCode = (ushort)StunAttributeType.MessageIntegrity;
+    private const ushort MessageIntegritySha256Code = (ushort)StunAttributeType.MessageIntegritySha256;
     private const ushort FingerprintCode = (ushort)StunAttributeType.Fingerprint;
     private const int MessageIntegrityAttributeLength = 4 + StunMessageIntegrityAttribute.DigestLength;
+    private const int MessageIntegritySha256AttributeLength = 4 + StunMessageIntegritySha256Attribute.DigestLength;
     private const int FingerprintAttributeLength = 8;
 
     private byte[]? _raw;
@@ -69,14 +71,14 @@ public sealed class StunMessage
     public StunTransactionId TransactionId { get; }
 
     /// <summary>
-    /// The message's attributes, in wire order. Mutable; MESSAGE-INTEGRITY and FINGERPRINT
-    /// instances found here are skipped by <see cref="Encode(byte[], bool)"/>.
+    /// The message's attributes, in wire order. Mutable; MESSAGE-INTEGRITY, MESSAGE-INTEGRITY-SHA256
+    /// and FINGERPRINT instances found here are skipped by <see cref="Encode(byte[], bool, bool)"/>.
     /// </summary>
     public List<StunAttribute> Attributes { get; }
 
     /// <summary>
     /// The exact bytes this message was decoded from, or the bytes most recently produced by
-    /// <see cref="Encode(byte[], bool)"/>; empty if the message has never been encoded or decoded.
+    /// <see cref="Encode(byte[], bool, bool)"/>; empty if the message has never been encoded or decoded.
     /// </summary>
     public ReadOnlyMemory<byte> Raw => _raw ?? ReadOnlyMemory<byte>.Empty;
 
@@ -201,14 +203,20 @@ public sealed class StunMessage
     }
 
     /// <summary>
-    /// Encodes the message, optionally appending MESSAGE-INTEGRITY and FINGERPRINT.
+    /// Encodes the message, optionally appending a message-integrity attribute and FINGERPRINT.
     /// </summary>
     /// <param name="integrityKey">
-    /// The HMAC-SHA1 key from <see cref="StunCredentials"/>, or null to omit MESSAGE-INTEGRITY.
+    /// The key from <see cref="StunCredentials"/>, or null to omit message integrity entirely.
     /// </param>
     /// <param name="appendFingerprint">True to append a FINGERPRINT attribute.</param>
+    /// <param name="useMessageIntegritySha256">
+    /// True to sign with MESSAGE-INTEGRITY-SHA256 (RFC 8489 section 14.6) instead of the default
+    /// MESSAGE-INTEGRITY (RFC 5389 section 15.4); only meaningful when <paramref name="integrityKey"/>
+    /// is not null. Selected by RFC 8489 password-algorithm negotiation having taken place, not by
+    /// which key-derivation algorithm produced <paramref name="integrityKey"/>.
+    /// </param>
     /// <returns>A new array holding the encoded message.</returns>
-    public byte[] Encode(byte[]? integrityKey = null, bool appendFingerprint = false)
+    public byte[] Encode(byte[]? integrityKey = null, bool appendFingerprint = false, bool useMessageIntegritySha256 = false)
     {
         var capacity = 512;
         while (true)
@@ -216,7 +224,7 @@ public sealed class StunMessage
             var buffer = new byte[capacity];
             try
             {
-                var length = EncodeTo(buffer, integrityKey, appendFingerprint);
+                var length = EncodeTo(buffer, integrityKey, appendFingerprint, useMessageIntegritySha256);
                 return buffer[..length];
             }
             catch (ByteBufferException) when (capacity < 1 << 17)
@@ -231,12 +239,18 @@ public sealed class StunMessage
     /// </summary>
     /// <param name="destination">The buffer to write into.</param>
     /// <param name="integrityKey">
-    /// The HMAC-SHA1 key from <see cref="StunCredentials"/>, or null to omit MESSAGE-INTEGRITY.
+    /// The key from <see cref="StunCredentials"/>, or null to omit message integrity entirely.
     /// </param>
     /// <param name="appendFingerprint">True to append a FINGERPRINT attribute.</param>
+    /// <param name="useMessageIntegritySha256">
+    /// True to sign with MESSAGE-INTEGRITY-SHA256 (RFC 8489 section 14.6) instead of the default
+    /// MESSAGE-INTEGRITY (RFC 5389 section 15.4); only meaningful when <paramref name="integrityKey"/>
+    /// is not null.
+    /// </param>
     /// <returns>The number of bytes written.</returns>
     /// <exception cref="ByteBufferException"><paramref name="destination"/> is too small.</exception>
-    public int EncodeTo(Span<byte> destination, byte[]? integrityKey = null, bool appendFingerprint = false)
+    public int EncodeTo(
+        Span<byte> destination, byte[]? integrityKey = null, bool appendFingerprint = false, bool useMessageIntegritySha256 = false)
     {
         // A heap array rather than a stackalloc: ByteWriter's span parameters are not declared
         // `scoped`, so a stack-allocated span cannot be passed to them.
@@ -250,7 +264,8 @@ public sealed class StunMessage
 
         foreach (var attribute in Attributes)
         {
-            if (attribute.Type is StunAttributeType.MessageIntegrity or StunAttributeType.Fingerprint)
+            if (attribute.Type is StunAttributeType.MessageIntegrity or StunAttributeType.MessageIntegritySha256
+                or StunAttributeType.Fingerprint)
             {
                 continue;
             }
@@ -258,7 +273,17 @@ public sealed class StunMessage
             WriteAttribute(ref writer, attribute, transactionId);
         }
 
-        if (integrityKey is not null)
+        if (integrityKey is not null && useMessageIntegritySha256)
+        {
+            // RFC 8489 section 14.6: same dummy-length rule as MESSAGE-INTEGRITY, with the 36-byte
+            // MESSAGE-INTEGRITY-SHA256 attribute (4-byte header plus a full 32-byte digest).
+            PatchLength(ref writer, lengthOffset, writer.Position - HeaderLength + MessageIntegritySha256AttributeLength);
+            var digest = StunMessageIntegritySha256Attribute.ComputeDigest(integrityKey, writer.Written);
+            writer.WriteU16(MessageIntegritySha256Code);
+            writer.WriteU16(StunMessageIntegritySha256Attribute.DigestLength);
+            writer.WriteBytes(digest);
+        }
+        else if (integrityKey is not null)
         {
             // RFC 5389 section 15.4: the length field must already include the MESSAGE-INTEGRITY
             // attribute (24 bytes) while the HMAC over the preceding bytes is computed.
@@ -403,6 +428,15 @@ public sealed class StunMessage
     public bool ValidateMessageIntegrity(string password)
         => ValidateMessageIntegrity(Raw.Span, StunCredentials.ShortTermKey(password));
 
+    /// <summary>
+    /// Verifies this message's MESSAGE-INTEGRITY-SHA256 against <paramref name="key"/>, using the
+    /// bytes in <see cref="Raw"/>.
+    /// </summary>
+    /// <param name="key">The key from <see cref="StunCredentials"/>.</param>
+    /// <returns>False when the attribute is absent, malformed, or does not match.</returns>
+    public bool ValidateMessageIntegritySha256(ReadOnlySpan<byte> key)
+        => ValidateMessageIntegritySha256(Raw.Span, key);
+
     /// <summary>Verifies this message's FINGERPRINT, using the bytes in <see cref="Raw"/>.</summary>
     /// <returns>False when the attribute is absent, not last, or does not match.</returns>
     public bool ValidateFingerprint() => ValidateFingerprint(Raw.Span);
@@ -429,6 +463,30 @@ public sealed class StunMessage
         var expected = HMACSHA1.HashData(key, prefix);
         return CryptographicOperations.FixedTimeEquals(
             expected, message.Slice(offset + 4, StunMessageIntegrityAttribute.DigestLength));
+    }
+
+    /// <summary>
+    /// Verifies the MESSAGE-INTEGRITY-SHA256 attribute of an encoded message, re-applying the
+    /// dummy-length rule of RFC 8489 section 14.6.
+    /// </summary>
+    /// <param name="message">The encoded message, exactly as received.</param>
+    /// <param name="key">The key from <see cref="StunCredentials"/>.</param>
+    /// <returns>False when the attribute is absent, malformed, or does not match.</returns>
+    public static bool ValidateMessageIntegritySha256(ReadOnlySpan<byte> message, ReadOnlySpan<byte> key)
+    {
+        if (!TryFindAttribute(message, MessageIntegritySha256Code, out var offset, out var valueLength, out var total)
+            || valueLength != StunMessageIntegritySha256Attribute.DigestLength
+            || offset + MessageIntegritySha256AttributeLength > total)
+        {
+            return false;
+        }
+
+        var prefix = message[..offset].ToArray();
+        BinaryPrimitives.WriteUInt16BigEndian(
+            prefix.AsSpan(2), (ushort)(offset + MessageIntegritySha256AttributeLength - HeaderLength));
+        var expected = StunMessageIntegritySha256Attribute.ComputeDigest(key, prefix);
+        return CryptographicOperations.FixedTimeEquals(
+            expected, message.Slice(offset + 4, StunMessageIntegritySha256Attribute.DigestLength));
     }
 
     /// <summary>
@@ -509,6 +567,10 @@ public sealed class StunMessage
             StunAttributeType.Nonce => new StunNonceAttribute(System.Text.Encoding.UTF8.GetString(value)),
             StunAttributeType.Software => new StunSoftwareAttribute(System.Text.Encoding.UTF8.GetString(value)),
             StunAttributeType.MessageIntegrity => new StunMessageIntegrityAttribute(value),
+            StunAttributeType.MessageIntegritySha256 when value.Length == StunMessageIntegritySha256Attribute.DigestLength =>
+                new StunMessageIntegritySha256Attribute(value),
+            StunAttributeType.PasswordAlgorithm => StunPasswordAlgorithmAttribute.ReadValue(value),
+            StunAttributeType.PasswordAlgorithms => StunPasswordAlgorithmsAttribute.ReadValue(value),
             StunAttributeType.Fingerprint => new StunFingerprintAttribute(ReadU32(value)),
             StunAttributeType.ErrorCode => StunErrorCodeAttribute.ReadValue(value),
             StunAttributeType.UnknownAttributes => StunUnknownAttributesAttribute.ReadValue(value),

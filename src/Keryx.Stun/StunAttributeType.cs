@@ -40,9 +40,9 @@ public enum StunAttributeType : ushort
     Nonce = 0x0015,
 
     /// <summary>
-    /// MESSAGE-INTEGRITY-SHA256 (RFC 8489 section 14.6). Recognised so that a server offering it
-    /// is not reported as sending an unknown comprehension-required attribute; Keryx keys
-    /// long-term credentials with MD5 and HMAC-SHA1 only, which RFC 8489 still permits.
+    /// MESSAGE-INTEGRITY-SHA256 (RFC 8489 section 14.6). Used once RFC 8489 password-algorithm
+    /// negotiation (PASSWORD-ALGORITHM/PASSWORD-ALGORITHMS) has taken place; see
+    /// <see cref="StunMessageIntegritySha256Attribute"/>.
     /// </summary>
     MessageIntegritySha256 = 0x001C,
 

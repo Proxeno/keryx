@@ -82,15 +82,88 @@ public sealed class TurnClientTests
     }
 
     [Fact]
-    public async Task Allocate_RejectsAServerThatDemandsRfc8489PasswordAlgorithms()
+    public async Task Allocate_NegotiatesRfc8489AndPicksSha256WhenTheServerPrefersIt()
     {
+        // RFC 8489 section 9.2.5: PASSWORD-ALGORITHMS offers SHA-256 first, so the client must pick
+        // it, key with SHA-256(username:realm:password), and switch to MESSAGE-INTEGRITY-SHA256.
         using var server = new TestTurnServer { AdvertisePasswordAlgorithms = true };
+        using var harness = new TurnClientHarness(server);
+
+        var relayed = await harness.Client.AllocateAsync(TestTimeout.Token);
+
+        relayed.Should().Be(server.RelayedEndPoint);
+        harness.Client.IsAllocated.Should().BeTrue();
+        server.UnauthenticatedAllocates.Should().Be(1);
+        server.AuthenticatedAllocates.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Allocate_NegotiatesRfc8489AndFallsBackToMd5WhenThatIsAllTheServerOffers()
+    {
+        // RFC 8489 section 9.2.5: the client picks the first algorithm it supports off the
+        // server's list, in the server's order - here that is MD5, still keyed and signed under
+        // the RFC 8489 PASSWORD-ALGORITHM/MESSAGE-INTEGRITY-SHA256 machinery.
+        using var server = new TestTurnServer
+        {
+            AdvertisePasswordAlgorithms = true,
+            OfferedPasswordAlgorithms = [StunPasswordAlgorithm.Md5],
+        };
+        using var harness = new TurnClientHarness(server);
+
+        var relayed = await harness.Client.AllocateAsync(TestTimeout.Token);
+
+        relayed.Should().Be(server.RelayedEndPoint);
+        harness.Client.IsAllocated.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Allocate_RetriesWithTheFreshNonceWhenTheServerAnswers438AfterNegotiatingSha256()
+    {
+        // The full RFC 8489 section 9.2.5 dance: 401 offers PASSWORD-ALGORITHMS, the client retries
+        // keyed with SHA-256 and signed with MESSAGE-INTEGRITY-SHA256, the server answers 438 for
+        // that retry specifically, and the client retries once more with the fresh nonce.
+        using var server = new TestTurnServer { AdvertisePasswordAlgorithms = true, StaleNonceOnRequest = 1 };
+        using var harness = new TurnClientHarness(server);
+
+        var relayed = await harness.Client.AllocateAsync(TestTimeout.Token);
+
+        relayed.Should().Be(server.RelayedEndPoint);
+        server.StaleNonceResponses.Should().Be(1);
+        server.UnauthenticatedAllocates.Should().Be(1);
+        server.AuthenticatedAllocates.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Allocate_RejectsAServerThatOnlyOffersPasswordAlgorithmsKeryxDoesNotImplement()
+    {
+        using var server = new TestTurnServer
+        {
+            AdvertisePasswordAlgorithms = true,
+            OfferedPasswordAlgorithms = [(StunPasswordAlgorithm)0x0099],
+        };
         using var harness = new TurnClientHarness(server);
 
         var allocate = async () => await harness.Client.AllocateAsync(TestTimeout.Token);
 
         (await allocate.Should().ThrowAsync<StunFormatException>())
-            .WithMessage("*password-algorithm*");
+            .WithMessage("*password algorithm*");
+        harness.Client.IsAllocated.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Allocate_RejectsAServerThatAdvertisesTheFeatureButSendsNoPasswordAlgorithms()
+    {
+        // The nonce cookie's "Password algorithms" bit is set (AdvertisePasswordAlgorithms) but the
+        // server is misbehaving and never actually attaches PASSWORD-ALGORITHMS: RFC 8489 section
+        // 9.2.5 says the client MUST NOT retry.
+        using var server = new TestTurnServer { AdvertisePasswordAlgorithms = true, OfferedPasswordAlgorithms = [] };
+        using var harness = new TurnClientHarness(server);
+
+        var allocate = async () => await harness.Client.AllocateAsync(TestTimeout.Token);
+
+        (await allocate.Should().ThrowAsync<StunFormatException>())
+            .WithMessage("*carried no PASSWORD-ALGORITHMS*");
+        harness.Client.IsAllocated.Should().BeFalse();
     }
 
     [Fact]

@@ -88,7 +88,7 @@ public sealed class StunIceControllingAttribute : StunIceRoleAttribute
 /// <remarks>
 /// Instances of this type appear on decoded messages so callers can inspect the received digest.
 /// When encoding, the digest is computed by
-/// <see cref="StunMessage.Encode(byte[], bool)"/> from the supplied key; any instance present in
+/// <see cref="StunMessage.Encode(byte[], bool, bool)"/> from the supplied key; any instance present in
 /// <see cref="StunMessage.Attributes"/> is ignored.
 /// </remarks>
 public sealed class StunMessageIntegrityAttribute : StunAttribute
@@ -123,7 +123,7 @@ public sealed class StunMessageIntegrityAttribute : StunAttribute
 /// 0x5354554e (RFC 5389 section 15.5).
 /// </summary>
 /// <remarks>
-/// When encoding, the value is computed by <see cref="StunMessage.Encode(byte[], bool)"/>; any
+/// When encoding, the value is computed by <see cref="StunMessage.Encode(byte[], bool, bool)"/>; any
 /// instance present in <see cref="StunMessage.Attributes"/> is ignored.
 /// </remarks>
 public sealed class StunFingerprintAttribute : StunAttribute
