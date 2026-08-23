@@ -66,6 +66,8 @@ public abstract class RtcpPacket
                 return Wrap(RtcpSourceDescription.TryParse(span, out var sdes), sdes, out packet);
             case RtcpPacketType.Goodbye:
                 return Wrap(RtcpGoodbye.TryParse(span, out var bye), bye, out packet);
+            case RtcpPacketType.ExtendedReport:
+                return Wrap(RtcpExtendedReport.TryParse(span, out var xr), xr, out packet);
             case RtcpPacketType.TransportLayerFeedback:
                 switch ((RtcpTransportFeedbackType)header.Count)
                 {
