@@ -36,7 +36,7 @@ public sealed class ChromeLossInteropTests
     [Trait("Category", "ChromeInterop")]
     public async Task ChromeNacksAndKeryxRepairsWhatTheLinkDestroyed()
     {
-        var chromePath = ChromeBrowser.Find();
+        var chromePath = ChromeBrowser.Require();
         if (chromePath is null)
         {
             _output.WriteLine("SKIPPED: Google Chrome not found (set KERYX_CHROME_PATH to enable).");

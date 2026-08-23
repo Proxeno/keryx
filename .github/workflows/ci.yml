@@ -17,3 +17,24 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=Soak"
+
+  # Browser interop, CI-enforced. This job installs a headless Chrome, so the ChromeInterop tests
+  # (excluded from build-test above) MUST actually run here. KERYX_REQUIRE_CHROME=1 turns a missing
+  # or unlaunchable browser into a failure instead of the graceful skip local dev gets, so an
+  # interop regression fails the build rather than silently passing.
+  browser-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+      - run: dotnet build Keryx.slnx --configuration Release
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=ChromeInterop"
+        env:
+          KERYX_REQUIRE_CHROME: "1"
+          KERYX_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
