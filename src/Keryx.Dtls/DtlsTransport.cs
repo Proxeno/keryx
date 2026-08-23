@@ -39,7 +39,6 @@ namespace Keryx.Dtls;
 public sealed class DtlsTransport : IDatagramTransport, IDisposable
 {
     private const int RandomLength = 32;
-    private const int KeyBlockLength = 2 * (AeadRecordCipher.KeyLength + AeadRecordCipher.SaltLength);
 
     private readonly IDatagramTransport _lower;
     private readonly DtlsConfig _config;
@@ -68,6 +67,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
     private byte[] _clientRandom = [];
     private byte[] _serverRandom = [];
     private ushort _cipherSuite;
+    private ushort _negotiatedGroup = NamedGroups.Secp256r1;
     private bool _useExtendedMasterSecret;
     private bool _peerOfferedRenegotiationInfo;
     private bool _peerOfferedEcPointFormats;
@@ -100,11 +100,11 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
     private ushort _writeEpoch;
     private ulong _writeSequenceEpoch0;
     private ulong _writeSequenceEpoch1;
-    private AeadRecordCipher? _writeCipher;
-    private AeadRecordCipher? _pendingWriteCipher;
+    private IRecordProtection? _writeCipher;
+    private IRecordProtection? _pendingWriteCipher;
     private ushort _readEpoch;
-    private AeadRecordCipher? _readCipher;
-    private AeadRecordCipher? _pendingReadCipher;
+    private IRecordProtection? _readCipher;
+    private IRecordProtection? _pendingReadCipher;
     private ReplayWindow _replayWindow = new();
 
     // Flight / retransmission state.
@@ -146,7 +146,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         _log = config.Logger;
         _role = config.Role;
         _mtu = Math.Max(
-            DtlsLimits.RecordHeaderLength + AeadRecordCipher.Overhead + 64,
+            DtlsLimits.RecordHeaderLength + RecordProtection.MaxOverhead + 64,
             Math.Min(config.MaxDatagramSize, lower.MaxDatagramSize));
         _retransmitTimeout = config.InitialRetransmitTimeout;
         _retransmitTimer = new Timer(OnRetransmitTimer, null, Timeout.Infinite, Timeout.Infinite);
@@ -175,7 +175,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
     /// Largest application payload <see cref="Send(ReadOnlySpan{byte})"/> accepts: the negotiated
     /// datagram size less the DTLS record header and AES-GCM overhead.
     /// </summary>
-    public int MaxDatagramSize => _mtu - DtlsLimits.RecordHeaderLength - AeadRecordCipher.Overhead;
+    public int MaxDatagramSize => _mtu - DtlsLimits.RecordHeaderLength - RecordProtection.MaxOverhead;
 
     /// <summary>The SRTP protection profile agreed via <c>use_srtp</c>, or <see cref="SrtpProtectionProfile.None"/>.</summary>
     public SrtpProtectionProfile NegotiatedSrtpProfile { get; private set; } = SrtpProtectionProfile.None;
@@ -206,6 +206,9 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     /// <summary>The negotiated cipher suite's IANA name, or null before ServerHello.</summary>
     public string? NegotiatedCipherSuite => _cipherSuite == 0 ? null : CipherSuites.Name(_cipherSuite);
+
+    /// <summary>Test hook: the negotiated ECDHE named group (a <see cref="NamedGroups"/> code).</summary>
+    internal ushort NegotiatedNamedGroup => _negotiatedGroup;
 
     /// <summary>Test hook: corrupt the verify_data of the next Finished this endpoint sends.</summary>
     internal bool TestCorruptOutgoingFinished { get; set; }
@@ -311,7 +314,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                     "Keying material can only be exported after the DTLS handshake has completed.");
             }
 
-            return TlsPrf.ExportKeyingMaterial(_masterSecret, label, _clientRandom, _serverRandom, length);
+            return TlsPrf.ExportKeyingMaterial(
+                _masterSecret, label, _clientRandom, _serverRandom, length, NegotiatedPrfHash());
         }
     }
 
@@ -761,10 +765,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
     private void SendClientHelloLocked()
     {
         _clientRandom = RandomNumberGenerator.GetBytes(RandomLength);
-        _ecdh?.Dispose();
-        _ecdh = Ecdhe.CreateP256();
 
-        var body = HandshakeCodec.BuildClientHello(_clientRandom, _cookie, LocalCipherSuites(), _config.SrtpProfiles);
+        // The ECDHE key is created once the server's ServerKeyExchange tells us which curve was
+        // negotiated; the client's public point is not sent until ClientKeyExchange.
+        _ecdh?.Dispose();
+        _ecdh = null;
+
+        var body = HandshakeCodec.BuildClientHello(
+            _clientRandom, _cookie, LocalCipherSuites(), LocalNamedGroups(), _config.SrtpProfiles);
         var hello = NewHandshakeMessageLocked(HandshakeType.ClientHello, body);
         SendFlightLocked([new FlightItem(ContentType.Handshake, hello, 0)], expectResponse: true);
     }
@@ -789,7 +797,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         // counting, so the retransmitted ClientHello is seq 1.
         _transcript.SetLength(0);
 
-        var body2 = HandshakeCodec.BuildClientHello(_clientRandom, _cookie, LocalCipherSuites(), _config.SrtpProfiles);
+        var body2 = HandshakeCodec.BuildClientHello(
+            _clientRandom, _cookie, LocalCipherSuites(), LocalNamedGroups(), _config.SrtpProfiles);
         var hello = NewHandshakeMessageLocked(HandshakeType.ClientHello, body2);
         SendFlightLocked([new FlightItem(ContentType.Handshake, hello, 0)], expectResponse: true);
     }
@@ -857,12 +866,16 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
         _sawServerKeyExchange = true;
         var ske = HandshakeCodec.ParseServerKeyExchange(body);
-        if (ske.NamedCurve != NamedGroups.Secp256r1)
+        if (!NamedGroups.IsSupported(ske.NamedCurve) || !LocalNamedGroups().Contains(ske.NamedCurve))
         {
             throw new DtlsException(
-                $"The server selected unsupported curve 0x{ske.NamedCurve:X4}; Keryx supports secp256r1 only.",
+                $"The server selected curve 0x{ske.NamedCurve:X4}, which Keryx did not offer.",
                 DtlsAlertDescription.HandshakeFailure);
         }
+
+        _negotiatedGroup = ske.NamedCurve;
+        _ecdh?.Dispose();
+        _ecdh = Ecdhe.Create(_negotiatedGroup);
 
         var certificate = _peerCertificate
                           ?? throw new DtlsException(
@@ -921,14 +934,14 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         }
 
         // ClientKeyExchange.
-        var point = Ecdhe.ExportPoint(_ecdh);
+        var point = Ecdhe.ExportPoint(_ecdh, _negotiatedGroup);
         var ckeBody = HandshakeCodec.BuildClientKeyExchange(point);
         flight.Add(new FlightItem(
             ContentType.Handshake,
             NewHandshakeMessageLocked(HandshakeType.ClientKeyExchange, ckeBody),
             0));
 
-        var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, _serverKeyExchangePoint);
+        var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, _serverKeyExchangePoint, _negotiatedGroup);
         DeriveKeysLocked(preMasterSecret);
 
         // CertificateVerify over the transcript through ClientKeyExchange.
@@ -998,13 +1011,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             throw new DtlsException("ClientHello does not offer null compression.", DtlsAlertDescription.HandshakeFailure);
         }
 
-        if (hello.SupportedGroups.Count > 0 && !hello.SupportedGroups.Contains(NamedGroups.Secp256r1))
-        {
-            throw new DtlsException(
-                "ClientHello does not offer secp256r1, the only curve Keryx supports.",
-                DtlsAlertDescription.HandshakeFailure);
-        }
-
+        _negotiatedGroup = ChooseNamedGroup(hello.SupportedGroups);
         _cipherSuite = ChooseCipherSuite(hello.CipherSuites);
         _localSignatureAlgorithm = ChooseLocalSignatureAlgorithm(hello.SignatureAlgorithms);
         _clientRandom = hello.Random;
@@ -1015,11 +1022,11 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         NegotiatedSrtpProfile = ChooseSrtpProfile(hello.SrtpProfiles);
 
         _ecdh?.Dispose();
-        _ecdh = Ecdhe.CreateP256();
+        _ecdh = Ecdhe.Create(_negotiatedGroup);
 
         _log.Log(
             KeryxLogLevel.Info,
-            $"Accepted ClientHello: {CipherSuites.Name(_cipherSuite)}, EMS={_useExtendedMasterSecret}, SRTP={NegotiatedSrtpProfile}, sig={_localSignatureAlgorithm}.");
+            $"Accepted ClientHello: {CipherSuites.Name(_cipherSuite)}, group=0x{_negotiatedGroup:X4}, EMS={_useExtendedMasterSecret}, SRTP={NegotiatedSrtpProfile}, sig={_localSignatureAlgorithm}.");
 
         var flight = new List<FlightItem>();
 
@@ -1041,8 +1048,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             NewHandshakeMessageLocked(HandshakeType.Certificate, certificateBody),
             0));
 
-        var point = Ecdhe.ExportPoint(_ecdh);
-        var parameters = HandshakeCodec.BuildServerKeyExchangeParams(NamedGroups.Secp256r1, point);
+        var point = Ecdhe.ExportPoint(_ecdh, _negotiatedGroup);
+        var parameters = HandshakeCodec.BuildServerKeyExchangeParams(_negotiatedGroup, point);
         var signed = new byte[_clientRandom.Length + _serverRandom.Length + parameters.Length];
         _clientRandom.CopyTo(signed, 0);
         _serverRandom.CopyTo(signed, _clientRandom.Length);
@@ -1086,7 +1093,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
         _sawClientKeyExchange = true;
         var point = HandshakeCodec.ParseClientKeyExchange(body);
-        var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, point);
+        var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, point, _negotiatedGroup);
         DeriveKeysLocked(preMasterSecret);
     }
 
@@ -1222,7 +1229,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
         _sawPeerFinished = true;
         var label = _role == DtlsRole.Server ? TlsPrf.ClientFinishedLabel : TlsPrf.ServerFinishedLabel;
-        var expected = TlsPrf.VerifyData(_masterSecret, label, transcriptHash);
+        var expected = TlsPrf.VerifyData(_masterSecret, label, transcriptHash, NegotiatedPrfHash());
         if (body.Length != expected.Length || !CryptographicOperations.FixedTimeEquals(body, expected))
         {
             throw new DtlsException(
@@ -1262,38 +1269,48 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private void DeriveKeysLocked(byte[] preMasterSecret)
     {
+        var description = CipherSuites.Describe(_cipherSuite)
+            ?? throw new DtlsException(
+                "Keys were derived before a cipher suite was negotiated.",
+                DtlsAlertDescription.InternalError);
+        var prfHash = TlsPrf.FromHashAlgorithm(description.PrfHash);
+
         try
         {
             _masterSecret = _useExtendedMasterSecret
-                ? TlsPrf.ExtendedMasterSecret(preMasterSecret, TranscriptHashLocked())
-                : TlsPrf.MasterSecret(preMasterSecret, _clientRandom, _serverRandom);
+                ? TlsPrf.ExtendedMasterSecret(preMasterSecret, TranscriptHashLocked(), prfHash)
+                : TlsPrf.MasterSecret(preMasterSecret, _clientRandom, _serverRandom, prfHash);
         }
         finally
         {
             CryptographicOperations.ZeroMemory(preMasterSecret);
         }
 
-        var keyBlock = TlsPrf.KeyBlock(_masterSecret, _clientRandom, _serverRandom, KeyBlockLength);
+        // Key block layout (RFC 5246 §6.3): client_write_key || server_write_key || client_write_IV ||
+        // server_write_IV. There are no MAC keys for an AEAD suite. The IV is the GCM salt (4 bytes) or
+        // the ChaCha20 write IV (12 bytes), per the suite.
+        var keyLength = description.KeyLength;
+        var ivLength = description.FixedIvLength;
+        var keyBlock = TlsPrf.KeyBlock(
+            _masterSecret, _clientRandom, _serverRandom, 2 * (keyLength + ivLength), prfHash);
         try
         {
-            const int Key = AeadRecordCipher.KeyLength;
-            const int Salt = AeadRecordCipher.SaltLength;
-            var clientKey = keyBlock.AsSpan(0, Key);
-            var serverKey = keyBlock.AsSpan(Key, Key);
-            var clientSalt = keyBlock.AsSpan(2 * Key, Salt);
-            var serverSalt = keyBlock.AsSpan((2 * Key) + Salt, Salt);
+            var clientKey = keyBlock.AsSpan(0, keyLength);
+            var serverKey = keyBlock.AsSpan(keyLength, keyLength);
+            var clientIv = keyBlock.AsSpan(2 * keyLength, ivLength);
+            var serverIv = keyBlock.AsSpan((2 * keyLength) + ivLength, ivLength);
 
             _pendingWriteCipher?.Dispose();
             _pendingReadCipher?.Dispose();
             if (_role == DtlsRole.Client)
             {
-                _pendingWriteCipher = new AeadRecordCipher(clientKey, clientSalt);
-                _pendingReadCipher = new AeadRecordCipher(serverKey, serverSalt);
+                _pendingWriteCipher = RecordProtection.Create(description, clientKey, clientIv);
+                _pendingReadCipher = RecordProtection.Create(description, serverKey, serverIv);
             }
             else
             {
-                _pendingWriteCipher = new AeadRecordCipher(serverKey, serverSalt);
-                _pendingReadCipher = new AeadRecordCipher(clientKey, clientSalt);
+                _pendingWriteCipher = RecordProtection.Create(description, serverKey, serverIv);
+                _pendingReadCipher = RecordProtection.Create(description, clientKey, clientIv);
             }
         }
         finally
@@ -1317,7 +1334,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
         _pendingWriteCipher = null;
         _writeEpoch++;
 
-        var verifyData = TlsPrf.VerifyData(_masterSecret, finishedLabel, TranscriptHashLocked());
+        var verifyData = TlsPrf.VerifyData(_masterSecret, finishedLabel, TranscriptHashLocked(), NegotiatedPrfHash());
         if (TestCorruptOutgoingFinished)
         {
             verifyData[0] ^= 0xFF;
@@ -1349,8 +1366,15 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     private byte[] TranscriptBytesLocked() => _transcript.ToArray();
 
-    private byte[] TranscriptHashLocked() =>
-        SHA256.HashData(_transcript.GetBuffer().AsSpan(0, (int)_transcript.Length));
+    private byte[] TranscriptHashLocked()
+    {
+        // The Finished verify_data and the RFC 7627 session hash are taken with the negotiated PRF's
+        // hash: SHA-384 for the AES-256-GCM suites, SHA-256 otherwise.
+        var transcript = _transcript.GetBuffer().AsSpan(0, (int)_transcript.Length);
+        return NegotiatedPrfHash() == PrfHash.Sha384
+            ? SHA384.HashData(transcript)
+            : SHA256.HashData(transcript);
+    }
 
     private void SendFlightLocked(List<FlightItem> flight, bool expectResponse)
     {
@@ -1397,7 +1421,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 continue;
             }
 
-            var overhead = item.Epoch == 0 ? 0 : AeadRecordCipher.Overhead;
+            var overhead = item.Epoch == 0 ? 0 : RecordProtection.MaxOverhead;
             var maxPlaintext = _mtu - DtlsLimits.RecordHeaderLength - overhead;
             var maxFragment = maxPlaintext - DtlsLimits.HandshakeHeaderLength;
             if (maxFragment < 1)
@@ -1446,7 +1470,7 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             return;
         }
 
-        var bodyLength = AeadRecordCipher.CiphertextLength(plaintext.Length);
+        var bodyLength = cipher.ProtectedLength(plaintext.Length);
         var protectedRecord = new byte[DtlsLimits.RecordHeaderLength + bodyLength];
         cipher.Encrypt(
             type,
@@ -1676,25 +1700,62 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
     // -------------------------------------------------------------- negotiation
 
-    private IReadOnlyList<ushort> LocalCipherSuites() => _config.Certificate.IsEcdsa
-        ? [CipherSuites.TlsEcdheEcdsaWithAes128GcmSha256]
-        : [CipherSuites.TlsEcdheRsaWithAes128GcmSha256];
+    private IReadOnlyList<ushort> LocalCipherSuites() =>
+        _config.OfferedCipherSuites ?? CipherSuites.PreferenceFor(_config.Certificate.IsEcdsa);
+
+    private IReadOnlyList<ushort> LocalNamedGroups() =>
+        _config.OfferedNamedGroups ?? NamedGroups.Preference;
 
     private ushort ChooseCipherSuite(ushort[] offered)
     {
-        var preferred = _config.Certificate.IsEcdsa
-            ? CipherSuites.TlsEcdheEcdsaWithAes128GcmSha256
-            : CipherSuites.TlsEcdheRsaWithAes128GcmSha256;
-
-        if (Array.IndexOf(offered, preferred) >= 0)
+        // Walk our preference (strongest first) and take the first suite the peer offered that we can
+        // actually authenticate with the local certificate's key type.
+        var ecdsa = _config.Certificate.IsEcdsa;
+        foreach (var candidate in LocalCipherSuites())
         {
-            return preferred;
+            if (Array.IndexOf(offered, candidate) < 0)
+            {
+                continue;
+            }
+
+            if (CipherSuites.Describe(candidate) is { } description && description.RequiresEcdsaCertificate == ecdsa)
+            {
+                return candidate;
+            }
         }
 
         throw new DtlsException(
-            $"No mutually supported cipher suite: the peer did not offer {CipherSuites.Name(preferred)}.",
+            "No mutually supported cipher suite for the local certificate's key type.",
             DtlsAlertDescription.HandshakeFailure);
     }
+
+    private ushort ChooseNamedGroup(IReadOnlyList<ushort> clientGroups)
+    {
+        // RFC 8422 §5.1.1: an absent supported_groups extension means the client accepts the server's
+        // choice, so default to secp256r1 in that case.
+        if (clientGroups.Count == 0)
+        {
+            return NamedGroups.Secp256r1;
+        }
+
+        foreach (var candidate in LocalNamedGroups())
+        {
+            if (clientGroups.Contains(candidate) && NamedGroups.IsSupported(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new DtlsException(
+            "No mutually supported ECDHE named group.",
+            DtlsAlertDescription.HandshakeFailure);
+    }
+
+    /// <summary>The PRF hash of the negotiated cipher suite, defaulting to SHA-256 before negotiation.</summary>
+    private PrfHash NegotiatedPrfHash() =>
+        CipherSuites.Describe(_cipherSuite) is { } description
+            ? TlsPrf.FromHashAlgorithm(description.PrfHash)
+            : PrfHash.Sha256;
 
     private SigHashAlgorithm ChooseLocalSignatureAlgorithm(List<SigHashAlgorithm> peerAlgorithms)
     {

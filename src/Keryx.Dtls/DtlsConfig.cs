@@ -60,4 +60,17 @@ public sealed class DtlsConfig
 
     /// <summary>Diagnostics sink. Defaults to <see cref="NullLogger"/>.</summary>
     public IKeryxLogger Logger { get; init; } = NullLogger.Instance;
+
+    /// <summary>
+    /// Overrides the cipher suites offered (client) or preferred (server), most preferred first. Null
+    /// uses Keryx's default preference for the certificate key type. Intended for tests; the default
+    /// already offers every suite Keryx implements.
+    /// </summary>
+    internal IReadOnlyList<ushort>? OfferedCipherSuites { get; init; }
+
+    /// <summary>
+    /// Overrides the ECDHE named groups offered (client) or preferred (server), most preferred first.
+    /// Null uses Keryx's default curve preference. Intended for tests.
+    /// </summary>
+    internal IReadOnlyList<ushort>? OfferedNamedGroups { get; init; }
 }
