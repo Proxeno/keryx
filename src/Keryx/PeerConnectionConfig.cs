@@ -188,6 +188,33 @@ public sealed class PeerConnectionConfig
     public RtxRetransmitOptions Retransmission { get; } = new();
 
     /// <summary>
+    /// Reorder inbound RTP through a per-SSRC <see cref="Keryx.Rtp.JitterBuffer"/> before firing
+    /// <see cref="PeerConnection.OnRtpPacketReceived"/>, so a handler that feeds a depacketizer sees a
+    /// sequence-ordered, duplicate-free stream even when the link reordered or duplicated packets.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Off by default. The event contract is unchanged either way — the same packets fire, with their
+    /// payload spans valid only for the duration of the call — but with the buffer on they arrive in
+    /// playout order rather than arrival order, which adds the buffer's holding latency to any packet
+    /// delivered behind a reordered or missing one (bounded by <see cref="JitterBufferOptions.MaxWait"/>).
+    /// A packet the buffer declares lost manifests as a gap in the delivered sequence numbers.
+    /// </para>
+    /// <para>
+    /// It is opt-in because the right depth and wait are workload-specific, and because a receiver that
+    /// only samples <see cref="PeerConnection.GetStats"/> or drives its own loss detection wants the raw
+    /// arrival stream. Enable it when handing packets straight to a decoder-facing depacketizer.
+    /// </para>
+    /// </remarks>
+    public bool EnableReceiveJitterBuffer { get; set; }
+
+    /// <summary>
+    /// Depth and wait bounds for the per-SSRC receive jitter buffer, applied to every inbound stream
+    /// when <see cref="EnableReceiveJitterBuffer"/> is set. Ignored when it is not.
+    /// </summary>
+    public JitterBufferOptions ReceiveJitterBuffer { get; } = new();
+
+    /// <summary>
     /// A testing and diagnostics seam: called once with the ICE agent's datagram transport, and the
     /// transport it returns is what the connection sends on and receives from. Null (the default)
     /// uses the ICE transport directly.
