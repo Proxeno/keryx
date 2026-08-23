@@ -6,7 +6,7 @@ namespace Keryx.IntegrationTests;
 
 /// <summary>
 /// <see cref="PeerConnection.CreateAnswerAsync"/> must negotiate the answered <c>a=</c> direction
-/// attribute from the offered direction rather than hardcoding <c>recvonly</c> (EWI-1285). Keryx does
+/// attribute from the offered direction rather than hardcoding <c>recvonly</c>. Keryx does
 /// not send media as an answerer, so its local capability is receive-only; these tests pin down what
 /// <see cref="SdpDirection.Negotiate"/> returns for that capability against each of the four offered
 /// directions, matching RFC 3264 §6.1's answer rules.

@@ -7,7 +7,7 @@ using Xunit;
 namespace Keryx.IntegrationTests;
 
 /// <summary>
-/// Regression coverage for <see cref="PeerConnection.PacedRtpSender"/>'s drain loop (EWI-1346): a send
+/// Regression coverage for <see cref="PeerConnection.PacedRtpSender"/>'s drain loop: a send
 /// that throws — most sharply the SRTP index guard refusing a reused index — must not escape the timer
 /// callback and crash the host. The drain must drop the offending packet, keep draining the rest, and
 /// remain usable for later packets.

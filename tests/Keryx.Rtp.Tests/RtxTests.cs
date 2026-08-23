@@ -344,7 +344,7 @@ public class RtxTests
     [Fact]
     public void A_stamped_retransmission_carries_the_transport_wide_sequence_number()
     {
-        // EWI-1247: a repair packet is an outbound RTP packet like any other, so it draws its own
+        // A repair packet is an outbound RTP packet like any other, so it draws its own
         // transport-wide sequence number and carries the one-byte header extension.
         var (rtx, history, _) = NewSender();
         var original = Original(1000, timestamp: 555, marker: true);

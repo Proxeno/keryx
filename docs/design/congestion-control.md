@@ -1,9 +1,9 @@
 # Send-side congestion control (GCC)
 
-Status: scaffold landed (EWI-1248). Delay-based estimator + AIMD + loss controller + pacer are
+Status: scaffold landed. Delay-based estimator + AIMD + loss controller + pacer are
 implemented and unit-tested against synthetic feedback. PeerConnection wiring and send-time
-correlation are deferred to follow-up PRs (they depend on EWI-1247's outbound transport-cc sequence
-numbers).
+correlation are deferred to follow-up PRs (they depend on outbound packets being stamped with
+transport-cc sequence numbers, which lands separately).
 
 ## Goal
 
@@ -19,7 +19,7 @@ BCL-only. Time is injected via `TimeProvider` (the same pattern as `RtpSendHisto
 
 ## Inputs (from the real code)
 
-- **`RtcpTransportCcFeedback`** (EWI-1247) — parses transport-cc into `TransportCcPacketStatus`
+- **`RtcpTransportCcFeedback`** — parses transport-cc into `TransportCcPacketStatus`
   entries, each with `Received`, `SequenceNumber` and `ArrivalTimeMicroseconds` on the receiver clock.
   This is the delay-based estimator's input.
 - **`RtcpReceiverEstimatedMaxBitrate`** (REMB) — a receiver-side estimate; interim fallback and cap.
@@ -103,14 +103,14 @@ event.
   `OnReportedLoss`, and add a `case RtcpReceiverEstimatedMaxBitrate` (not currently dispatched) →
   `OnReceiverEstimatedMaxBitrate`. Expose the controller as a `PeerConnection` property so callers can
   subscribe to `TargetBitrateChanged`.
-- **Sends out** (PR3): once EWI-1247 stamps outbound packets with transport-cc sequence numbers, call
+- **Sends out** (PR3): once outbound packets are stamped with transport-cc sequence numbers, call
   `OnPacketSent(seq, sendTimeMicros, size)` from the send path (`TrackSender.SendFrame`) and gate the
   send loop through `PacketPacer`.
 
-These are split out because they depend on EWI-1247's per-sequence send-time table, which lands
-separately; the estimator and its tests do not block on it.
+These are split out because they depend on a per-sequence send-time table for outbound packets, which
+lands separately; the estimator and its tests do not block on it.
 
-## Per-subscriber use in the SFU (EWI-1250)
+## Per-subscriber use in the SFU
 
 The interface is per-sending-transport by design. In the SFU each downstream subscriber has its own
 transport-cc feedback loop, so the SFU holds **one `GccCongestionController` per subscriber**. Each
@@ -122,7 +122,7 @@ forwarding choosing the highest layer that fits its own target.
 
 1. **This PR** — components + working delay-based estimator + synthetic-feedback tests + this doc.
 2. **PR2** — PeerConnection feedback dispatch hooks + REMB dispatch case + controller property.
-3. **PR3** — consume EWI-1247 outbound sequence numbers; `OnPacketSent` from the send path; insert
-   `PacketPacer` into the send loop.
+3. **PR3** — consume the outbound transport-cc sequence numbers; `OnPacketSent` from the send path;
+   insert `PacketPacer` into the send loop.
 4. **PR4** — Kiln encoder rate controller subscribes to `TargetBitrateChanged`.
-5. **PR5 (EWI-1250)** — per-subscriber controller instances + layer allocation in the SFU.
+5. **PR5** — per-subscriber controller instances + layer allocation in the SFU.

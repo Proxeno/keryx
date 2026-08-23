@@ -252,7 +252,7 @@ public sealed class ReceiverReportEventArgs : EventArgs
 /// The simulcast layer identifier (RFC 8851 RID) carried in the RFC 8852 <c>rtp-stream-id</c> header
 /// extension, or <see langword="null"/> when the section is not simulcast or the extension was absent.
 /// Lets a handler route each packet to its layer without re-parsing the header. Populated once the RID
-/// header extension is negotiated (EWI-1250 ingest-demux follow-up).
+/// header extension is negotiated (ingest-demux follow-up).
 /// </param>
 public readonly record struct RtpPacketInfo(
     string? Mid,
