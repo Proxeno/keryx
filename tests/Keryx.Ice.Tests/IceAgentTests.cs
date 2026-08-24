@@ -249,13 +249,18 @@ public sealed class IceAgentTests
         var primary = new IceAgent(sharedOptionsFor());
         using var backup = new IceAgent(sharedOptionsFor());
 
-        // Both peers can answer the offerer's checks, but only the offerer's manually injected
-        // remote candidates decide which endpoints it pairs with and in what priority order.
+        // Both peers can answer the offerer's checks - answering needs only the peer's own
+        // credentials - but only the offerer's manually injected remote candidates decide which
+        // endpoints it pairs with and in what priority order. The backup is deliberately NOT told
+        // the offerer's candidate or credentials: if it were, it would proactively probe the
+        // offerer, the offerer would learn its address as a peer-reflexive candidate and pair with
+        // it, and regular nomination (which freezes onto the first valid pair) could nominate that
+        // backup pair before the primary's - making which endpoint gets nominated a race. Keeping
+        // the backup answer-only means the primary is the offerer's only pair when it nominates, so
+        // the failover being exercised here is deterministic.
         Trickle(offerer, primary);
-        Trickle(offerer, backup);
         offerer.SetRemoteCredentials(primary.LocalUfrag, primary.LocalPassword);
         primary.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
-        backup.SetRemoteCredentials(offerer.LocalUfrag, offerer.LocalPassword);
 
         await offerer.StartGatheringAsync(cancellationToken);
         await primary.StartGatheringAsync(cancellationToken);
