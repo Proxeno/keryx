@@ -103,6 +103,15 @@ public sealed class SctpAssociation : IDisposable
     private int _nextStreamId;
     private long _receiveBufferBytes;
 
+    // Fully reassembled messages awaiting in-order delivery (future-SSN/MID ordered-hold buffers and
+    // the pre-channel orphan lists) leave _fragments/_iDataReassembly, so they no longer charge
+    // _receiveBufferBytes. Track them separately here so the same hard cap bounds the whole receive
+    // path: a peer that withholds the next expected SSN/MID while flooding later ones must not pin
+    // memory without limit. _reorderCount is the companion entry-count guard, mirroring the fragment
+    // path's _fragments.Count cap so a flood of tiny held messages cannot side-step the byte cap.
+    private long _reorderBufferBytes;
+    private int _reorderCount;
+
     // Outgoing RE-CONFIG in flight, if any, plus its retransmission bookkeeping.
     private uint _reconfigNextSeq;
     private uint _reconfigNextExpectedRemoteSeq;
@@ -242,6 +251,22 @@ public sealed class SctpAssociation : IDisposable
             lock (_lock)
             {
                 return _receiveBufferBytes;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Total memory pinned by the inbound receive path: out-of-order fragments awaiting reassembly
+    /// plus fully reassembled messages held for in-order delivery. Bounded by the hard cap. Test
+    /// observability only.
+    /// </summary>
+    internal long TotalReceiveBufferBytes
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _receiveBufferBytes + _reorderBufferBytes;
             }
         }
     }
@@ -533,8 +558,12 @@ public sealed class SctpAssociation : IDisposable
         _sendSequence.Remove(streamId);
         _sendOrderedMid.Remove(streamId);
         _sendUnorderedMid.Remove(streamId);
-        _receiveStreams.Remove(streamId);
-        _orphanMessages.Remove(streamId);
+        if (_receiveStreams.Remove(streamId, out var receiveStream))
+        {
+            ReleaseOrdered(receiveStream);
+        }
+
+        ReleaseOrphans(streamId);
         ResetIDataStream(streamId);
 
         // Only identifiers this endpoint owns (matching its allocation parity) may be handed back
@@ -934,15 +963,27 @@ public sealed class SctpAssociation : IDisposable
         // TSN advances but _fragments never drains. If the buffer stays above the hard cap
         // after attempting reassembly there is no legitimate way to recover it, so abort with
         // an Out-of-Resource cause rather than let a hostile peer OOM the host.
-        if (_receiveBufferBytes > (long)ReceiveBufferHardCap || _fragments.Count > MaxBufferedChunks)
+        if (ReceivePathExceedsHardCap(_fragments.Count))
         {
             _log.Log(
                 KeryxLogLevel.Warning,
                 $"Aborting association: out-of-order receive buffer exceeded hard cap " +
-                $"({_receiveBufferBytes} bytes / {_fragments.Count} chunks, cap {ReceiveBufferHardCap}).");
+                $"({_receiveBufferBytes + _reorderBufferBytes} bytes / {_fragments.Count} chunks / " +
+                $"{_reorderCount} held, cap {ReceiveBufferHardCap}).");
             AbortInternal(SctpErrorCauseCode.OutOfResource, "receive buffer exhausted");
         }
     }
+
+    /// <summary>
+    /// True when the whole inbound receive path — out-of-order fragments plus reassembled messages
+    /// held for in-order delivery — has grown past the hard cap on either bytes or entry count.
+    /// <paramref name="fragmentCount"/> is the number of buffered fragments in the calling path
+    /// (contiguous DATA or interleaved I-DATA), checked alongside the shared reorder-hold count.
+    /// </summary>
+    private bool ReceivePathExceedsHardCap(int fragmentCount) =>
+        _receiveBufferBytes + _reorderBufferBytes > (long)ReceiveBufferHardCap
+        || fragmentCount > MaxBufferedChunks
+        || _reorderCount > MaxBufferedChunks;
 
     /// <summary>
     /// The hard ceiling on out-of-order receive buffering. <see cref="LocalReceiveWindow"/>
@@ -968,9 +1009,10 @@ public sealed class SctpAssociation : IDisposable
     /// bytes or buffered chunk count.
     /// </summary>
     private bool WouldExceedReceiveBuffer(int incomingLength) =>
-        (ulong)(_receiveBufferBytes + incomingLength) > ReceiveBufferHardCap
+        (ulong)(_receiveBufferBytes + _reorderBufferBytes + incomingLength) > ReceiveBufferHardCap
         || _received.Count >= MaxBufferedChunks
-        || _fragments.Count >= MaxBufferedChunks;
+        || _fragments.Count >= MaxBufferedChunks
+        || _reorderCount >= MaxBufferedChunks;
 
     /// <summary>Sends an ABORT with the given cause and tears the association down locally.</summary>
     private void AbortInternal(SctpErrorCauseCode cause, string detail)
@@ -1078,8 +1120,38 @@ public sealed class SctpAssociation : IDisposable
         }
         else if (Serial.Gt16(head.StreamSequence, stream.NextSequence))
         {
-            stream.Buffered[head.StreamSequence] = message;
+            HoldOrdered(stream, head.StreamSequence, message);
         }
+    }
+
+    /// <summary>
+    /// Buffers a reassembled ordered message whose stream sequence number is ahead of the next
+    /// expected one, charging the reorder-hold accounting so the hard cap bounds it. Overwriting an
+    /// existing entry for the same SSN releases the old charge first.
+    /// </summary>
+    private void HoldOrdered(ReceiveStream stream, ushort ssn, ReassembledMessage message)
+    {
+        if (stream.Buffered.Remove(ssn, out var existing))
+        {
+            _reorderBufferBytes -= existing.Payload.Length;
+            _reorderCount--;
+        }
+
+        stream.Buffered[ssn] = message;
+        _reorderBufferBytes += message.Payload.Length;
+        _reorderCount++;
+    }
+
+    /// <summary>Releases the reorder-hold accounting for every message held on a stream, then clears it.</summary>
+    private void ReleaseOrdered(ReceiveStream stream)
+    {
+        foreach (var held in stream.Buffered.Values)
+        {
+            _reorderBufferBytes -= held.Payload.Length;
+            _reorderCount--;
+        }
+
+        stream.Buffered.Clear();
     }
 
     private void DropRange(uint start, uint end)
@@ -1102,6 +1174,8 @@ public sealed class SctpAssociation : IDisposable
     {
         while (stream.Buffered.Remove(stream.NextSequence, out var next))
         {
+            _reorderBufferBytes -= next.Payload.Length;
+            _reorderCount--;
             DeliverMessage(next);
             stream.NextSequence = unchecked((ushort)(stream.NextSequence + 1));
         }
@@ -1165,12 +1239,13 @@ public sealed class SctpAssociation : IDisposable
         BufferIData(data);
         ProcessDeferredIncomingResets();
 
-        if (_receiveBufferBytes > (long)ReceiveBufferHardCap || _iDataBufferedFragments > MaxBufferedChunks)
+        if (ReceivePathExceedsHardCap(_iDataBufferedFragments))
         {
             _log.Log(
                 KeryxLogLevel.Warning,
                 $"Aborting association: out-of-order I-DATA receive buffer exceeded hard cap " +
-                $"({_receiveBufferBytes} bytes / {_iDataBufferedFragments} fragments, cap {ReceiveBufferHardCap}).");
+                $"({_receiveBufferBytes + _reorderBufferBytes} bytes / {_iDataBufferedFragments} fragments / " +
+                $"{_reorderCount} held, cap {ReceiveBufferHardCap}).");
             AbortInternal(SctpErrorCauseCode.OutOfResource, "receive buffer exhausted");
         }
     }
@@ -1257,7 +1332,52 @@ public sealed class SctpAssociation : IDisposable
         }
         else if (Serial.Gt(key.MessageId, stream.NextMessageId))
         {
-            stream.Buffered[key.MessageId] = message;
+            HoldIDataOrdered(stream, key.MessageId, message);
+        }
+    }
+
+    /// <summary>
+    /// Buffers a reassembled I-DATA message whose MID is ahead of the next expected one, charging
+    /// the reorder-hold accounting so the hard cap bounds it. Overwriting an existing entry for the
+    /// same MID releases the old charge first.
+    /// </summary>
+    private void HoldIDataOrdered(IDataReceiveStream stream, uint mid, ReassembledMessage message)
+    {
+        if (stream.Buffered.Remove(mid, out var existing))
+        {
+            _reorderBufferBytes -= existing.Payload.Length;
+            _reorderCount--;
+        }
+
+        stream.Buffered[mid] = message;
+        _reorderBufferBytes += message.Payload.Length;
+        _reorderCount++;
+    }
+
+    /// <summary>Releases the reorder-hold accounting for every I-DATA message held on a stream, then clears it.</summary>
+    private void ReleaseIDataOrdered(IDataReceiveStream stream)
+    {
+        foreach (var held in stream.Buffered.Values)
+        {
+            _reorderBufferBytes -= held.Payload.Length;
+            _reorderCount--;
+        }
+
+        stream.Buffered.Clear();
+    }
+
+    /// <summary>Releases the reorder-hold accounting for messages orphaned on a stream, then drops them.</summary>
+    private void ReleaseOrphans(ushort streamId)
+    {
+        if (!_orphanMessages.Remove(streamId, out var orphans))
+        {
+            return;
+        }
+
+        foreach (var orphan in orphans)
+        {
+            _reorderBufferBytes -= orphan.Payload.Length;
+            _reorderCount--;
         }
     }
 
@@ -1265,6 +1385,8 @@ public sealed class SctpAssociation : IDisposable
     {
         while (stream.Buffered.Remove(stream.NextMessageId, out var next))
         {
+            _reorderBufferBytes -= next.Payload.Length;
+            _reorderCount--;
             DeliverMessage(next);
             stream.NextMessageId = unchecked(stream.NextMessageId + 1);
         }
@@ -1325,7 +1447,10 @@ public sealed class SctpAssociation : IDisposable
     /// <summary>Drops every buffered I-DATA fragment and ordered-delivery state for a stream.</summary>
     private void ResetIDataStream(ushort streamId)
     {
-        _iDataReceiveStreams.Remove(streamId);
+        if (_iDataReceiveStreams.Remove(streamId, out var receiveStream))
+        {
+            ReleaseIDataOrdered(receiveStream);
+        }
 
         var keys = new List<IDataKey>();
         foreach (var key in _iDataReassembly.Keys)
@@ -1363,6 +1488,8 @@ public sealed class SctpAssociation : IDisposable
             if (pending.Count < 16)
             {
                 pending.Add(message);
+                _reorderBufferBytes += message.Payload.Length;
+                _reorderCount++;
             }
 
             return;
@@ -1451,6 +1578,8 @@ public sealed class SctpAssociation : IDisposable
         {
             foreach (var orphan in orphans)
             {
+                _reorderBufferBytes -= orphan.Payload.Length;
+                _reorderCount--;
                 RaiseMessage(channel, orphan);
             }
         }
@@ -1694,7 +1823,7 @@ public sealed class SctpAssociation : IDisposable
         if (_receiveStreams.TryGetValue(streamId, out var stream))
         {
             stream.NextSequence = 0;
-            stream.Buffered.Clear();
+            ReleaseOrdered(stream);
         }
 
         ResetIDataStream(streamId);
@@ -1829,7 +1958,11 @@ public sealed class SctpAssociation : IDisposable
 
             foreach (var key in skipped)
             {
-                stream.Buffered.Remove(key);
+                if (stream.Buffered.Remove(key, out var removed))
+                {
+                    _reorderBufferBytes -= removed.Payload.Length;
+                    _reorderCount--;
+                }
             }
 
             stream.NextSequence = unchecked((ushort)(entry.StreamSequence + 1));
@@ -2159,7 +2292,7 @@ public sealed class SctpAssociation : IDisposable
 
     private uint LocalReceiveWindow()
     {
-        var used = Math.Max(0, _receiveBufferBytes);
+        var used = Math.Max(0, _receiveBufferBytes + _reorderBufferBytes);
         var available = _config.ReceiveWindow - (ulong)used;
         return available > _config.ReceiveWindow ? 0 : (uint)Math.Max(0, (long)available);
     }
@@ -2832,6 +2965,10 @@ public sealed class SctpAssociation : IDisposable
         _iDataReceiveStreams.Clear();
         _iDataBufferedFragments = 0;
         _receiveBufferBytes = 0;
+        _receiveStreams.Clear();
+        _orphanMessages.Clear();
+        _reorderBufferBytes = 0;
+        _reorderCount = 0;
 
         var channels = _channels.Values.ToArray();
         _channels.Clear();
