@@ -193,16 +193,17 @@ internal static class BrowserLauncher
     };
 
     /// <summary>
-    /// Writes the <c>user.js</c> that turns a fresh Firefox profile into one that can complete a pure
-    /// 127.0.0.1 loopback WebRTC handshake headless, and copies a warmed OpenH264 GMP into it when one
-    /// is offered. Firefox's defaults fight loopback interop in three ways this undoes:
+    /// Writes the <c>user.js</c> that turns a fresh Firefox profile into one that can complete a
+    /// headless, host-candidate-only WebRTC handshake against Keryx, and copies a warmed OpenH264 GMP
+    /// into it when one is offered. Firefox's defaults fight this interop in two ways this undoes:
     /// <list type="bullet">
-    /// <item><c>media.peerconnection.ice.loopback=true</c> — Firefox does not gather loopback (127.0.0.1)
-    /// host candidates unless asked; without it ICE never connects on a pure loopback path.</item>
     /// <item><c>media.peerconnection.ice.obfuscate_host_addresses=false</c> — disables the mDNS
-    /// <c>.local</c> candidate hiding that would otherwise replace the real 127.0.0.1 address.</item>
+    /// <c>.local</c> candidate hiding, so Firefox advertises a real interface address that Keryx (bound
+    /// to <see cref="System.Net.IPAddress.Any"/>) can pair with. <c>media.peerconnection.ice.loopback</c>
+    /// is left on so a 127.0.0.1 candidate is also offered where the platform exposes one.</item>
     /// <item>the <c>media.gmp-gmpopenh264.*</c> prefs enable the OpenH264 GMP so Firefox can offer,
-    /// answer, encode and decode H.264 — the only video codec Keryx speaks.</item>
+    /// answer and <em>decode</em> H.264 — the only video codec Keryx speaks. (Headless Firefox does not
+    /// <em>encode</em> H.264, so the Firefox lane never asks it to send video.)</item>
     /// </list>
     /// The remaining prefs silence first-run, telemetry and update chatter that would otherwise add
     /// latency and network noise to a headless CI launch.
@@ -213,7 +214,7 @@ internal static class BrowserLauncher
         Directory.CreateDirectory(profileDir);
 
         // A warmed template profile (created once by the CI job so the OpenH264 GMP is already
-        // downloaded) lets every throwaway profile speak H.264 without racing a per-test Cisco
+        // downloaded) lets every throwaway profile decode H.264 without racing a per-test Cisco
         // download. Local dev without the template relies on Firefox's own on-demand GMP fetch.
         var gmpTemplate = Environment.GetEnvironmentVariable("KERYX_FIREFOX_GMP_DIR");
         if (!string.IsNullOrEmpty(gmpTemplate))
@@ -223,7 +224,7 @@ internal static class BrowserLauncher
 
         string[] prefs =
         [
-            // ---- WebRTC loopback + H.264, the prefs that make keryx interop possible ----
+            // ---- WebRTC candidates + H.264, the prefs that make keryx interop possible ----
             Pref("media.peerconnection.ice.loopback", true),
             Pref("media.peerconnection.ice.obfuscate_host_addresses", false),
             Pref("media.peerconnection.ice.no_host", false),

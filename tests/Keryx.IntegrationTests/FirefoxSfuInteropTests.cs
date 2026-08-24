@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Text.Json;
 using FluentAssertions;
 using Keryx.Rtp;
@@ -8,18 +9,21 @@ using Xunit.Abstractions;
 namespace Keryx.IntegrationTests;
 
 /// <summary>
-/// The SFU shapes, proven against Firefox as the offerer and Keryx as the answerer — the mirror of
-/// <see cref="ChromeSfuInteropTests"/> on a second real engine. Two directions run against the one
-/// role-flexible fixture (<c>assets/chrome-client.html</c>) through the shared
-/// <see cref="BrowserLauncher"/> seam:
-/// <list type="bullet">
-/// <item>Firefox offers <c>sendonly</c> and Keryx receives its RTP (the ingest shape), and</item>
-/// <item>Firefox offers <c>recvonly</c>, Keryx answers <c>sendonly</c> and forwards RTP with
-/// <see cref="PeerConnection.TryForwardRtp"/>, and Firefox reports what it received (the
-/// subscriber-egress shape).</item>
-/// </list>
-/// Firefox's codec/PT preferences and <c>a=setup</c> role differ from Chrome's, so these exercise the
-/// answerer's codec-matching and DTLS-role paths against inputs Chrome does not produce.
+/// The SFU egress shape, proven against Firefox as the offerer and Keryx as the answerer — the mirror
+/// of <see cref="ChromeSfuInteropTests"/> on a second real engine. Firefox offers <c>recvonly</c>,
+/// Keryx answers <c>sendonly</c> and forwards RTP with <see cref="PeerConnection.TryForwardRtp"/>, and
+/// Firefox reports what it received. It runs against the one role-flexible fixture
+/// (<c>assets/chrome-client.html</c>) through the shared <see cref="BrowserLauncher"/> seam. Firefox's
+/// codec/PT preferences and <c>a=setup</c> role differ from Chrome's, so it exercises the answerer's
+/// codec-matching and DTLS-role paths against inputs Chrome does not produce.
+/// <para>
+/// The complementary ingest shape (browser offers <c>sendonly</c>, Keryx receives the browser's RTP)
+/// that the Chrome lane proves is deliberately absent here: Keryx accepts only H.264 video, and
+/// headless Firefox cannot <em>encode</em> H.264 — its OpenH264 GMP decodes (so the keryx-offers flow
+/// works) but produces zero encoded frames, so a Firefox <c>sendonly</c> offer would carry no media to
+/// receive. That is a headless-Firefox codec limitation, not a Keryx defect; Chrome, whose H.264
+/// encoder works headless, covers the ingest direction.
+/// </para>
 /// </summary>
 /// <remarks>
 /// <c>Category=FirefoxInterop</c>: needs a browser. Its absence skips locally and — when the CI job
@@ -35,105 +39,6 @@ public sealed class FirefoxSfuInteropTests
     /// <summary>Captures the xunit output sink.</summary>
     /// <param name="output">Where progress and the final report land.</param>
     public FirefoxSfuInteropTests(ITestOutputHelper output) => _output = output;
-
-    /// <summary>
-    /// Firefox offers <c>sendonly</c> video (a synthetic canvas stream); Keryx answers, connects, and
-    /// its inbound RTP counter climbs — the media-server ingest path with Firefox driving the offer.
-    /// </summary>
-    [Fact]
-    [Trait("Category", "FirefoxInterop")]
-    public async Task BrowserOffersSendonlyAndKeryxReceivesInboundRtp()
-    {
-        var firefoxPath = BrowserLauncher.Require(BrowserKind.Firefox);
-        if (firefoxPath is null)
-        {
-            _output.WriteLine("SKIPPED: Firefox not found (set KERYX_FIREFOX_PATH to enable).");
-            return;
-        }
-
-        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(90));
-        var cancellationToken = shutdown.Token;
-
-        await using var peer = new PeerConnection(TestSupport.NewConfig());
-
-        // Count the inbound video RTP Keryx routes, alongside the transport-level receive counter, so
-        // the assertion is "Keryx saw Firefox's media", not merely "some datagram decrypted".
-        var videoPacketsSeen = 0;
-        peer.OnRtpPacketReceived += (in RtpPacketInfo info, ReadOnlySpan<byte> payload) =>
-        {
-            _ = payload;
-            if (info.Kind == MediaKind.Video)
-            {
-                Interlocked.Increment(ref videoPacketsSeen);
-            }
-        };
-
-        var reportLock = new object();
-        string? latestReportJson = null;
-        var answered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        using var host = new InteropSignalingHost(HttpPort, _output)
-        {
-            OnPostOffer = async offerSdp =>
-            {
-                await peer.SetRemoteDescriptionAsync(offerSdp, SdpType.Offer, cancellationToken);
-                var answer = await peer.CreateAnswerAsync(cancellationToken);
-                answer.Should().Contain("a=recvonly", "a sendonly offer must be answered recvonly");
-                answered.TrySetResult();
-                return answer;
-            },
-            OnReport = body =>
-            {
-                lock (reportLock)
-                {
-                    latestReportJson = body;
-                }
-            },
-        };
-        host.Start(cancellationToken);
-
-        var profileDir = Path.Combine(Path.GetTempPath(), $"keryx-firefox-sfu-send-{Guid.NewGuid():N}");
-        Process? firefox = null;
-        try
-        {
-            firefox = BrowserLauncher.Launch(
-                BrowserKind.Firefox, firefoxPath, $"http://127.0.0.1:{HttpPort}/?role=offer-send", profileDir);
-
-            (await Task.WhenAny(answered.Task, Task.Delay(TimeSpan.FromSeconds(30), cancellationToken)))
-                .Should().Be(answered.Task, "Firefox should offer and Keryx should answer it");
-
-            (await peer.WaitForConnectedAsync(TimeSpan.FromSeconds(30), cancellationToken))
-                .Should().BeTrue("ICE + DTLS should complete against Firefox");
-            _output.WriteLine(
-                $"connected: dtlsRole={peer.LocalDtlsRole} srtp={peer.NegotiatedSrtpProfile}");
-
-            var received = await TestSupport.WaitForAsync(
-                () => peer.GetStats().RtpPacketsReceived >= 60 && Volatile.Read(ref videoPacketsSeen) >= 60,
-                timeoutMilliseconds: 45_000);
-
-            var stats = peer.GetStats();
-            string? lastJson;
-            lock (reportLock)
-            {
-                lastJson = latestReportJson;
-            }
-
-            _output.WriteLine(
-                $"keryx inbound: rtpPackets={stats.RtpPacketsReceived} videoPackets={Volatile.Read(ref videoPacketsSeen)} "
-                + $"srtpFailures={stats.SrtpAuthenticationFailures} beforeReady={stats.MediaDroppedBeforeReady}");
-            _output.WriteLine($"final browser report: {lastJson ?? "(none)"}");
-
-            received.Should().BeTrue(
-                $"Keryx must see Firefox's inbound RTP; last report: {lastJson}");
-            stats.RtpPacketsReceived.Should().BeGreaterThan(30);
-            Volatile.Read(ref videoPacketsSeen).Should().BeGreaterThan(30, "inbound video must route to the video track");
-        }
-        finally
-        {
-            BrowserLauncher.Cleanup(firefox, profileDir);
-            shutdown.Cancel();
-        }
-    }
 
     /// <summary>
     /// Firefox offers <c>recvonly</c> video; Keryx answers <c>sendonly</c> and forwards synthetic RTP
@@ -154,7 +59,7 @@ public sealed class FirefoxSfuInteropTests
         using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(90));
         var cancellationToken = shutdown.Token;
 
-        await using var peer = new PeerConnection(TestSupport.NewConfig());
+        await using var peer = new PeerConnection(TestSupport.NewConfig(bindAddress: IPAddress.Any));
 
         var reportLock = new object();
         string? latestReportJson = null;

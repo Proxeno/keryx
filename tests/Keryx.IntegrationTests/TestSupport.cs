@@ -18,11 +18,24 @@ internal static class TestSupport
     /// <summary>Highest UDP port the tests are allowed to bind.</summary>
     internal const int MaxPort = 7999;
 
-    /// <summary>A config pinned to the loopback interface and the test port range.</summary>
+    /// <summary>
+    /// A config pinned to the test port range, bound to <paramref name="bindAddress"/> or the loopback
+    /// interface by default.
+    /// </summary>
     /// <param name="logger">Optional diagnostics sink.</param>
-    internal static PeerConnectionConfig NewConfig(IKeryxLogger? logger = null) => new()
+    /// <param name="bindAddress">
+    /// The interface to bind and gather host candidates on; <see langword="null"/> keeps the loopback
+    /// interface the Keryx-to-Keryx, Chrome and pion lanes use. The Firefox lane passes
+    /// <see cref="IPAddress.Any"/> instead: headless Firefox gathers only its real (non-loopback)
+    /// interface address and binds its socket to it, and on Linux a socket bound to <c>127.0.0.1</c>
+    /// cannot send to a non-loopback address, so a loopback-only Keryx and Firefox never form a working
+    /// candidate pair. Binding every interface lets Keryx meet Firefox on the address Firefox chose,
+    /// still using host candidates only — no STUN, TURN or mDNS. (Chrome escapes this because it binds
+    /// <c>0.0.0.0</c> and the winning pair collapses onto loopback; Firefox binds the specific address.)
+    /// </param>
+    internal static PeerConnectionConfig NewConfig(IKeryxLogger? logger = null, IPAddress? bindAddress = null) => new()
     {
-        BindAddress = IPAddress.Loopback,
+        BindAddress = bindAddress ?? IPAddress.Loopback,
         MinPort = MinPort,
         MaxPort = MaxPort,
         Logger = logger ?? NullLogger.Instance,

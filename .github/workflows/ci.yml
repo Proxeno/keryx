@@ -42,16 +42,22 @@ jobs:
   # Firefox interop, CI-enforced. A third real-engine lane alongside the Chrome lane, reusing the
   # same role-flexible fixture and the same BrowserLauncher seam. It is valuable precisely because
   # Firefox exercises paths Chrome does not: it negotiates two-byte RTP header extensions more
-  # readily, prefers a different codec/PT ordering, makes its own a=setup role choice, and speaks
+  # readily, prefers a different codec/PT ordering, makes its own a=setup role choice, and decodes
   # H.264 only through the downloadable OpenH264 GMP rather than a built-in decoder. This job installs
   # Firefox, so the FirefoxInterop tests (excluded from build-test above) MUST actually run here.
   # KERYX_REQUIRE_FIREFOX=1 turns a missing or unlaunchable browser into a failure instead of the
   # graceful skip local dev gets, so an interop regression fails the build rather than passing.
+  # The lane proves the two directions headless Firefox can sustain against an H.264-only Keryx:
+  # Keryx offers H.264 + data channels and Firefox decodes/round-trips (media-server shape), and Keryx
+  # forwards RTP that Firefox receives (SFU egress). The browser-sends-H.264 ingest shape is left to the
+  # Chrome lane: headless Firefox's OpenH264 GMP decodes but does not encode, so a Firefox sendonly
+  # offer would carry no media. Data channels use classic SCTP DATA (not RFC 8260 I-DATA), which is what
+  # Firefox actually handles — see PeerConnection.StartSctp.
   firefox-interop:
     runs-on: ubuntu-latest
-    # Safety bound: the three FirefoxInterop tests each carry their own ~90s deadline and run serially,
-    # so a healthy run finishes in a few minutes. This ceiling guarantees a future regression can never
-    # hang the job for the six-hour GitHub default and burn CI minutes.
+    # Safety bound: the FirefoxInterop tests each carry their own ~90s deadline and run serially, so a
+    # healthy run finishes in a few minutes. This ceiling guarantees a future regression can never hang
+    # the job for the six-hour GitHub default and burn CI minutes.
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
@@ -62,11 +68,11 @@ jobs:
         id: setup-firefox
         with:
           firefox-version: latest
-      # Keryx speaks H.264 only, but Firefox ships no built-in H.264 codec: it downloads Cisco's
-      # OpenH264 GMP on demand. Warming it once into a template profile (and copying it into each
-      # test's throwaway profile via KERYX_FIREFOX_GMP_DIR) keeps every test from racing that download
-      # at SDP time. Best effort: the tests' prefs also enable Firefox's own on-demand fetch as a
-      # fallback, so a slow warm-up does not fail the job outright.
+      # Keryx speaks H.264 only, and Firefox needs Cisco's OpenH264 GMP to decode it (Firefox ships no
+      # built-in H.264): it downloads the GMP on demand. Warming it once into a template profile (and
+      # copying it into each test's throwaway profile via KERYX_FIREFOX_GMP_DIR) keeps every test from
+      # racing that download at SDP time. Best effort: the tests' prefs also enable Firefox's own
+      # on-demand fetch as a fallback, so a slow warm-up does not fail the job outright.
       - name: Warm up OpenH264 GMP
         run: |
           FF="${{ steps.setup-firefox.outputs.firefox-path }}"
@@ -93,10 +99,12 @@ jobs:
           echo "KERYX_FIREFOX_GMP_DIR=$PROFILE" >> "$GITHUB_ENV"
           ls -R "$PROFILE/gmp-gmpopenh264" 2>/dev/null || echo "OpenH264 GMP not present after warm-up (tests will fetch on demand)"
       - run: dotnet build Keryx.slnx --configuration Release
-      # The DTLS-SRTP/ICE path stays a pure 127.0.0.1 loopback (host candidates only): the test peer
-      # binds IPAddress.Loopback and the Firefox profile is primed with
-      # media.peerconnection.ice.loopback=true + obfuscate_host_addresses=false so it gathers 127.0.0.1
-      # host candidates and no STUN/TURN or mDNS is involved. That is what lets the lane run headless.
+      # The DTLS-SRTP/ICE path uses host candidates only — no STUN, TURN or mDNS — so it runs headless.
+      # It is not loopback-only: headless Firefox gathers just its real interface address and binds its
+      # socket to it, and on Linux a 127.0.0.1-bound socket cannot reach a non-loopback peer, so the
+      # Keryx test peer binds IPAddress.Any to meet Firefox on the interface Firefox chose. The Firefox
+      # profile still disables mDNS (obfuscate_host_addresses=false) so the candidate is a real address
+      # rather than a .local name. See TestSupport.NewConfig for why Chrome tolerates loopback-only.
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=FirefoxInterop"
         env:
           KERYX_REQUIRE_FIREFOX: "1"

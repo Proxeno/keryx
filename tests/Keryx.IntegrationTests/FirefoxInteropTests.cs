@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Text.Json;
 using FluentAssertions;
 using Xunit;
@@ -54,7 +55,7 @@ public sealed class FirefoxInteropTests
         var logger = logWriter is null
             ? (Keryx.Core.IKeryxLogger?)null
             : new Keryx.Core.TextWriterLogger(logWriter, Keryx.Core.KeryxLogLevel.Trace, "interop");
-        await using var peer = new PeerConnection(TestSupport.NewConfig(logger));
+        await using var peer = new PeerConnection(TestSupport.NewConfig(logger, IPAddress.Any));
         var controllerTask = peer.CreateDataChannel("controller", ordered: false, maxRetransmits: 0);
         var telemetryTask = peer.CreateDataChannel("telemetry");
 

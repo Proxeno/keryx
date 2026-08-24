@@ -739,6 +739,19 @@ public sealed partial class PeerConnection
             IsInitiator = role == DtlsRole.Client,
             UsesEvenStreamIds = role == DtlsRole.Client,
             MaxMessageSize = (uint)_config.MaxMessageSize,
+
+            // Classic DATA only on the browser-facing path — never RFC 8260 I-DATA. Chrome does not
+            // implement I-DATA at all, so it negotiates classic DATA and is unaffected. Firefox is the
+            // hazard: it advertises I-DATA in its INIT Supported Extensions (so a peer concludes it is
+            // supported) yet sends classic DATA itself and does not deliver a peer's ordered I-DATA —
+            // an interleaving-capable Keryx would send I-DATA that Firefox opens the data channel from
+            // (the DATA_CHANNEL_OPEN arrives) but then silently buffers every ordered user message
+            // behind, so a reliable/ordered channel to Firefox goes permanently one-way. Using the
+            // lowest-common-denominator classic DATA that every browser handles keeps ordered channels
+            // working against Chrome and Firefox alike. Keryx's I-DATA implementation stays intact for
+            // Keryx-to-Keryx and its unit tests; it is only this browser-interop association that opts
+            // out.
+            EnableInterleaving = false,
             Logger = _logger,
         });
 
