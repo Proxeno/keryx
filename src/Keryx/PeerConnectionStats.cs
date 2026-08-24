@@ -1,5 +1,6 @@
 using Keryx.Dtls;
 using Keryx.Ice;
+using Keryx.Sdp;
 
 namespace Keryx;
 
@@ -151,6 +152,27 @@ public readonly record struct FeedbackStats(
     long NacksSent = 0,
     long TransportCcFeedbacksSent = 0);
 
+/// <summary>Point-in-time counters for one transceiver (session-model.md §2.2).</summary>
+/// <param name="Mid">The transceiver's negotiated <c>a=mid</c>, or null before one is assigned.</param>
+/// <param name="Kind">Whether the transceiver carries audio or video.</param>
+/// <param name="Direction">The direction the application wants.</param>
+/// <param name="CurrentDirection">The negotiated direction, or null before negotiation settles.</param>
+/// <param name="Stopped">True once the transceiver has been stopped.</param>
+/// <param name="SenderSsrc">The local send SSRC the transceiver owns.</param>
+/// <param name="SenderPayloadType">The negotiated send payload type, or null before it settles.</param>
+/// <param name="ReceiverSsrc">The remote sender's SSRC learned from inbound RTP, or null.</param>
+/// <param name="Send">The send-track counters, or null when this transceiver has no live send track.</param>
+public readonly record struct TransceiverStats(
+    string? Mid,
+    MediaKind Kind,
+    MediaDirection Direction,
+    MediaDirection? CurrentDirection,
+    bool Stopped,
+    uint SenderSsrc,
+    byte? SenderPayloadType,
+    uint? ReceiverSsrc,
+    MediaTrackStats? Send = null);
+
 /// <summary>A small point-in-time snapshot of a <see cref="PeerConnection"/>.</summary>
 /// <param name="State">The connection state.</param>
 /// <param name="IceState">The ICE agent's state.</param>
@@ -162,6 +184,10 @@ public readonly record struct FeedbackStats(
 /// <param name="RtcpPacketsReceived">Inbound SRTCP datagrams that decrypted.</param>
 /// <param name="SrtpAuthenticationFailures">Inbound media datagrams SRTP rejected (bad tag or replay).</param>
 /// <param name="MediaDroppedBeforeReady">Inbound media datagrams discarded because SRTP was not keyed yet.</param>
+/// <param name="Transceivers">
+/// One entry per transceiver in m-line order (session-model.md §2.2). Additive: the legacy
+/// <see cref="Video"/> / <see cref="Audio"/> counters are unchanged and still resolve first-of-kind.
+/// </param>
 public readonly record struct PeerConnectionStats(
     PeerConnectionState State,
     IceAgentState IceState,
@@ -172,4 +198,5 @@ public readonly record struct PeerConnectionStats(
     long RtpPacketsReceived,
     long RtcpPacketsReceived,
     long SrtpAuthenticationFailures,
-    long MediaDroppedBeforeReady);
+    long MediaDroppedBeforeReady,
+    IReadOnlyList<TransceiverStats> Transceivers = null!);
