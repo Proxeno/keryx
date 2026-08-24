@@ -168,6 +168,19 @@ public sealed class PublicTransceiverApiTests
             byMid[mid].Keys.Should().Equal(transceiver.Sender.Ssrc);
         }
 
+        // The answerer's per-transceiver receiver learned its OWN sender's SSRC — the multi-same-kind
+        // case this API exists for. A first-of-kind write would flip-flop one and leave the other null.
+        answerer.Transceivers.Count(t => t.Kind == MediaKind.Video).Should().Be(2);
+        foreach (var offererVideo in videoTransceivers)
+        {
+            var answererVideo = answerer.GetTransceiver(offererVideo.Mid!);
+            answererVideo.Should().NotBeNull();
+            answererVideo!.Receiver.Ssrc.Should().Be(
+                offererVideo.Sender.Ssrc,
+                "receiver on mid {0} must learn its own m-line's remote SSRC",
+                offererVideo.Mid);
+        }
+
         // Per-transceiver stats are populated (§2.2): two video + one audio, the video senders sending.
         var stats = offerer.GetStats();
         stats.Transceivers.Should().NotBeNull();

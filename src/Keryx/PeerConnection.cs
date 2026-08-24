@@ -102,6 +102,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         // Build the legacy per-kind transceivers from the config (session-model.md §5.1). Their senders
         // own the pre-allocated SSRCs and track ids, so the per-kind identity accessors resolve to them.
+        _transceiversView = new System.Collections.ObjectModel.ReadOnlyCollection<RtpTransceiver>(_transceivers);
         BuildLegacyTransceivers();
 
         if (_config.EnableCongestionControl)
@@ -571,8 +572,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
         Interlocked.Read(ref _rtpReceived),
         Interlocked.Read(ref _rtcpReceived),
         Interlocked.Read(ref _srtpFailures),
-        Interlocked.Read(ref _mediaBeforeReady),
-        BuildTransceiverStats());
+        Interlocked.Read(ref _mediaBeforeReady))
+    {
+        Transceivers = BuildTransceiverStats(),
+    };
 
     /// <summary>
     /// Forwards a congestion-controller target change to the pacer and to public subscribers. Runs on
@@ -1542,9 +1545,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
             }
 
             // The MID extension is likewise transport-wide; the first section that kept it fixes the
-            // demux element id. Populated only when the remote (answerer) kept it — Keryx does not yet
-            // offer the extension, so on the offerer path this is typically absent and demux falls to
-            // the SSRC map the answer's a=ssrc lines provide.
+            // demux element id. Keryx offers the MID extmap on every RTP m-line once the transceiver API
+            // is used (§3.5), so a peer that echoes it lands here; otherwise this stays absent and demux
+            // falls to the SSRC map the answer's a=ssrc lines provide.
             if (midExtensionId == 0)
             {
                 midExtensionId = FindMidExtensionId(media.HeaderExtensions);

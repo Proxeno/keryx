@@ -21,6 +21,10 @@ public sealed partial class PeerConnection
     // public AddTransceiver/AddTrack append more before the first negotiation.
     private readonly List<RtpTransceiver> _transceivers = [];
 
+    // A non-mutable, non-castable view over _transceivers for the public Transceivers property. Assigned
+    // in the constructor (a field initializer cannot reference another instance field).
+    private readonly System.Collections.ObjectModel.ReadOnlyCollection<RtpTransceiver> _transceiversView;
+
     // Cached first-of-kind handles for the legacy per-kind shim. "First of kind" is exact and stable
     // because the constructor creates the video transceiver before the audio one, so for every existing
     // single-video/single-audio consumer the first-of-kind transceiver is the only one of its kind.
@@ -46,7 +50,14 @@ public sealed partial class PeerConnection
     public event EventHandler<RtpTransceiver>? OnTransceiver;
 
     /// <summary>Every transceiver, in m-line order. The data channel is not a transceiver.</summary>
-    public IReadOnlyList<RtpTransceiver> Transceivers => _transceivers;
+    /// <remarks>
+    /// This is a read-only view over the live set, not a snapshot: it reflects transceivers auto-created
+    /// while a remote offer is applied. Because both shipping consumers add transceivers before the first
+    /// negotiation and never renegotiate, that mutation is confined to <see cref="SetRemoteDescriptionAsync"/>
+    /// on the answerer; enumerate the collection off that path (before applying an offer, or after the
+    /// answer is built) rather than concurrently with it.
+    /// </remarks>
+    public IReadOnlyList<RtpTransceiver> Transceivers => _transceiversView;
 
     /// <summary>The transceiver associated with <paramref name="mid"/>, or null when none is.</summary>
     /// <param name="mid">The <c>a=mid</c> to look up.</param>
@@ -88,6 +99,17 @@ public sealed partial class PeerConnection
             throw new ArgumentOutOfRangeException(nameof(kind), kind, "Only audio and video transceivers can be added.");
         }
 
+        // A codec source must exist: either the init supplies one, or the per-kind config does. Without
+        // one the offer would emit an m-line with zero formats (invalid SDP), so fail fast here.
+        var hasCodecs = init is { Codecs.Count: > 0 }
+            || (kind == MediaKind.Video ? _config.VideoCodecs.Count > 0 : _config.AudioCodecs.Count > 0);
+        if (!hasCodecs)
+        {
+            throw new ArgumentException(
+                $"No codecs are available for a {kind} transceiver; provide init.Codecs or configure {kind}Codecs.",
+                nameof(init));
+        }
+
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
@@ -96,6 +118,25 @@ public sealed partial class PeerConnection
                 throw new InvalidOperationException(
                     "Adding a transceiver after a description has been set (a mid-session add) is not supported yet;"
                     + " add every transceiver before the first offer or answer.");
+            }
+
+            // A pinned mid must be unique across the session, or the offer emits duplicate a=mid lines.
+            if (init?.Mid is { } pinnedMid)
+            {
+                if (string.Equals(pinnedMid, _config.ApplicationMid, StringComparison.Ordinal))
+                {
+                    throw new ArgumentException(
+                        $"init.Mid '{pinnedMid}' collides with the application (data channel) mid.", nameof(init));
+                }
+
+                foreach (var existing in _transceivers)
+                {
+                    if (string.Equals(existing.Mid, pinnedMid, StringComparison.Ordinal))
+                    {
+                        throw new ArgumentException(
+                            $"init.Mid '{pinnedMid}' is already used by another transceiver.", nameof(init));
+                    }
+                }
             }
 
             var sender = new RtpSender(

@@ -40,7 +40,10 @@ public sealed class RtpTransceiver
     /// <summary>The direction the application wants, settable before the next negotiation.</summary>
     public MediaDirection Direction { get; set; }
 
-    /// <summary>The direction actually negotiated (RFC 8829), <see langword="null"/> before negotiation settles.</summary>
+    /// <summary>
+    /// The direction actually negotiated (RFC 8829), <see langword="null"/> before negotiation settles
+    /// — and still <see langword="null"/> when the answer rejects the m-line (no common codec).
+    /// </summary>
     public MediaDirection? CurrentDirection { get; internal set; }
 
     /// <summary>The send half of this transceiver.</summary>
@@ -52,15 +55,11 @@ public sealed class RtpTransceiver
     /// <summary>The primary codec negotiated for this m-line, <see langword="null"/> before it settles.</summary>
     public NegotiatedCodec? NegotiatedCodec { get; internal set; }
 
-    /// <summary>
-    /// Marks the transceiver stopped. A stopped slot is emitted as a rejected (port 0) m-line on the
-    /// next offer/answer. Adding transceivers and stopping them is a before-connect operation in this
-    /// release; a stop mid-session takes effect only if renegotiation is later added.
-    /// </summary>
-    public void Stop() => Stopped = true;
-
-    /// <summary>True once <see cref="Stop"/> has been called.</summary>
-    public bool Stopped { get; private set; }
+    // Stopping a transceiver (rejected port-0 re-emission) is deliberately not exposed in 0.3.0: it
+    // needs the renegotiation machinery a later release adds, so the public surface carries no Stop() /
+    // Stopped it cannot honour. This internal flag is always false today and lets the binding logic that
+    // will consult it in a later PR compile unchanged; reintroducing the public members then is additive.
+    internal bool Stopped => false;
 
     /// <summary>The per-transceiver codec preference list used when THIS side offers, or empty to fall
     /// back to the connection's per-kind codec config.</summary>
@@ -104,8 +103,10 @@ public sealed class RtpSender : IRtpForwarder
     public uint Ssrc { get; }
 
     /// <summary>
-    /// The RFC 4588 rtx repair SSRC, when retransmission is negotiated for this m-line, else
-    /// <see langword="null"/>.
+    /// The RFC 4588 rtx repair SSRC this sender owns. A video sender is allocated one at creation (so
+    /// this is non-null for video whether or not rtx is ultimately negotiated — read
+    /// <see cref="RtxPayloadType"/> to learn whether a repair codec was kept); <see langword="null"/>
+    /// for audio, which never uses RTX.
     /// </summary>
     public uint? RtxSsrc => RtxSsrcRaw == 0 ? null : RtxSsrcRaw;
 
@@ -195,14 +196,9 @@ public sealed class RtpTransceiverInit
     public string? Mid { get; set; }
 
     /// <summary>
-    /// Whether to offer an RFC 4588 rtx codec for this (video) transceiver. Defaults to true, matching
-    /// the connection default; ignored for audio, which does not use RTX.
+    /// Whether to offer an RFC 4588 rtx codec for this (video) transceiver, or <see langword="null"/>
+    /// (the default) to inherit <see cref="PeerConnectionConfig.EnableRetransmission"/>. Ignored for
+    /// audio, which does not use RTX.
     /// </summary>
-    public bool EnableRetransmission { get; set; } = true;
-
-    /// <summary>
-    /// Send-simulcast RID declaration, if any. Reserved: accepted for API-shape stability but not yet
-    /// emitted; send-simulcast offering lands in a later release.
-    /// </summary>
-    public IList<SdpRid> SimulcastLayers { get; } = new List<SdpRid>();
+    public bool? EnableRetransmission { get; set; }
 }

@@ -554,7 +554,6 @@ public sealed partial class PeerConnection
                 transceiver.Kind,
                 transceiver.Direction,
                 transceiver.CurrentDirection,
-                transceiver.Stopped,
                 sender.Ssrc,
                 sender.PayloadType,
                 transceiver.Receiver.RemoteSsrc,
@@ -1076,13 +1075,19 @@ public sealed partial class PeerConnection
     {
         var payloadType = packet.Header.PayloadType;
 
-        // Track the sender's SSRC per kind for GetRemoteSsrc, straight off the same demux resolution
-        // OnRtpPacketReceived is about to see. This is a plain last-writer-wins snapshot, not a full
-        // source table.
-        if (route.Kind is MediaKind.Video or MediaKind.Audio
-            && FirstTransceiver(route.Kind) is { } transceiver)
+        // Track the remote sender's SSRC on the receiver of the transceiver this packet demuxed to,
+        // straight off the same demux resolution OnRtpPacketReceived is about to see. Resolve by the
+        // route's mid so two same-kind m-lines each learn their own SSRC (a first-of-kind write would
+        // let one transceiver's SSRC flip-flop and leave the other's null); fall back to first-of-kind
+        // only for the mid-less legacy shape. A plain last-writer-wins snapshot, not a full source table.
+        if (route.Kind is MediaKind.Video or MediaKind.Audio)
         {
-            transceiver.Receiver.RemoteSsrc = packet.Header.Ssrc;
+            var transceiver = route.Mid.Length != 0 ? GetTransceiver(route.Mid) : null;
+            transceiver ??= FirstTransceiver(route.Kind);
+            if (transceiver is not null)
+            {
+                transceiver.Receiver.RemoteSsrc = packet.Header.Ssrc;
+            }
         }
 
         TrackInboundReceipt(
