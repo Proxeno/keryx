@@ -67,6 +67,32 @@ public sealed partial class TransceiverRefactorGoldenTests
     }
 
     /// <summary>
+    /// A genuine-shape Chrome offer (audio-first, <c>sendrecv</c>, carrying the RFC 8843 §9.2 MID header
+    /// extension at element id 9) — the case the synthetic Keryx-offer fixtures cannot represent, because
+    /// a Keryx offer carries no MID extmap. It pins the one deliberate legacy-answerer SDP change 0.3.0
+    /// makes over 0.2.x: the answer now echoes the MID extmap the browser offered, on every RTP m-line,
+    /// at the offered id — the shipped vuefix broadcaster/ingest PCs answer real Chrome offers, so this
+    /// change is on their path and must be locked.
+    /// </summary>
+    [Fact]
+    public async Task GoldenAnswer_ToRealChromeOffer_EchoesMidExtmap()
+    {
+        var offer = await File.ReadAllTextAsync(
+            Path.Combine(AppContext.BaseDirectory, "assets", "chrome-offer.sdp"));
+        var answer = await AnswerToAsync(offer);
+
+        var parsed = SessionDescription.Parse(answer);
+        foreach (var media in parsed.MediaDescriptions.Where(m => m.Media is "audio" or "video"))
+        {
+            media.GetExtMaps().Should().Contain(
+                e => e.Id == 9 && string.Equals(e.Uri, RtpHeaderExtensionUri.Mid, StringComparison.Ordinal),
+                "the 0.3.0 answer echoes the browser's MID extmap on every RTP m-line, at the offered id");
+        }
+
+        AssertGolden("answer-chrome", answer);
+    }
+
+    /// <summary>
     /// Builds a Keryx offer, then rewrites every RTP m-line's direction to <paramref name="retargetBothTo"/>,
     /// standing in for a browser offer of that shape.
     /// </summary>

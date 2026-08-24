@@ -52,6 +52,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
 {
     private const string ExporterLabel = "EXTRACTOR-dtls_srtp";
 
+    /// <summary>The one-byte <c>a=extmap</c> id offered for the RFC 8843 §9.2 MID header extension.</summary>
+    private const int MidHeaderExtensionId = 4;
+
     private readonly PeerConnectionConfig _config;
     private readonly TimeProvider _time;
     private readonly GccCongestionController? _congestionController;
@@ -99,6 +102,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         // Build the legacy per-kind transceivers from the config (session-model.md §5.1). Their senders
         // own the pre-allocated SSRCs and track ids, so the per-kind identity accessors resolve to them.
+        _transceiversView = new System.Collections.ObjectModel.ReadOnlyCollection<RtpTransceiver>(_transceivers);
         BuildLegacyTransceivers();
 
         if (_config.EnableCongestionControl)
@@ -568,7 +572,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
         Interlocked.Read(ref _rtpReceived),
         Interlocked.Read(ref _rtcpReceived),
         Interlocked.Read(ref _srtpFailures),
-        Interlocked.Read(ref _mediaBeforeReady));
+        Interlocked.Read(ref _mediaBeforeReady))
+    {
+        Transceivers = BuildTransceiverStats(),
+    };
 
     /// <summary>
     /// Forwards a congestion-controller target change to the pacer and to public subscribers. Runs on
@@ -857,44 +864,62 @@ public sealed partial class PeerConnection : IAsyncDisposable
             TrickleIce = true,
         };
 
-        // Walk the transceiver set in m-line order rather than the fixed video/audio sections. For the
-        // legacy transceiver set (one sendonly video, one sendonly audio) this emits byte-identical SDP:
-        // same mids, order, directions, codecs and SSRCs (session-model.md §5.1).
+        // Allocate mids for any application-added transceivers (session-model.md §3.1), then walk the
+        // transceiver set in m-line order. For the legacy transceiver set (one sendonly video, one
+        // sendonly audio) this emits byte-identical SDP: same mids, order, directions, codecs, SSRCs and
+        // — because the MID extmap is offered only once the transceiver API is used — the same extmaps.
+        AllocateOfferMids();
+
         foreach (var transceiver in _transceivers)
         {
             var sender = transceiver.Sender;
             var mid = transceiver.Mid!;
             if (transceiver.Kind == MediaKind.Video)
             {
-                var codecs = BuildOfferedVideoCodecs();
+                IReadOnlyList<SdpCodec> videoSource = transceiver.OfferCodecs.Count > 0
+                    ? transceiver.OfferCodecs
+                    : [.. _config.VideoCodecs];
+                var codecs = BuildOfferedVideoCodecs(videoSource, transceiver.EnableRetransmissionOnOffer);
                 var video = SdpMediaOffer.Video(mid, [.. codecs]);
                 video.Direction = transceiver.Direction;
-                video.TrackId = sender.TrackId;
-                video.Ssrcs.Add(sender.Ssrc);
+                AddMidExtmap(video);
                 if (_config.EnableTransportWideCc)
                 {
                     video.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
                 }
 
-                if (codecs.Exists(static c => c.IsRtx))
+                if (transceiver.Direction.Sends())
                 {
-                    // RFC 5576 §4.2: FID associates the media source with the repair source carrying its
-                    // retransmissions. Both sources publish the same cname, which the builder writes.
-                    video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sender.Ssrc, sender.RtxSsrc]));
-                    video.Ssrcs.Add(sender.RtxSsrc);
+                    video.TrackId = sender.TrackId;
+                    video.Ssrcs.Add(sender.Ssrc);
+                    if (codecs.Exists(static c => c.IsRtx))
+                    {
+                        // RFC 5576 §4.2: FID associates the media source with the repair source carrying
+                        // its retransmissions. Both sources publish the same cname, which the builder writes.
+                        video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sender.Ssrc, sender.RtxSsrcRaw]));
+                        video.Ssrcs.Add(sender.RtxSsrcRaw);
+                    }
                 }
 
                 builder.AddMedia(video);
             }
             else if (transceiver.Kind == MediaKind.Audio)
             {
-                var audio = SdpMediaOffer.Audio(mid, [.. _config.AudioCodecs]);
+                IReadOnlyList<SdpCodec> audioSource = transceiver.OfferCodecs.Count > 0
+                    ? transceiver.OfferCodecs
+                    : [.. _config.AudioCodecs];
+                var audio = SdpMediaOffer.Audio(mid, [.. audioSource]);
                 audio.Direction = transceiver.Direction;
-                audio.TrackId = sender.TrackId;
-                audio.Ssrcs.Add(sender.Ssrc);
+                AddMidExtmap(audio);
                 if (_config.EnableTransportWideCc)
                 {
                     audio.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
+                }
+
+                if (transceiver.Direction.Sends())
+                {
+                    audio.TrackId = sender.TrackId;
+                    audio.Ssrcs.Add(sender.Ssrc);
                 }
 
                 builder.AddMedia(audio);
@@ -906,25 +931,39 @@ public sealed partial class PeerConnection : IAsyncDisposable
     }
 
     /// <summary>
-    /// Copies the configured video codecs and, when retransmission is enabled, gives each one bare
-    /// <c>nack</c> feedback and a matching RFC 4588 <c>rtx</c> entry on a free dynamic payload type.
-    /// The configured codecs themselves are never mutated.
+    /// Offers the RFC 8843 §9.2 MID header extension on an RTP m-line, but only once the public
+    /// transceiver API is in use (session-model.md §3.5). A pure legacy single-per-kind config never
+    /// reaches this, keeping its offer byte-identical; a multi-m-line offer carries the extension so a
+    /// real browser can demux the bundle by mid.
     /// </summary>
-    private List<SdpCodec> BuildOfferedVideoCodecs()
+    private void AddMidExtmap(SdpMediaOffer section)
     {
-        var codecs = new List<SdpCodec>(_config.VideoCodecs.Count * 2);
-        foreach (var codec in _config.VideoCodecs)
+        if (_transceiverApiUsed)
+        {
+            section.HeaderExtensions.Add(new SdpExtMap(MidHeaderExtensionId, RtpHeaderExtensionUri.Mid));
+        }
+    }
+
+    /// <summary>
+    /// Copies <paramref name="source"/>'s video codecs and, when <paramref name="enableRtx"/> is set,
+    /// gives each one bare <c>nack</c> feedback and a matching RFC 4588 <c>rtx</c> entry on a free
+    /// dynamic payload type. The source codecs themselves are never mutated.
+    /// </summary>
+    private List<SdpCodec> BuildOfferedVideoCodecs(IReadOnlyList<SdpCodec> source, bool enableRtx)
+    {
+        var codecs = new List<SdpCodec>(source.Count * 2);
+        foreach (var codec in source)
         {
             codecs.Add(CloneCodec(codec));
         }
 
-        if (!_config.EnableRetransmission || codecs.Count == 0)
+        if (!enableRtx || codecs.Count == 0)
         {
             return codecs;
         }
 
         var used = new HashSet<int>();
-        foreach (var codec in _config.VideoCodecs)
+        foreach (var codec in source)
         {
             used.Add(codec.PayloadType);
         }
@@ -1023,10 +1062,6 @@ public sealed partial class PeerConnection : IAsyncDisposable
         // first sending section that echoed the extension fixes its id for the whole connection.
         byte? answerSendTransportCcId = null;
 
-        // Tracks which transceivers have already claimed an offered m-line during this answer, so a
-        // second m-line of the same kind binds to the next unassociated transceiver (RFC 8829 §5.10).
-        var associated = new HashSet<RtpTransceiver>();
-
         for (var i = 0; i < offer.MediaDescriptions.Count; i++)
         {
             var offered = offer.MediaDescriptions[i];
@@ -1040,20 +1075,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 continue;
             }
 
-            // Bind the offered m-line to a transceiver (session-model.md §3.2) and negotiate the answered
-            // direction from the transceiver's direction, which the binding defaults to the complement of
-            // the offered one. This reproduces the historical answerer rule exactly: Keryx answers as a
-            // sender when — and only when — the offer is recvonly (the SFU subscriber shape, where a
-            // viewer offers recvonly and Keryx answers sendonly on its own SSRC); every other offered
-            // direction leaves the transceiver receive-only, so a sendrecv or sendonly offer answers
-            // recvonly and an inactive offer stays inactive.
+            // Resolve the transceiver bound to this m-line when the offer was applied (session-model.md
+            // §3.2) and negotiate the answered direction from the transceiver's direction, which the
+            // binding defaulted to the complement of the offered one (unless the application set it). This
+            // reproduces the historical answerer rule exactly: Keryx answers as a sender when — and only
+            // when — the offer is recvonly (the SFU subscriber shape, where a viewer offers recvonly and
+            // Keryx answers sendonly on its own SSRC); every other offered direction leaves the transceiver
+            // receive-only, so a sendrecv or sendonly offer answers recvonly and an inactive offer stays
+            // inactive.
             var offeredDirection = offered.DirectionOrDefault;
             var kind = ToMediaKind(offered.Media);
-            RtpTransceiver? boundTransceiver = null;
+            var boundTransceiver = kind is MediaKind.Video or MediaKind.Audio ? GetTransceiver(mid) : null;
             MediaDirection negotiatedDirection;
-            if (kind is MediaKind.Video or MediaKind.Audio)
+            if (boundTransceiver is not null)
             {
-                boundTransceiver = BindOfferedMediaLine(kind, mid, offeredDirection, associated);
                 negotiatedDirection = SdpDirection.Negotiate(boundTransceiver.Direction, offeredDirection);
                 boundTransceiver.CurrentDirection = negotiatedDirection;
             }
@@ -1150,6 +1185,30 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 }
             }
 
+            // Publish this m-line's negotiated receive codecs on the bound transceiver's receiver and the
+            // primary codec on the transceiver, so the public model reflects what was settled (§2.1).
+            if (boundTransceiver is not null && section.Port != 0)
+            {
+                var receivePayloadTypes = new List<byte>();
+                foreach (var codec in section.Codecs)
+                {
+                    if (!codec.IsRtx && codec.PayloadType is >= 0 and <= 255)
+                    {
+                        receivePayloadTypes.Add((byte)codec.PayloadType);
+                    }
+                }
+
+                boundTransceiver.Receiver.PayloadTypes = receivePayloadTypes;
+                if (section.Codecs.FirstOrDefault(c => !c.IsRtx) is { } primaryCodec)
+                {
+                    boundTransceiver.NegotiatedCodec = new NegotiatedCodec(
+                        primaryCodec.PayloadType,
+                        new RtpMap(primaryCodec.PayloadType, primaryCodec.EncodingName, primaryCodec.ClockRate, primaryCodec.Channels),
+                        primaryCodec.Fmtp,
+                        [.. primaryCodec.Feedback]);
+                }
+            }
+
             if (_config.EnableSimulcast
                 && string.Equals(offered.Media, "video", StringComparison.Ordinal)
                 && section.Codecs.Count > 0
@@ -1199,8 +1258,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     {
                         // RFC 5576 §4.2: FID binds the media source to the repair source that carries
                         // its retransmissions; both publish the same cname, which the builder writes.
-                        section.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sendSsrc, sender.RtxSsrc]));
-                        section.Ssrcs.Add(sender.RtxSsrc);
+                        section.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sendSsrc, sender.RtxSsrcRaw]));
+                        section.Ssrcs.Add(sender.RtxSsrcRaw);
                     }
 
                     sender.Negotiated = new NegotiatedTrack(
@@ -1221,6 +1280,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         }
                     }
                 }
+            }
+
+            // Echo the RFC 8843 §9.2 MID header extension when the offer carried it (session-model.md
+            // §3.5), keeping the offerer's id, so a peer demuxes our bundle by mid. Skipped when the
+            // section already carries a MID extmap (a simulcast section adds its own), and absent for a
+            // synthetic offer with no MID extension, so the golden answers are byte-identical.
+            var offeredMidId = FindMidExtensionId(offered.GetExtMaps());
+            if (offeredMidId != 0
+                && !section.HeaderExtensions.Any(e => string.Equals(e.Uri, RtpHeaderExtensionUri.Mid, StringComparison.Ordinal)))
+            {
+                section.HeaderExtensions.Add(new SdpExtMap(offeredMidId, RtpHeaderExtensionUri.Mid));
             }
 
             builder.AddMedia(section);
@@ -1248,8 +1318,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
         byte midExtensionId = 0;
         var rtxToMedia = new Dictionary<uint, uint>();
 
+        // Bind each offered RTP m-line to a transceiver now (RFC 8829 §5.10, session-model.md §3.2), so
+        // OnTransceiver fires for auto-created ones before CreateAnswerAsync runs and a handler can set
+        // the direction. The answer builder later reads the bound transceiver by mid.
+        var associated = new HashSet<RtpTransceiver>();
+        var autoCreated = new List<RtpTransceiver>();
+        var mediaIndex = -1;
+
         foreach (var media in offer.MediaDescriptions)
         {
+            mediaIndex++;
             ufrag ??= media.IceUfrag ?? offer.IceUfrag;
             password ??= media.IcePwd ?? offer.IcePwd;
             CollectFidAssociations(media.GetSsrcGroups(), rtxToMedia);
@@ -1279,6 +1357,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
             var kind = ToMediaKind(media.Media);
             if (kind is MediaKind.Audio or MediaKind.Video)
             {
+                var bindMid = media.Mid ?? mediaIndex.ToString(CultureInfo.InvariantCulture);
+                var bound = BindOfferedMediaLine(kind, bindMid, media.DirectionOrDefault, associated, out var created);
+                if (created)
+                {
+                    autoCreated.Add(bound);
+                }
+
                 var mid = media.Mid ?? string.Empty;
                 var perMid = mid.Length != 0 ? GetOrAddMidRoutes(routesByMid, mid) : null;
                 var acceptable = kind == MediaKind.Video ? _config.VideoCodecs : _config.AudioCodecs;
@@ -1355,6 +1440,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
             KeryxLogLevel.Info,
             $"Applied remote offer; local DTLS role {LocalDtlsRole}, {routes.Count} inbound payload type(s),"
             + $" mid extmap {(midExtensionId == 0 ? "none" : midExtensionId.ToString(CultureInfo.InvariantCulture))}.");
+
+        // Raise OnTransceiver for auto-created transceivers after the route table is published, outside
+        // any lock, so a handler can set Direction before CreateAnswerAsync reads it.
+        foreach (var transceiver in autoCreated)
+        {
+            OnTransceiver?.Invoke(this, transceiver);
+        }
     }
 
     private Dictionary<string, SimulcastReceiveTracker> BuildSimulcastTrackers(SessionDescription offer)
@@ -1453,9 +1545,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
             }
 
             // The MID extension is likewise transport-wide; the first section that kept it fixes the
-            // demux element id. Populated only when the remote (answerer) kept it — Keryx does not yet
-            // offer the extension, so on the offerer path this is typically absent and demux falls to
-            // the SSRC map the answer's a=ssrc lines provide.
+            // demux element id. Keryx offers the MID extmap on every RTP m-line once the transceiver API
+            // is used (§3.5), so a peer that echoes it lands here; otherwise this stays absent and demux
+            // falls to the SSRC map the answer's a=ssrc lines provide.
             if (midExtensionId == 0)
             {
                 midExtensionId = FindMidExtensionId(media.HeaderExtensions);
@@ -1496,7 +1588,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 }
             }
 
-            var configured = kind == MediaKind.Video ? _config.VideoCodecs : _config.AudioCodecs;
+            // The transceiver this answered m-line belongs to, resolved by the mid it was offered under.
+            // For a single-video/single-audio session this is the first-of-kind transceiver, exactly as
+            // before; for multiple same-kind m-lines each answer section updates its own transceiver.
+            var transceiver = media.Mid is { } answeredMid ? GetTransceiver(answeredMid) : FirstTransceiver(kind);
+
+            // Match against the transceiver's own offered codecs when it has them (an application-added
+            // transceiver), else the per-kind config that drives the legacy transceivers.
+            IEnumerable<SdpCodec> configured = transceiver is { OfferCodecs.Count: > 0 }
+                ? transceiver.OfferCodecs
+                : (kind == MediaKind.Video ? _config.VideoCodecs : _config.AudioCodecs);
+            var receivePayloadTypes = new List<byte>();
             foreach (var codec in media.Codecs)
             {
                 if (codec.PayloadType is < 0 or > 127)
@@ -1512,6 +1614,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 var route = new RtpRoute(mid, kind, (uint)codec.ClockRate);
                 routes[(byte)codec.PayloadType] = route;
                 perMid?.TryAdd((byte)codec.PayloadType, route);
+                receivePayloadTypes.Add((byte)codec.PayloadType);
             }
 
             var chosen = media.Codecs.FirstOrDefault(c =>
@@ -1522,52 +1625,59 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 continue;
             }
 
-            if (kind == MediaKind.Video)
+            // Publish the negotiated direction, primary codec and receive payload types on the transceiver
+            // (session-model.md §2.1). media.Direction is the intersection from the offerer's point of view.
+            if (transceiver is not null)
             {
-                byte? rtxPayloadType = null;
-                if (_config.EnableRetransmission)
-                {
-                    // RFC 4588 §8.1: retransmission is negotiated only if the answer keeps an rtx
-                    // codec whose apt names the media codec we settled on. Bare a=rtcp-fb nack in the
-                    // answer is not enough — without a repair stream there is nowhere to send resends,
-                    // and resending on the media SSRC would corrupt its sequence numbering.
-                    var rtx = media.FindRtxCodec(chosen.PayloadType);
-                    if (rtx is not null && rtx.PayloadType is >= 0 and <= 127)
-                    {
-                        rtxPayloadType = (byte)rtx.PayloadType;
-                        var rtxRoute = new RtpRoute(
-                            mid,
-                            kind,
-                            (uint)rtx.ClockRate,
-                            IsRtx: true,
-                            AptPayloadType: (byte)chosen.PayloadType);
-                        routes[(byte)rtx.PayloadType] = rtxRoute;
-                        perMid?.TryAdd((byte)rtx.PayloadType, rtxRoute);
-                    }
-                    else
-                    {
-                        _logger.Log(
-                            KeryxLogLevel.Info,
-                            $"The answer kept no rtx codec for payload type {chosen.PayloadType}; retransmission is disabled.");
-                    }
-                }
+                transceiver.CurrentDirection = media.Direction;
+                transceiver.NegotiatedCodec = chosen;
+                transceiver.Receiver.PayloadTypes = receivePayloadTypes;
+            }
 
-                if (FirstSender(MediaKind.Video) is { } videoSender)
+            // Resolve the RFC 4588 rtx codec once: its route lets an inbound repair packet demux (when this
+            // side receives), and its payload type wires the outbound repair stream (when this side sends).
+            byte? rtxPayloadType = null;
+            var rtxEnabled = kind == MediaKind.Video
+                && (transceiver?.EnableRetransmissionOnOffer ?? _config.EnableRetransmission);
+            if (rtxEnabled)
+            {
+                // RFC 4588 §8.1: retransmission is negotiated only if the answer keeps an rtx codec whose
+                // apt names the media codec we settled on. Bare a=rtcp-fb nack is not enough — without a
+                // repair stream there is nowhere to send resends, and resending on the media SSRC would
+                // corrupt its sequence numbering.
+                var rtx = media.FindRtxCodec(chosen.PayloadType);
+                if (rtx is not null && rtx.PayloadType is >= 0 and <= 127)
                 {
-                    videoSender.Negotiated = new NegotiatedTrack(
+                    rtxPayloadType = (byte)rtx.PayloadType;
+                    var rtxRoute = new RtpRoute(
+                        mid,
+                        kind,
+                        (uint)rtx.ClockRate,
+                        IsRtx: true,
+                        AptPayloadType: (byte)chosen.PayloadType);
+                    routes[(byte)rtx.PayloadType] = rtxRoute;
+                    perMid?.TryAdd((byte)rtx.PayloadType, rtxRoute);
+                }
+                else
+                {
+                    _logger.Log(
+                        KeryxLogLevel.Info,
+                        $"The answer kept no rtx codec for payload type {chosen.PayloadType}; retransmission is disabled.");
+                }
+            }
+
+            // Wire the send track only when the offerer's negotiated direction actually sends. A recvonly
+            // transceiver (added via AddTransceiver to ingest media as the offerer) never builds a sender,
+            // so CreateTrackSenders leaves it receive-only.
+            if (transceiver is not null && media.Direction.Sends())
+            {
+                transceiver.Sender.Negotiated = kind == MediaKind.Video
+                    ? new NegotiatedTrack(
                         media.Mid ?? _config.VideoMid,
                         (byte)chosen.PayloadType,
                         (uint)chosen.ClockRate,
-                        rtxPayloadType);
-                }
-            }
-            else
-            {
-                if (FirstSender(MediaKind.Audio) is { } audioSender)
-                {
-                    audioSender.Negotiated =
-                        new NegotiatedTrack(media.Mid ?? _config.AudioMid, (byte)chosen.PayloadType, (uint)chosen.ClockRate);
-                }
+                        rtxPayloadType)
+                    : new NegotiatedTrack(media.Mid ?? _config.AudioMid, (byte)chosen.PayloadType, (uint)chosen.ClockRate);
             }
         }
 
@@ -1685,7 +1795,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// What the answer settled on for one media kind. <paramref name="RtxPayloadType"/> is null when
     /// the answerer dropped the RFC 4588 repair codec, which disables retransmission for the track.
     /// </summary>
-    private sealed record NegotiatedTrack(
+    internal sealed record NegotiatedTrack(
         string Mid,
         byte PayloadType,
         uint ClockRate,

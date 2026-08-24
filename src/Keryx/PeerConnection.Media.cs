@@ -131,26 +131,10 @@ public sealed partial class PeerConnection
     /// <see cref="PeerConnectionState.Connected"/> or no video track was negotiated — in which case
     /// the frame is dropped silently and counted in <see cref="GetStats"/>.
     /// </returns>
-    public int SendVideoFrame(ReadOnlySpan<byte> annexBAccessUnit, uint rtpTimestamp90k)
-    {
-        var track = FirstSender(MediaKind.Video)?.Track;
-        if (track is null || State != PeerConnectionState.Connected)
-        {
-            Interlocked.Increment(ref _videoFramesDropped);
-            return 0;
-        }
-
-        lock (_sendLock)
-        {
-            if (_srtp is null)
-            {
-                Interlocked.Increment(ref _videoFramesDropped);
-                return 0;
-            }
-
-            return track.SendFrame(annexBAccessUnit, rtpTimestamp90k);
-        }
-    }
+    public int SendVideoFrame(ReadOnlySpan<byte> annexBAccessUnit, uint rtpTimestamp90k) =>
+        FirstSender(MediaKind.Video) is { } sender
+            ? sender.SendFrame(annexBAccessUnit, rtpTimestamp90k)
+            : DropFrame(MediaKind.Video);
 
     /// <summary>
     /// Sends one Opus packet as a single RTP packet over SRTP (RFC 7587 §4.2: Opus packets are never
@@ -162,12 +146,42 @@ public sealed partial class PeerConnection
     /// 1 when the packet was sent, 0 when it was dropped because the connection is not yet
     /// <see cref="PeerConnectionState.Connected"/> or no audio track was negotiated.
     /// </returns>
-    public int SendAudioFrame(ReadOnlySpan<byte> opusPacket, uint rtpTimestamp48k)
+    public int SendAudioFrame(ReadOnlySpan<byte> opusPacket, uint rtpTimestamp48k) =>
+        FirstSender(MediaKind.Audio) is { } sender
+            ? sender.SendFrame(opusPacket, rtpTimestamp48k)
+            : DropFrame(MediaKind.Audio);
+
+    /// <summary>Records a dropped frame for <paramref name="kind"/> and returns 0.</summary>
+    private int DropFrame(MediaKind kind)
     {
-        var track = FirstSender(MediaKind.Audio)?.Track;
-        if (track is null || State != PeerConnectionState.Connected)
+        IncrementFramesDropped(kind);
+        return 0;
+    }
+
+    private void IncrementFramesDropped(MediaKind kind)
+    {
+        if (kind == MediaKind.Video)
+        {
+            Interlocked.Increment(ref _videoFramesDropped);
+        }
+        else if (kind == MediaKind.Audio)
         {
             Interlocked.Increment(ref _audioFramesDropped);
+        }
+    }
+
+    /// <summary>
+    /// Packetizes and sends one codec frame on <paramref name="sender"/> — the shared implementation
+    /// behind <see cref="SendVideoFrame"/>, <see cref="SendAudioFrame"/> and
+    /// <see cref="RtpSender.SendFrame"/>. Takes the one send lock and checks SRTP readiness, dropping
+    /// (never throwing) when the connection is not yet up.
+    /// </summary>
+    internal int SendFrameOnSender(RtpSender sender, ReadOnlySpan<byte> frame, uint rtpTimestamp)
+    {
+        var track = sender.Track;
+        if (track is null || State != PeerConnectionState.Connected)
+        {
+            IncrementFramesDropped(sender.Kind);
             return 0;
         }
 
@@ -175,11 +189,51 @@ public sealed partial class PeerConnection
         {
             if (_srtp is null)
             {
-                Interlocked.Increment(ref _audioFramesDropped);
+                IncrementFramesDropped(sender.Kind);
                 return 0;
             }
 
-            return track.SendFrame(opusPacket, rtpTimestamp48k);
+            return track.SendFrame(frame, rtpTimestamp);
+        }
+    }
+
+    /// <summary>
+    /// Forwards one already-packetized RTP payload verbatim on <paramref name="sender"/> — the shared
+    /// implementation behind <see cref="TryForwardRtp"/> and <see cref="RtpSender.TryForwardRtp"/>. Never
+    /// throws; returns false when the sender is not ready or the payload will not fit the MTU.
+    /// </summary>
+    internal bool ForwardRtpOnSender(
+        RtpSender sender,
+        ReadOnlySpan<byte> payload,
+        uint rtpTimestamp,
+        bool marker,
+        byte payloadType)
+    {
+        var track = sender.Track;
+        if (track is null || State != PeerConnectionState.Connected)
+        {
+            return false;
+        }
+
+        lock (_sendLock)
+        {
+            if (_srtp is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return track.ForwardRtp(payload, rtpTimestamp, marker, payloadType);
+            }
+            catch (Exception ex)
+            {
+                // TryForwardRtp is contractually total: a transient send-path failure (a torn-down
+                // transport, an SRTP index-guard race) must surface as false, never as a throw that
+                // could unwind a subscriber fan-out loop.
+                _logger.Log(KeryxLogLevel.Warning, "Dropping a forwarded RTP packet after a send failure.", ex);
+                return false;
+            }
         }
     }
 
@@ -220,41 +274,10 @@ public sealed partial class PeerConnection
         ReadOnlySpan<byte> payload,
         uint rtpTimestamp,
         bool marker,
-        byte payloadType)
-    {
-        var track = kind switch
-        {
-            MediaKind.Video => FirstSender(MediaKind.Video)?.Track,
-            MediaKind.Audio => FirstSender(MediaKind.Audio)?.Track,
-            _ => null,
-        };
-
-        if (track is null || State != PeerConnectionState.Connected)
-        {
-            return false;
-        }
-
-        lock (_sendLock)
-        {
-            if (_srtp is null)
-            {
-                return false;
-            }
-
-            try
-            {
-                return track.ForwardRtp(payload, rtpTimestamp, marker, payloadType);
-            }
-            catch (Exception ex)
-            {
-                // TryForwardRtp is contractually total: a transient send-path failure (a torn-down
-                // transport, an SRTP index-guard race) must surface as false, never as a throw that
-                // could unwind a subscriber fan-out loop.
-                _logger.Log(KeryxLogLevel.Warning, "Dropping a forwarded RTP packet after a send failure.", ex);
-                return false;
-            }
-        }
-    }
+        byte payloadType) =>
+        kind is MediaKind.Video or MediaKind.Audio
+        && FirstSender(kind) is { } sender
+        && sender.TryForwardRtp(payload, rtpTimestamp, marker, payloadType);
 
     /// <summary>
     /// The forwarder handle for <paramref name="kind"/>'s send track, for a consumer that prefers to
@@ -515,6 +538,29 @@ public sealed partial class PeerConnection
         return dropped == 0 && quality is null
             ? null
             : new MediaTrackStats(MediaKind.Audio, _config.AudioMid, sender?.Ssrc ?? 0, 0, 0, 0, 0, dropped, quality);
+    }
+
+    /// <summary>Builds one <see cref="TransceiverStats"/> per transceiver, in m-line order (§2.2).</summary>
+    private IReadOnlyList<TransceiverStats> BuildTransceiverStats()
+    {
+        var stats = new List<TransceiverStats>(_transceivers.Count);
+        foreach (var transceiver in _transceivers)
+        {
+            var sender = transceiver.Sender;
+            var track = sender.Track;
+            var send = track?.GetStats(0, sender.Quality, RetransmissionStatsFor(track));
+            stats.Add(new TransceiverStats(
+                transceiver.Mid,
+                transceiver.Kind,
+                transceiver.Direction,
+                transceiver.CurrentDirection,
+                sender.Ssrc,
+                sender.PayloadType,
+                transceiver.Receiver.RemoteSsrc,
+                send));
+        }
+
+        return stats;
     }
 
     private RetransmissionStats? RetransmissionStatsFor(TrackSender track)
@@ -805,7 +851,7 @@ public sealed partial class PeerConnection
                         RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
                         _config.RetransmissionHistory);
                     rtx = new RtxRetransmitter(
-                        sender.RtxSsrc,
+                        sender.RtxSsrcRaw,
                         rtxPayloadType,
                         negotiated.ClockRate,
                         history,
@@ -814,7 +860,7 @@ public sealed partial class PeerConnection
 
                     _logger.Log(
                         KeryxLogLevel.Info,
-                        $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{sender.RtxSsrc:x8}, "
+                        $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{sender.RtxSsrcRaw:x8}, "
                         + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
                 }
 
@@ -1040,13 +1086,19 @@ public sealed partial class PeerConnection
     {
         var payloadType = packet.Header.PayloadType;
 
-        // Track the sender's SSRC per kind for GetRemoteSsrc, straight off the same demux resolution
-        // OnRtpPacketReceived is about to see. This is a plain last-writer-wins snapshot, not a full
-        // source table.
-        if (route.Kind is MediaKind.Video or MediaKind.Audio
-            && FirstTransceiver(route.Kind) is { } transceiver)
+        // Track the remote sender's SSRC on the receiver of the transceiver this packet demuxed to,
+        // straight off the same demux resolution OnRtpPacketReceived is about to see. Resolve by the
+        // route's mid so two same-kind m-lines each learn their own SSRC (a first-of-kind write would
+        // let one transceiver's SSRC flip-flop and leave the other's null); fall back to first-of-kind
+        // only for the mid-less legacy shape. A plain last-writer-wins snapshot, not a full source table.
+        if (route.Kind is MediaKind.Video or MediaKind.Audio)
         {
-            transceiver.Receiver.RemoteSsrc = packet.Header.Ssrc;
+            var transceiver = route.Mid.Length != 0 ? GetTransceiver(route.Mid) : null;
+            transceiver ??= FirstTransceiver(route.Kind);
+            if (transceiver is not null)
+            {
+                transceiver.Receiver.RemoteSsrc = packet.Header.Ssrc;
+            }
         }
 
         TrackInboundReceipt(
@@ -1877,7 +1929,7 @@ public sealed partial class PeerConnection
     /// datagram buffer that the payloadizer fills in place and SRTP encrypts in place. When RFC 4588
     /// retransmission is negotiated it also owns the repair stream and a second buffer for it.
     /// </summary>
-    private sealed class TrackSender : IRtpPayloadWriter
+    internal sealed class TrackSender : IRtpPayloadWriter
     {
         private readonly PeerConnection _owner;
         private readonly IRtpPayloadizer _payloadizer;
