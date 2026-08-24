@@ -38,11 +38,6 @@ public sealed partial class PeerConnection
     /// <summary>The <c>a=extmap</c> id offered for the transport-wide congestion-control extension.</summary>
     private const int TransportCcExtensionId = 3;
 
-    private TrackSender? _videoTrack;
-    private TrackSender? _audioTrack;
-    private NegotiatedTrack? _negotiatedVideo;
-    private NegotiatedTrack? _negotiatedAudio;
-
     // Stable per-kind forwarder handles, wired to the send track through the owner's locked forward
     // path. Created once in the constructor so GetForwarder is total and allocation-free; they return
     // false until the corresponding send track is negotiated.
@@ -60,11 +55,9 @@ public sealed partial class PeerConnection
     private Dictionary<uint, uint> _rtxSsrcToMediaSsrc = [];
     private Dictionary<string, SimulcastReceiveTracker> _simulcastByMid = new(StringComparer.Ordinal);
 
-    // The most recently demultiplexed remote SSRC per media kind, boxed so a reference write/read is
-    // enough to publish it without locking. Only written from the single ICE receive loop that drives
-    // HandleRtp; read from any thread through GetRemoteSsrc. Null until a packet of that kind arrives.
-    private volatile object? _remoteVideoSsrc;
-    private volatile object? _remoteAudioSsrc;
+    // The most recently demultiplexed remote SSRC per media kind now lives on each transceiver's
+    // RtpReceiver (session-model.md §3.5), still a boxed volatile snapshot written only from the single
+    // ICE receive loop that drives HandleRtp and read from any thread through GetRemoteSsrc.
 
     // Per-SSRC receive jitter buffers, built lazily as sources appear. Only touched from the single
     // ICE receive loop that drives HandleRtp, so it needs no synchronisation; it stays empty unless
@@ -124,9 +117,6 @@ public sealed partial class PeerConnection
     private long _twccCount;
     private long _receiverReportCount;
 
-    private volatile OutboundStreamQuality? _videoQuality;
-    private volatile OutboundStreamQuality? _audioQuality;
-
     /// <summary>
     /// Packetizes one H.264 access unit and sends it over SRTP.
     /// </summary>
@@ -143,7 +133,7 @@ public sealed partial class PeerConnection
     /// </returns>
     public int SendVideoFrame(ReadOnlySpan<byte> annexBAccessUnit, uint rtpTimestamp90k)
     {
-        var track = _videoTrack;
+        var track = FirstSender(MediaKind.Video)?.Track;
         if (track is null || State != PeerConnectionState.Connected)
         {
             Interlocked.Increment(ref _videoFramesDropped);
@@ -174,7 +164,7 @@ public sealed partial class PeerConnection
     /// </returns>
     public int SendAudioFrame(ReadOnlySpan<byte> opusPacket, uint rtpTimestamp48k)
     {
-        var track = _audioTrack;
+        var track = FirstSender(MediaKind.Audio)?.Track;
         if (track is null || State != PeerConnectionState.Connected)
         {
             Interlocked.Increment(ref _audioFramesDropped);
@@ -234,8 +224,8 @@ public sealed partial class PeerConnection
     {
         var track = kind switch
         {
-            MediaKind.Video => _videoTrack,
-            MediaKind.Audio => _audioTrack,
+            MediaKind.Video => FirstSender(MediaKind.Video)?.Track,
+            MediaKind.Audio => FirstSender(MediaKind.Audio)?.Track,
             _ => null,
         };
 
@@ -288,7 +278,7 @@ public sealed partial class PeerConnection
     /// peer kept no RFC 4588 repair codec and retransmission is therefore disabled.
     /// </summary>
     /// <remarks>Meaningful once a remote answer has been applied.</remarks>
-    public byte? NegotiatedVideoRtxPayloadType => _negotiatedVideo?.RtxPayloadType;
+    public byte? NegotiatedVideoRtxPayloadType => FirstSender(MediaKind.Video)?.RtxPayloadType;
 
     /// <summary>
     /// The payload type the answer settled on for <paramref name="kind"/>, or <see langword="null"/>
@@ -303,12 +293,8 @@ public sealed partial class PeerConnection
     /// the first non-null value — this is deliberate so a consumer never has to guard the call with a
     /// state check first.
     /// </remarks>
-    public byte? GetNegotiatedPayloadType(MediaKind kind) => kind switch
-    {
-        MediaKind.Video => _negotiatedVideo?.PayloadType,
-        MediaKind.Audio => _negotiatedAudio?.PayloadType,
-        _ => null,
-    };
+    public byte? GetNegotiatedPayloadType(MediaKind kind) =>
+        kind is MediaKind.Video or MediaKind.Audio ? FirstSender(kind)?.PayloadType : null;
 
     /// <summary>
     /// The synchronisation source Keryx sends <paramref name="kind"/> on. Assigned at construction
@@ -317,12 +303,8 @@ public sealed partial class PeerConnection
     /// </summary>
     /// <param name="kind">The media kind to look up.</param>
     /// <returns>The local sending SSRC for <paramref name="kind"/>; zero for any other kind.</returns>
-    public uint GetLocalSsrc(MediaKind kind) => kind switch
-    {
-        MediaKind.Video => _videoSsrc,
-        MediaKind.Audio => _audioSsrc,
-        _ => 0,
-    };
+    public uint GetLocalSsrc(MediaKind kind) =>
+        kind is MediaKind.Video or MediaKind.Audio ? FirstSender(kind)?.Ssrc ?? 0 : 0;
 
     /// <summary>
     /// The remote sender's synchronisation source for <paramref name="kind"/>, learned from the most
@@ -331,12 +313,8 @@ public sealed partial class PeerConnection
     /// </summary>
     /// <param name="kind">The media kind to look up.</param>
     /// <returns>The last observed remote SSRC for <paramref name="kind"/>, or null.</returns>
-    public uint? GetRemoteSsrc(MediaKind kind) => kind switch
-    {
-        MediaKind.Video => (uint?)_remoteVideoSsrc,
-        MediaKind.Audio => (uint?)_remoteAudioSsrc,
-        _ => null,
-    };
+    public uint? GetRemoteSsrc(MediaKind kind) =>
+        kind is MediaKind.Video or MediaKind.Audio ? FirstTransceiver(kind)?.Receiver.RemoteSsrc : null;
 
     /// <summary>
     /// The current inbound demux table, published from the last applied remote description. Exposed to
@@ -509,9 +487,10 @@ public sealed partial class PeerConnection
 
     private MediaTrackStats? VideoStats()
     {
-        var track = _videoTrack;
+        var sender = FirstSender(MediaKind.Video);
+        var track = sender?.Track;
         var dropped = Interlocked.Read(ref _videoFramesDropped);
-        var quality = _videoQuality;
+        var quality = sender?.Quality;
         if (track is not null)
         {
             return track.GetStats(dropped, quality, RetransmissionStatsFor(track));
@@ -519,14 +498,15 @@ public sealed partial class PeerConnection
 
         return dropped == 0 && quality is null
             ? null
-            : new MediaTrackStats(MediaKind.Video, _config.VideoMid, _videoSsrc, 0, 0, 0, 0, dropped, quality);
+            : new MediaTrackStats(MediaKind.Video, _config.VideoMid, sender?.Ssrc ?? 0, 0, 0, 0, 0, dropped, quality);
     }
 
     private MediaTrackStats? AudioStats()
     {
-        var track = _audioTrack;
+        var sender = FirstSender(MediaKind.Audio);
+        var track = sender?.Track;
         var dropped = Interlocked.Read(ref _audioFramesDropped);
-        var quality = _audioQuality;
+        var quality = sender?.Quality;
         if (track is not null)
         {
             return track.GetStats(dropped, quality, null);
@@ -534,7 +514,7 @@ public sealed partial class PeerConnection
 
         return dropped == 0 && quality is null
             ? null
-            : new MediaTrackStats(MediaKind.Audio, _config.AudioMid, _audioSsrc, 0, 0, 0, 0, dropped, quality);
+            : new MediaTrackStats(MediaKind.Audio, _config.AudioMid, sender?.Ssrc ?? 0, 0, 0, 0, 0, dropped, quality);
     }
 
     private RetransmissionStats? RetransmissionStatsFor(TrackSender track)
@@ -789,56 +769,67 @@ public sealed partial class PeerConnection
                 $"An MTU of {_config.Mtu} leaves only {maxPayload} byte(s) for an RTP payload.");
         }
 
-        if (_negotiatedVideo is { } video)
+        // Build a wire sender for every transceiver whose negotiation settled on a send codec, in m-line
+        // order. Refactored to run per transceiver so it can be driven both from the connection driver
+        // (here) and, in a later phase, from a mid-session apply against the live SRTP context.
+        foreach (var transceiver in _transceivers)
         {
-            var videoMaxPayload = maxPayload;
-            RtxRetransmitter? rtx = null;
-
-            if (_config.EnableRetransmission && video.RtxPayloadType is { } rtxPayloadType)
+            var sender = transceiver.Sender;
+            if (sender.Negotiated is not { } negotiated)
             {
-                // An RTX packet is the original packet plus the two-octet OSN (RFC 4588 §4), so the
-                // media stream gives those two bytes back to keep repairs inside the same MTU.
-                videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
-                var history = new RtpSendHistory(
-                    RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
-                    _config.RetransmissionHistory);
-                rtx = new RtxRetransmitter(
-                    _videoRtxSsrc,
-                    rtxPayloadType,
-                    video.ClockRate,
-                    history,
-                    _config.Retransmission,
-                    logger: _logger);
-
-                _logger.Log(
-                    KeryxLogLevel.Info,
-                    $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{_videoRtxSsrc:x8}, "
-                    + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
+                continue;
             }
 
-            _videoTrack = new TrackSender(
-                this,
-                video.Mid,
-                MediaKind.Video,
-                new RtpStreamSender(_videoSsrc, video.PayloadType, video.ClockRate, logger: _logger),
-                new H264Packetizer(),
-                videoMaxPayload,
-                profile.RtpOverhead,
-                transportCcId,
-                rtx);
-        }
+            if (transceiver.Kind == MediaKind.Video)
+            {
+                var videoMaxPayload = maxPayload;
+                RtxRetransmitter? rtx = null;
 
-        if (_negotiatedAudio is { } audio)
-        {
-            _audioTrack = new TrackSender(
-                this,
-                audio.Mid,
-                MediaKind.Audio,
-                new RtpStreamSender(_audioSsrc, audio.PayloadType, audio.ClockRate, logger: _logger),
-                new OpusPacketizer(),
-                maxPayload,
-                profile.RtpOverhead,
-                transportCcId);
+                if (_config.EnableRetransmission && negotiated.RtxPayloadType is { } rtxPayloadType)
+                {
+                    // An RTX packet is the original packet plus the two-octet OSN (RFC 4588 §4), so the
+                    // media stream gives those two bytes back to keep repairs inside the same MTU.
+                    videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
+                    var history = new RtpSendHistory(
+                        RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
+                        _config.RetransmissionHistory);
+                    rtx = new RtxRetransmitter(
+                        sender.RtxSsrc,
+                        rtxPayloadType,
+                        negotiated.ClockRate,
+                        history,
+                        _config.Retransmission,
+                        logger: _logger);
+
+                    _logger.Log(
+                        KeryxLogLevel.Info,
+                        $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{sender.RtxSsrc:x8}, "
+                        + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
+                }
+
+                sender.Track = new TrackSender(
+                    this,
+                    negotiated.Mid,
+                    MediaKind.Video,
+                    new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
+                    new H264Packetizer(),
+                    videoMaxPayload,
+                    profile.RtpOverhead,
+                    transportCcId,
+                    rtx);
+            }
+            else if (transceiver.Kind == MediaKind.Audio)
+            {
+                sender.Track = new TrackSender(
+                    this,
+                    negotiated.Mid,
+                    MediaKind.Audio,
+                    new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
+                    new OpusPacketizer(),
+                    maxPayload,
+                    profile.RtpOverhead,
+                    transportCcId);
+            }
         }
 
         if (_congestionController is { } controller)
@@ -992,12 +983,7 @@ public sealed partial class PeerConnection
             // No FID association for this repair SSRC. A non-simulcast section carries a single media
             // source, so the last media SSRC learned for the kind is the one being repaired; without
             // even that, there is no source to attribute the repair to, so drop it rather than guess.
-            var learned = route.Kind switch
-            {
-                MediaKind.Video => (uint?)_remoteVideoSsrc,
-                MediaKind.Audio => (uint?)_remoteAudioSsrc,
-                _ => null,
-            };
+            var learned = FirstTransceiver(route.Kind)?.Receiver.RemoteSsrc;
 
             if (learned is not { } knownMediaSsrc)
             {
@@ -1046,13 +1032,10 @@ public sealed partial class PeerConnection
         // Track the sender's SSRC per kind for GetRemoteSsrc, straight off the same demux resolution
         // OnRtpPacketReceived is about to see. This is a plain last-writer-wins snapshot, not a full
         // source table.
-        if (route.Kind == MediaKind.Video)
+        if (route.Kind is MediaKind.Video or MediaKind.Audio
+            && FirstTransceiver(route.Kind) is { } transceiver)
         {
-            _remoteVideoSsrc = packet.Header.Ssrc;
-        }
-        else if (route.Kind == MediaKind.Audio)
-        {
-            _remoteAudioSsrc = packet.Header.Ssrc;
+            transceiver.Receiver.RemoteSsrc = packet.Header.Ssrc;
         }
 
         TrackInboundReceipt(
@@ -1501,8 +1484,16 @@ public sealed partial class PeerConnection
     /// </remarks>
     private void ServeNack(RtcpGenericNack nack)
     {
-        var track = _videoTrack;
-        if (track?.Retransmitter is null || nack.MediaSsrc != _videoSsrc)
+        // Resolve the NACKed media SSRC to the sender that owns it (session-model.md §1.5). A NACK names
+        // the media source, so a repair (RTX) SSRC or an unknown SSRC is not served; a sender with no
+        // retransmitter (audio) has no history to serve from.
+        if (!_localSsrcOwners.TryGetValue(nack.MediaSsrc, out var owner) || owner.IsRtx)
+        {
+            return;
+        }
+
+        var track = owner.Sender.Track;
+        if (track?.Retransmitter is null)
         {
             return;
         }
@@ -1542,15 +1533,16 @@ public sealed partial class PeerConnection
         for (var i = 0; i < blocks.Count; i++)
         {
             var block = blocks[i];
-            var video = block.SourceSsrc == _videoSsrc;
-            if (!video && block.SourceSsrc != _audioSsrc)
+            if (!_localSsrcOwners.TryGetValue(block.SourceSsrc, out var owner) || owner.IsRtx)
             {
-                // Report blocks for the RTX SSRC describe the repair stream, which has no separate
+                // Report blocks for an RTX SSRC describe the repair stream, which has no separate
                 // quality surface, and blocks for anything else are not about us at all.
                 continue;
             }
 
-            var clockRate = video ? _negotiatedVideo?.ClockRate : _negotiatedAudio?.ClockRate;
+            var sender = owner.Sender;
+            var video = sender.Kind == MediaKind.Video;
+            var clockRate = sender.Negotiated?.ClockRate;
             var quality = new OutboundStreamQuality(
                 block.SourceSsrc,
 
@@ -1563,18 +1555,11 @@ public sealed partial class PeerConnection
                 ReceiverReportEventArgs.CalculateRoundTripTime(block, receivedAt),
                 receivedAt);
 
-            if (video)
-            {
-                _videoQuality = quality;
-            }
-            else
-            {
-                _audioQuality = quality;
-            }
+            sender.Quality = quality;
 
             // Feed reception-report loss to the loss-based estimator. Video carries the bitrate the
             // estimator is protecting, so prefer it; fall back to audio only when no video is sent.
-            if (video || _negotiatedVideo is null)
+            if (video || FirstSender(MediaKind.Video)?.Negotiated is null)
             {
                 _congestionController?.OnReportedLoss(quality.FractionLost);
             }
@@ -1619,8 +1604,13 @@ public sealed partial class PeerConnection
         try
         {
             var now = DateTimeOffset.UtcNow;
-            SendReportFor(MediaKind.Video, _videoTrack, now);
-            SendReportFor(MediaKind.Audio, _audioTrack, now);
+
+            // Iterate the transceiver set in m-line order (video then audio for the legacy set), so the
+            // reports emit in the same order as before.
+            foreach (var transceiver in _transceivers)
+            {
+                SendReportFor(transceiver.Kind, transceiver.Sender.Track, now);
+            }
         }
         catch (Exception ex)
         {
@@ -1685,8 +1675,9 @@ public sealed partial class PeerConnection
             var sources = new List<uint>();
             var now = DateTimeOffset.UtcNow;
 
-            foreach (var track in new[] { _videoTrack, _audioTrack })
+            foreach (var transceiver in _transceivers)
             {
+                var track = transceiver.Sender.Track;
                 if (track is null)
                 {
                     continue;

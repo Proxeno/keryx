@@ -64,11 +64,6 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private readonly List<string> _pendingRemoteCandidates = [];
     private readonly string _cname;
     private readonly string _streamId;
-    private readonly string _videoTrackId;
-    private readonly string _audioTrackId;
-    private readonly uint _videoSsrc;
-    private readonly uint _videoRtxSsrc;
-    private readonly uint _audioSsrc;
     private readonly uint _rtcpSenderSsrc;
 
     private IceAgent? _ice;
@@ -98,14 +93,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _ownsCertificate = _config.Certificate is null;
         _cname = _config.Cname ?? NewIdentifier("keryx");
         _streamId = _config.StreamId ?? NewIdentifier("stream");
-        _videoTrackId = _config.VideoTrackId ?? NewIdentifier("video");
-        _audioTrackId = _config.AudioTrackId ?? NewIdentifier("audio");
-        _videoSsrc = NewSsrc();
-        _videoRtxSsrc = NewSsrc();
-        _audioSsrc = NewSsrc();
         _rtcpSenderSsrc = NewSsrc();
         _videoForwarder = new RtpForwarderHandle(this, MediaKind.Video);
         _audioForwarder = new RtpForwarderHandle(this, MediaKind.Audio);
+
+        // Build the legacy per-kind transceivers from the config (session-model.md §5.1). Their senders
+        // own the pre-allocated SSRCs and track ids, so the per-kind identity accessors resolve to them.
+        BuildLegacyTransceivers();
 
         if (_config.EnableCongestionControl)
         {
@@ -226,16 +220,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
     public ICongestionController? CongestionController => _congestionController;
 
     /// <summary>The synchronisation source of the outbound video stream.</summary>
-    public uint VideoSsrc => _videoSsrc;
+    public uint VideoSsrc => FirstSender(MediaKind.Video)?.Ssrc ?? 0;
 
     /// <summary>
     /// The synchronisation source of the outbound video retransmission stream, published as the second
     /// member of <c>a=ssrc-group:FID</c> when RFC 4588 RTX is offered.
     /// </summary>
-    public uint VideoRtxSsrc => _videoRtxSsrc;
+    public uint VideoRtxSsrc => FirstSender(MediaKind.Video)?.RtxSsrc ?? 0;
 
     /// <summary>The synchronisation source of the outbound audio stream.</summary>
-    public uint AudioSsrc => _audioSsrc;
+    public uint AudioSsrc => FirstSender(MediaKind.Audio)?.Ssrc ?? 0;
 
     /// <summary>The most recent local description, or null before one was created.</summary>
     public string? LocalDescription
@@ -863,39 +857,48 @@ public sealed partial class PeerConnection : IAsyncDisposable
             TrickleIce = true,
         };
 
-        if (_config.VideoCodecs.Count > 0)
+        // Walk the transceiver set in m-line order rather than the fixed video/audio sections. For the
+        // legacy transceiver set (one sendonly video, one sendonly audio) this emits byte-identical SDP:
+        // same mids, order, directions, codecs and SSRCs (session-model.md §5.1).
+        foreach (var transceiver in _transceivers)
         {
-            var codecs = BuildOfferedVideoCodecs();
-            var video = SdpMediaOffer.Video(_config.VideoMid, [.. codecs]);
-            video.TrackId = _videoTrackId;
-            video.Ssrcs.Add(_videoSsrc);
-            if (_config.EnableTransportWideCc)
+            var sender = transceiver.Sender;
+            var mid = transceiver.Mid!;
+            if (transceiver.Kind == MediaKind.Video)
             {
-                video.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
-            }
+                var codecs = BuildOfferedVideoCodecs();
+                var video = SdpMediaOffer.Video(mid, [.. codecs]);
+                video.Direction = transceiver.Direction;
+                video.TrackId = sender.TrackId;
+                video.Ssrcs.Add(sender.Ssrc);
+                if (_config.EnableTransportWideCc)
+                {
+                    video.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
+                }
 
-            if (codecs.Exists(static c => c.IsRtx))
+                if (codecs.Exists(static c => c.IsRtx))
+                {
+                    // RFC 5576 §4.2: FID associates the media source with the repair source carrying its
+                    // retransmissions. Both sources publish the same cname, which the builder writes.
+                    video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sender.Ssrc, sender.RtxSsrc]));
+                    video.Ssrcs.Add(sender.RtxSsrc);
+                }
+
+                builder.AddMedia(video);
+            }
+            else if (transceiver.Kind == MediaKind.Audio)
             {
-                // RFC 5576 §4.2: FID associates the media source with the repair source carrying its
-                // retransmissions. Both sources publish the same cname, which the builder writes.
-                video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [_videoSsrc, _videoRtxSsrc]));
-                video.Ssrcs.Add(_videoRtxSsrc);
+                var audio = SdpMediaOffer.Audio(mid, [.. _config.AudioCodecs]);
+                audio.Direction = transceiver.Direction;
+                audio.TrackId = sender.TrackId;
+                audio.Ssrcs.Add(sender.Ssrc);
+                if (_config.EnableTransportWideCc)
+                {
+                    audio.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
+                }
+
+                builder.AddMedia(audio);
             }
-
-            builder.AddMedia(video);
-        }
-
-        if (_config.AudioCodecs.Count > 0)
-        {
-            var audio = SdpMediaOffer.Audio(_config.AudioMid, [.. _config.AudioCodecs]);
-            audio.TrackId = _audioTrackId;
-            audio.Ssrcs.Add(_audioSsrc);
-            if (_config.EnableTransportWideCc)
-            {
-                audio.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
-            }
-
-            builder.AddMedia(audio);
         }
 
         builder.AddDataChannel(_config.ApplicationMid, _config.SctpPort, _config.MaxMessageSize);
@@ -1020,6 +1023,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
         // first sending section that echoed the extension fixes its id for the whole connection.
         byte? answerSendTransportCcId = null;
 
+        // Tracks which transceivers have already claimed an offered m-line during this answer, so a
+        // second m-line of the same kind binds to the next unassociated transceiver (RFC 8829 §5.10).
+        var associated = new HashSet<RtpTransceiver>();
+
         for (var i = 0; i < offer.MediaDescriptions.Count; i++)
         {
             var offered = offer.MediaDescriptions[i];
@@ -1033,17 +1040,31 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 continue;
             }
 
-            // Keryx answers as a sender when — and only when — the offer is recvonly, i.e. the peer
-            // asked this endpoint to send and to receive nothing back. That is the SFU subscriber shape:
-            // a viewer offers recvonly and Keryx (the subscriber PeerConnection) answers sendonly and
-            // forwards media on its own SSRC. For every other offered direction the local capability
-            // stays receive-only, so a sendrecv or sendonly offer still answers recvonly and an inactive
-            // offer stays inactive — the media-server-receiving-from-browsers shape is unchanged.
+            // Bind the offered m-line to a transceiver (session-model.md §3.2) and negotiate the answered
+            // direction from the transceiver's direction, which the binding defaults to the complement of
+            // the offered one. This reproduces the historical answerer rule exactly: Keryx answers as a
+            // sender when — and only when — the offer is recvonly (the SFU subscriber shape, where a
+            // viewer offers recvonly and Keryx answers sendonly on its own SSRC); every other offered
+            // direction leaves the transceiver receive-only, so a sendrecv or sendonly offer answers
+            // recvonly and an inactive offer stays inactive.
             var offeredDirection = offered.DirectionOrDefault;
-            var localCapability = offeredDirection == MediaDirection.RecvOnly
-                ? MediaDirection.SendRecv
-                : MediaDirection.RecvOnly;
-            var negotiatedDirection = SdpDirection.Negotiate(localCapability, offeredDirection);
+            var kind = ToMediaKind(offered.Media);
+            RtpTransceiver? boundTransceiver = null;
+            MediaDirection negotiatedDirection;
+            if (kind is MediaKind.Video or MediaKind.Audio)
+            {
+                boundTransceiver = BindOfferedMediaLine(kind, mid, offeredDirection, associated);
+                negotiatedDirection = SdpDirection.Negotiate(boundTransceiver.Direction, offeredDirection);
+                boundTransceiver.CurrentDirection = negotiatedDirection;
+            }
+            else
+            {
+                var localCapability = offeredDirection == MediaDirection.RecvOnly
+                    ? MediaDirection.SendRecv
+                    : MediaDirection.RecvOnly;
+                negotiatedDirection = SdpDirection.Negotiate(localCapability, offeredDirection);
+            }
+
             var section = new SdpMediaOffer(mid, offered.Media, offered.Protocol)
             {
                 Direction = negotiatedDirection,
@@ -1156,10 +1177,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
             // stream it is about to receive.
             if (negotiatedDirection.Sends() && section.Port != 0)
             {
-                var kind = ToMediaKind(offered.Media);
                 var primary = section.Codecs.FirstOrDefault(c => !c.IsRtx);
-                if (kind is MediaKind.Video or MediaKind.Audio && primary is not null)
+                if (boundTransceiver is not null && kind is MediaKind.Video or MediaKind.Audio && primary is not null)
                 {
+                    var sender = boundTransceiver.Sender;
                     byte? rtxPayloadType = null;
                     if (kind == MediaKind.Video)
                     {
@@ -1171,30 +1192,22 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         }
                     }
 
-                    var sendSsrc = kind == MediaKind.Video ? _videoSsrc : _audioSsrc;
-                    section.TrackId = kind == MediaKind.Video ? _videoTrackId : _audioTrackId;
+                    var sendSsrc = sender.Ssrc;
+                    section.TrackId = sender.TrackId;
                     section.Ssrcs.Add(sendSsrc);
                     if (rtxPayloadType is not null)
                     {
                         // RFC 5576 §4.2: FID binds the media source to the repair source that carries
                         // its retransmissions; both publish the same cname, which the builder writes.
-                        section.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sendSsrc, _videoRtxSsrc]));
-                        section.Ssrcs.Add(_videoRtxSsrc);
+                        section.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sendSsrc, sender.RtxSsrc]));
+                        section.Ssrcs.Add(sender.RtxSsrc);
                     }
 
-                    var track = new NegotiatedTrack(
+                    sender.Negotiated = new NegotiatedTrack(
                         mid,
                         (byte)primary.PayloadType,
                         (uint)primary.ClockRate,
                         rtxPayloadType);
-                    if (kind == MediaKind.Video)
-                    {
-                        _negotiatedVideo = track;
-                    }
-                    else
-                    {
-                        _negotiatedAudio = track;
-                    }
 
                     if (_config.EnableTransportWideCc && answerSendTransportCcId is null)
                     {
@@ -1539,15 +1552,22 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     }
                 }
 
-                _negotiatedVideo = new NegotiatedTrack(
-                    media.Mid ?? _config.VideoMid,
-                    (byte)chosen.PayloadType,
-                    (uint)chosen.ClockRate,
-                    rtxPayloadType);
+                if (FirstSender(MediaKind.Video) is { } videoSender)
+                {
+                    videoSender.Negotiated = new NegotiatedTrack(
+                        media.Mid ?? _config.VideoMid,
+                        (byte)chosen.PayloadType,
+                        (uint)chosen.ClockRate,
+                        rtxPayloadType);
+                }
             }
             else
             {
-                _negotiatedAudio = new NegotiatedTrack(media.Mid ?? _config.AudioMid, (byte)chosen.PayloadType, (uint)chosen.ClockRate);
+                if (FirstSender(MediaKind.Audio) is { } audioSender)
+                {
+                    audioSender.Negotiated =
+                        new NegotiatedTrack(media.Mid ?? _config.AudioMid, (byte)chosen.PayloadType, (uint)chosen.ClockRate);
+                }
             }
         }
 
@@ -1561,11 +1581,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         Volatile.Write(ref _routeTable, new RouteTable(routes, routesByMid, ssrcToMid, midExtensionId));
         Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);
+        var negotiatedVideo = FirstSender(MediaKind.Video)?.Negotiated;
+        var negotiatedAudio = FirstSender(MediaKind.Audio)?.Negotiated;
         _logger.Log(
             KeryxLogLevel.Info,
-            $"Applied answer; local DTLS role {LocalDtlsRole}, video pt {_negotiatedVideo?.PayloadType}"
-            + $" (rtx pt {_negotiatedVideo?.RtxPayloadType?.ToString(CultureInfo.InvariantCulture) ?? "none"}),"
-            + $" audio pt {_negotiatedAudio?.PayloadType},"
+            $"Applied answer; local DTLS role {LocalDtlsRole}, video pt {negotiatedVideo?.PayloadType}"
+            + $" (rtx pt {negotiatedVideo?.RtxPayloadType?.ToString(CultureInfo.InvariantCulture) ?? "none"}),"
+            + $" audio pt {negotiatedAudio?.PayloadType},"
             + $" transport-cc extmap {(transportCcExtensionId?.ToString(CultureInfo.InvariantCulture) ?? "none")}.");
     }
 
