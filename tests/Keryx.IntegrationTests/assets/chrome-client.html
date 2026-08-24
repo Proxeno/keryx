@@ -1,11 +1,12 @@
 <!doctype html>
 <!--
-  Keryx Chrome interop client. Served by the integration test host; drives a real
-  RTCPeerConnection against a Keryx peer over HTTP signaling. One role-flexible
-  fixture: the ?role= query string picks who offers and in which direction, so the
-  same page covers the media-server shape (Keryx offers) and the SFU shapes (the
-  browser offers, Keryx answers). A sibling project extends this same page — do not
-  fork it.
+  Keryx browser interop client. Served by the integration test host; drives a real
+  RTCPeerConnection against a Keryx peer over HTTP signaling. Engine-agnostic: the
+  same page runs unchanged in headless Chrome and headless Firefox (the standard
+  RTCPeerConnection JS API), so both real-engine CI lanes share one fixture. One
+  role-flexible page: the ?role= query string picks who offers and in which direction,
+  so it covers the media-server shape (Keryx offers) and the SFU shapes (the browser
+  offers, Keryx answers). A sibling project extends this same page — do not fork it.
 
     ?role=answer      (default) Keryx offers; the browser answers.
         GET  /offer   -> { type: "offer",  sdp }   (Keryx is the offerer)

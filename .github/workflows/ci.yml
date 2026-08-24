@@ -16,7 +16,7 @@ jobs:
       # coverage rather than a no-op.
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
-      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=PionInterop&Category!=Soak"
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=Soak"
 
   # Browser interop, CI-enforced. This job installs a headless Chrome, so the ChromeInterop tests
   # (excluded from build-test above) MUST actually run here. KERYX_REQUIRE_CHROME=1 turns a missing
@@ -38,6 +38,69 @@ jobs:
         env:
           KERYX_REQUIRE_CHROME: "1"
           KERYX_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+  # Firefox interop, CI-enforced. A third real-engine lane alongside the Chrome lane, reusing the
+  # same role-flexible fixture and the same BrowserLauncher seam. It is valuable precisely because
+  # Firefox exercises paths Chrome does not: it negotiates two-byte RTP header extensions more
+  # readily, prefers a different codec/PT ordering, makes its own a=setup role choice, and speaks
+  # H.264 only through the downloadable OpenH264 GMP rather than a built-in decoder. This job installs
+  # Firefox, so the FirefoxInterop tests (excluded from build-test above) MUST actually run here.
+  # KERYX_REQUIRE_FIREFOX=1 turns a missing or unlaunchable browser into a failure instead of the
+  # graceful skip local dev gets, so an interop regression fails the build rather than passing.
+  firefox-interop:
+    runs-on: ubuntu-latest
+    # Safety bound: the three FirefoxInterop tests each carry their own ~90s deadline and run serially,
+    # so a healthy run finishes in a few minutes. This ceiling guarantees a future regression can never
+    # hang the job for the six-hour GitHub default and burn CI minutes.
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-firefox@v1
+        id: setup-firefox
+        with:
+          firefox-version: latest
+      # Keryx speaks H.264 only, but Firefox ships no built-in H.264 codec: it downloads Cisco's
+      # OpenH264 GMP on demand. Warming it once into a template profile (and copying it into each
+      # test's throwaway profile via KERYX_FIREFOX_GMP_DIR) keeps every test from racing that download
+      # at SDP time. Best effort: the tests' prefs also enable Firefox's own on-demand fetch as a
+      # fallback, so a slow warm-up does not fail the job outright.
+      - name: Warm up OpenH264 GMP
+        run: |
+          FF="${{ steps.setup-firefox.outputs.firefox-path }}"
+          PROFILE="$HOME/keryx-ff-gmp"
+          mkdir -p "$PROFILE"
+          cat > "$PROFILE/user.js" <<'EOF'
+          user_pref("media.gmp-gmpopenh264.enabled", true);
+          user_pref("media.gmp-gmpopenh264.autoupdate", true);
+          user_pref("media.gmp-manager.updateEnabled", true);
+          user_pref("toolkit.telemetry.enabled", false);
+          user_pref("datareporting.policy.dataSubmissionEnabled", false);
+          user_pref("app.update.enabled", false);
+          EOF
+          "$FF" --headless --no-remote --new-instance --profile "$PROFILE" about:blank &
+          FF_PID=$!
+          for i in $(seq 1 30); do
+            if ls "$PROFILE"/gmp-gmpopenh264/*/libgmpopenh264.* >/dev/null 2>&1; then
+              echo "OpenH264 GMP downloaded."
+              break
+            fi
+            sleep 2
+          done
+          kill "$FF_PID" 2>/dev/null || true
+          echo "KERYX_FIREFOX_GMP_DIR=$PROFILE" >> "$GITHUB_ENV"
+          ls -R "$PROFILE/gmp-gmpopenh264" 2>/dev/null || echo "OpenH264 GMP not present after warm-up (tests will fetch on demand)"
+      - run: dotnet build Keryx.slnx --configuration Release
+      # The DTLS-SRTP/ICE path stays a pure 127.0.0.1 loopback (host candidates only): the test peer
+      # binds IPAddress.Loopback and the Firefox profile is primed with
+      # media.peerconnection.ice.loopback=true + obfuscate_host_addresses=false so it gathers 127.0.0.1
+      # host candidates and no STUN/TURN or mDNS is involved. That is what lets the lane run headless.
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=FirefoxInterop"
+        env:
+          KERYX_REQUIRE_FIREFOX: "1"
+          KERYX_FIREFOX_PATH: ${{ steps.setup-firefox.outputs.firefox-path }}
 
   # pion (Go WebRTC) reference-implementation interop, CI-enforced. A second, non-browser peer to
   # catch bugs a single implementation would mask. This job installs Go and builds the pion peer, so
