@@ -68,6 +68,11 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
     private readonly BatchedDatagramSender _batchSender;
     private Datagram[] _batchScratch = [];
 
+    // Test seam: overrides how one staged batch window (offset, length into _batchScratch) is handed to the
+    // socket, so a test can script a short send (backpressure) and assert DroppedDatagrams deterministically
+    // without forcing a real ENOBUFS. Null in production — the real batch sender is used. Read under _sendLock.
+    internal Func<int, int, int>? _sendWindowOverrideForTest;
+
     // Read-mostly demux state. _byEndPoint routes established 5-tuples (the hot path); _byUfrag is the
     // first-contact index a new viewer's STUN Binding request is matched against. Both are keyed so a
     // lookup is O(1) in viewer count.
@@ -76,6 +81,7 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
 
     private readonly object _lifecycleLock = new();
     private int _viewerCount;
+    private long _droppedDatagrams;
     private bool _disposed;
 
     /// <summary>Opens the shared socket and starts its receive loop.</summary>
@@ -84,7 +90,7 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
     {
         _options = (options ?? new BroadcastEndpointOptions()).Validate();
         _logger = _options.Logger;
-        _socket = CreateSocket(_options.BindEndPoint);
+        _socket = CreateSocket(_options.BindEndPoint, _options.SendBufferSize);
         try
         {
             _socket.Bind(_options.BindEndPoint);
@@ -112,6 +118,65 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
 
     /// <summary>The number of viewer sessions currently held.</summary>
     public int ViewerCount => Volatile.Read(ref _viewerCount);
+
+    /// <summary>
+    /// The total number of media datagrams <see cref="SendBatch"/> has dropped after the shared socket's
+    /// send buffer stayed full across every retry (the tail-drop that keeps one viewer's transient
+    /// <c>ENOBUFS</c> from stalling the whole fan-out — <c>broadcast-scale.md</c> §3.1). A steadily
+    /// climbing count is the signal to raise the socket send-buffer size (see
+    /// <see cref="BroadcastEndpointOptions.SendBufferSize"/>) or shed load; it is otherwise expected to
+    /// stay at or near zero. Monotonic for the endpoint's lifetime.
+    /// </summary>
+    public long DroppedDatagrams => Interlocked.Read(ref _droppedDatagrams);
+
+    /// <summary>
+    /// Re-registers a viewer's first-contact demux binding after an ICE restart (RFC 8445 §9,
+    /// <c>broadcast-scale.md</c> §2): an endpoint-session-mode restart regenerates the connection's local
+    /// ICE ufrag, so the endpoint adopts the new ufrag and moves its <c>ufrag→session</c> map entry. Call
+    /// it once the restart offer/answer has regenerated the credentials (e.g. right after
+    /// <c>CreateOfferAsync(iceRestart: true)</c> / applying a restart answer) and before the viewer's
+    /// fresh checks arrive from a new 5-tuple; an already-established 5-tuple keeps routing throughout.
+    /// </summary>
+    /// <param name="session">The viewer whose ICE credentials were just restarted.</param>
+    /// <returns>True when the ufrag changed and the binding was moved; false when it was unchanged
+    /// (nothing to do) or the connection has no ICE ufrag yet.</returns>
+    /// <exception cref="InvalidOperationException">The endpoint is disposed, or the session is not held here.</exception>
+    public bool RebindViewerIceUfrag(ViewerSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        var current = session.Connection.LocalIceUfrag;
+        if (current is null)
+        {
+            return false;
+        }
+
+        lock (_lifecycleLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            var previous = session.LocalIceUfrag;
+            if (string.Equals(previous, current, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (!_byUfrag.TryGetValue(previous, out var held) || !ReferenceEquals(held, session))
+            {
+                throw new InvalidOperationException(
+                    $"Session '{session.Id}' is not registered on this endpoint under ufrag '{previous}'.");
+            }
+
+            // Register the new ufrag first, then adopt it on the session and drop the old entry, so a
+            // first-contact check racing the swap resolves under one ufrag or the other, never neither.
+            _byUfrag[current] = session;
+            session.SetLocalIceUfrag(current);
+            _byUfrag.TryRemove(new KeyValuePair<string, ViewerSession>(previous, session));
+        }
+
+        _logger.Log(KeryxLogLevel.Debug, $"Broadcast viewer {session.Id} rebound to restarted ufrag '{current}'.");
+        return true;
+    }
 
     /// <summary>
     /// Enrolls a new viewer: mints its local ICE credentials, points the supplied config's ICE agent
@@ -403,7 +468,10 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
         {
             while (total < count)
             {
-                var sent = _batchSender.Send(_batchScratch.AsSpan(total, count - total));
+                var window = count - total;
+                var sent = _sendWindowOverrideForTest is { } over
+                    ? over(total, window)
+                    : _batchSender.Send(_batchScratch.AsSpan(total, window));
                 total += sent;
                 if (total >= count || ++attempts >= MaxFlushAttempts)
                 {
@@ -424,9 +492,11 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
 
         if (total < count)
         {
+            Interlocked.Add(ref _droppedDatagrams, count - total);
             _logger.Log(
                 KeryxLogLevel.Trace,
-                $"Broadcast fan-out flush sent {total}/{count} datagrams; the tail was dropped (send buffer full).");
+                $"Broadcast fan-out flush sent {total}/{count} datagrams; the tail ({count - total}) was dropped "
+                + "(send buffer full). BroadcastEndpoint.DroppedDatagrams tracks the running total.");
         }
 
         return total;
@@ -465,7 +535,7 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
     internal void SendControlForTest(byte[] datagram, IPEndPoint destination)
         => SendToViewer(datagram, destination);
 
-    private static Socket CreateSocket(IPEndPoint bind)
+    private static Socket CreateSocket(IPEndPoint bind, int? sendBufferSize)
     {
         var socket = new Socket(bind.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
         if (bind.AddressFamily == AddressFamily.InterNetworkV6 && bind.Address.Equals(IPAddress.IPv6Any))
@@ -473,6 +543,13 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
             // One dual-stack v6 socket then carries IPv4 too, as v4-mapped addresses that the receive
             // loop and SendToViewer normalise back to native IPv4.
             socket.DualMode = true;
+        }
+
+        if (sendBufferSize is { } bytes)
+        {
+            // Absorb bigger fan-out bursts before the batch tail-drop (see DroppedDatagrams). The OS may
+            // clamp this to its configured maximum; the effective size is observable on SendBufferSize.
+            socket.SendBufferSize = bytes;
         }
 
         return socket;

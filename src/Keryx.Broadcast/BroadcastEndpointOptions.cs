@@ -29,6 +29,18 @@ public sealed class BroadcastEndpointOptions
     /// </summary>
     public int MaxViewers { get; set; } = 1024;
 
+    /// <summary>
+    /// The shared socket's send-buffer size in bytes (<c>SO_SNDBUF</c>), or null (the default) to leave the
+    /// OS default in force. This is the primary lever against <see cref="BroadcastEndpoint.DroppedDatagrams"/>:
+    /// a fan-out flushes many datagrams per <c>sendmmsg</c>, and when the send buffer fills the batch's tail
+    /// is dropped rather than allowed to stall the fan-out. Size it to at least one full fan-out batch worth
+    /// of MTU-sized datagrams — roughly <c>MaxViewers × 1500</c> bytes as an upper bound, less if peak
+    /// concurrency is lower — so a burst is buffered instead of shed. The OS clamps the request to its
+    /// configured maximum (<c>net.core.wmem_max</c> on Linux), so verify the effective size under load and
+    /// watch <see cref="BroadcastEndpoint.DroppedDatagrams"/>.
+    /// </summary>
+    public int? SendBufferSize { get; set; }
+
     /// <summary>Diagnostics sink; defaults to a no-op logger.</summary>
     public IKeryxLogger Logger { get; set; } = NullLogger.Instance;
 
@@ -36,6 +48,10 @@ public sealed class BroadcastEndpointOptions
     {
         ArgumentNullException.ThrowIfNull(BindEndPoint);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxViewers, 1);
+        if (SendBufferSize is { } sendBuffer)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(sendBuffer, 1);
+        }
 
         if (AdvertisedAddress is null
             && (BindEndPoint.Address.Equals(IPAddress.Any) || BindEndPoint.Address.Equals(IPAddress.IPv6Any)))

@@ -508,7 +508,8 @@ public sealed class IceAgent : IDisposable
     /// <summary>
     /// Restarts ICE on this agent (RFC 8445 section 9): generates fresh local credentials, discards the
     /// peer's credentials and the entire check list, and re-arms connectivity checks — while keeping the
-    /// bound socket and the gathered local candidates, so the base is reused and the datagram transport
+    /// gathered local candidates and the underlying transport (the bound socket in the self-owned path, or
+    /// the shared send seam in endpoint-session mode), so the base is reused and the datagram transport
     /// seam (<see cref="Transport"/>) that DTLS/SRTP/SCTP ride is never disturbed.
     /// </summary>
     /// <remarks>
@@ -516,17 +517,25 @@ public sealed class IceAgent : IDisposable
     /// candidates and the new <see cref="LocalUfrag"/>/<see cref="LocalPassword"/> in a fresh offer or
     /// answer, feeds the peer's restart candidates back through <see cref="AddRemoteCandidate(string)"/>,
     /// and supplies the peer's fresh credentials through <see cref="SetRemoteCredentials"/>. Connectivity
-    /// checks then re-run from scratch and nominate a new selected pair.</para>
+    /// checks then re-run from scratch and nominate a new selected pair. In endpoint-session mode the owner
+    /// (a broadcast endpoint) additionally re-registers the new ufrag→session demux binding.</para>
     /// <para>The previously selected pair is cleared, so <see cref="Transport"/> sends throw for the brief
     /// window until a new pair succeeds; every layer above tolerates that (it is the same gap trickle ICE
-    /// already produces before the first pair is nominated). A no-op before gathering has bound a socket.</para>
+    /// already produces before the first pair is nominated). A no-op before the agent has gathered (no
+    /// bound socket in the self-owned path, or no advertised candidate in endpoint-session mode).</para>
     /// </remarks>
     public void Restart()
     {
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_state is IceAgentState.Closed or IceAgentState.Failed || _socket is null)
+
+            // "Gathered" means the base is in place to re-run checks over: a bound socket in the
+            // self-owned path, or — in endpoint-session mode, which never binds a socket — the advertised
+            // host candidate StartEndpointSession added over the shared send seam. Either way the transport
+            // seam that DTLS/SRTP ride is untouched by the restart.
+            var gathered = _socket is not null || (_externalTransport is not null && LocalCandidates.Count > 0);
+            if (_state is IceAgentState.Closed or IceAgentState.Failed || !gathered)
             {
                 // Nothing to restart: either the agent is done, or it never gathered (the first
                 // negotiation has not run), in which case the normal gather path applies.

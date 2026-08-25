@@ -220,6 +220,16 @@ internal interface IBatchDatagramSender
   broadcast fan-out must never let one viewer's error stall the batch — same never-throws contract
   as the send path today). `vlen` is capped (`UIO_MAXIOV` = 1024; in practice the shard's viewer
   slice per flush, typically 64–512).
+- **Observing the tail-drop**: the bounded retry then drop is otherwise silent, so
+  `BroadcastEndpoint.DroppedDatagrams` counts every datagram shed this way. Production should scrape
+  it: a steadily climbing count means the shared socket's send buffer is the bottleneck. The lever is
+  `BroadcastEndpointOptions.SendBufferSize` (`SO_SNDBUF`) — size it to at least one full fan-out batch
+  of MTU-sized datagrams (an upper bound of roughly `MaxViewers × 1500` bytes, less when peak
+  concurrency is lower) so a burst is buffered rather than dropped. The OS clamps the request to its
+  configured maximum (`net.core.wmem_max` on Linux — raise it if the effective size is short), so
+  verify under load with `DroppedDatagrams` as the signal. Persistent drops after sizing the buffer
+  mean the NIC/CPU wall is reached and the answer is load-shedding (tier step-down, §5.2), not a
+  bigger buffer.
 
 ### 3.2 How it plugs into the shared-socket path
 

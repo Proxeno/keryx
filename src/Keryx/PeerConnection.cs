@@ -104,6 +104,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private DtlsTransport? _dtls;
     private SctpAssociation? _sctp;
     private SrtpContext? _srtp;
+
+    // The negotiated outbound (SFU->peer) SRTP master key/salt and profile, retained alongside _srtp so a
+    // sibling send-keyed encrypt context can be minted for the broadcast fan-out fast path (the key-bridge:
+    // broadcast-scale.md §4). Set and cleared under _lock in lockstep with _srtp; the bytes never leave the
+    // assembly except as an opaque SrtpEncryptContext (no raw-byte accessor).
+    private SrtpProfile? _srtpSendProfile;
+    private SrtpSessionKeys? _srtpSendKeys;
     private readonly Broadcast.PublicBroadcastReceiveKeys? _broadcastReceive;
     private Task? _driver;
 
@@ -267,6 +274,64 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     /// <summary>The SRTP protection profile the DTLS handshake agreed on, or null before it completes.</summary>
     public SrtpProfile? NegotiatedSrtpProfile => _srtp?.Profile;
+
+    /// <summary>
+    /// The local ICE username fragment (<c>a=ice-ufrag</c>) this connection currently answers with, or null
+    /// before an ICE agent exists. In endpoint-session mode an ICE restart regenerates it, so a broadcast
+    /// endpoint reads this to re-register the viewer's demux binding after a restart
+    /// (<c>broadcast-scale.md</c> §2).
+    /// </summary>
+    public string? LocalIceUfrag
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _ice?.LocalUfrag;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Mints a fresh SRTP encrypt context keyed identically to this connection's negotiated <b>send</b>
+    /// direction — the SFU→peer key, which is exactly the key the remote peer's DTLS handshake derived for
+    /// its <b>receive</b> direction. Media this context protects therefore decrypts, byte-correct, under
+    /// the peer's own key.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the per-viewer key-bridge that puts a real (e.g. browser) viewer on the broadcast fan-out
+    /// fast path (<c>broadcast-scale.md</c> §4): the returned context can encrypt the viewer's media off
+    /// this connection's own send lock — in parallel, in a <c>BroadcastSubscriber</c>, feeding a batched
+    /// <c>sendmmsg</c> flush — instead of the per-datagram <see cref="TryForwardRtp"/> path, while still
+    /// producing ciphertext the viewer decrypts under the key its DTLS handshake already negotiated.
+    /// </para>
+    /// <para>
+    /// The returned context is a fresh, independent instance the caller owns and must dispose; no key bytes
+    /// are exposed. It shares the connection's send master key, so — to avoid two independent SRTP packet
+    /// indices over one key+SSRC (which would repeat AES-CM keystream / AEAD nonces) — the caller must
+    /// protect media on it only for SSRC(s) this connection does not itself send RTP on via
+    /// <see cref="TryForwardRtp"/>, i.e. drive the viewer's media exclusively through the fan-out once
+    /// bridged. RTCP the connection emits on its own context is a distinct SRTP keyspace and does not
+    /// conflict.
+    /// </para>
+    /// </remarks>
+    /// <returns>A fresh outbound SRTP context keyed to this connection's send direction.</returns>
+    /// <exception cref="InvalidOperationException">The DTLS handshake has not derived SRTP keys yet.</exception>
+    public SrtpEncryptContext CreateSendKeyedSrtpContext()
+    {
+        lock (_lock)
+        {
+            if (_srtpSendProfile is not { } profile || _srtpSendKeys is not { } keys)
+            {
+                throw new InvalidOperationException(
+                    "SRTP keys are not negotiated yet; wait for the connection to reach Connected before "
+                    + "bridging it onto the broadcast fan-out.");
+            }
+
+            return new SrtpEncryptContext(profile, keys, _logger);
+        }
+    }
 
     /// <summary>The DTLS cipher suite the handshake agreed on (e.g. <c>TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256</c>), or null before it completes.</summary>
     public string? NegotiatedDtlsCipherSuite => _dtls?.NegotiatedCipherSuite;
@@ -1028,6 +1093,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
             // are about to be zeroed. The ICE, DTLS and SCTP references are kept so IceState,
             // DtlsState and SctpState keep reporting the truth after the connection is closed.
             _srtp = null;
+
+            // Drop the retained send key/profile too, so the key-bridge cannot mint a context from a
+            // closed connection's keys.
+            _srtpSendProfile = null;
+            _srtpSendKeys = null;
         }
 
         Safely(() => sctp?.Shutdown());

@@ -749,6 +749,7 @@ public sealed partial class PeerConnection
             var profile = MapSrtpProfile(negotiated);
             var material = dtls.ExportKeyingMaterial(ExporterLabel, negotiated.KeyingMaterialLength());
             SrtpContext srtp;
+            SrtpSessionKeys sendKeys;
             try
             {
                 var keys = DtlsSrtpKeyMaterial.Split(
@@ -756,6 +757,10 @@ public sealed partial class PeerConnection
                     material,
                     role == DtlsRole.Client ? DtlsSrtpRole.Client : DtlsSrtpRole.Server);
                 srtp = new SrtpContext(profile, keys.Local, keys.Remote, _logger);
+
+                // keys.Local is the SFU->peer (send) direction = the key the peer decrypts with. Retain a
+                // copy for the broadcast key-bridge before the exporter material is zeroed below.
+                sendKeys = keys.Local;
             }
             finally
             {
@@ -771,6 +776,11 @@ public sealed partial class PeerConnection
                 }
 
                 _srtp = srtp;
+
+                // Retain the outbound (send) master key/salt and profile so the broadcast key-bridge can
+                // mint a sibling send-keyed encrypt context (CreateSendKeyedSrtpContext).
+                _srtpSendProfile = profile;
+                _srtpSendKeys = sendKeys;
             }
 
             CreateTrackSenders(ice, profile);

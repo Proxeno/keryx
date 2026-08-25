@@ -16,10 +16,11 @@ namespace Keryx.Broadcast;
 /// (spec §5.1) — encoded with <see cref="PublicBroadcastKeyMessage"/>. It is never SDP and never a
 /// signaling-server-trusted value beyond what the data channel already implies. Treat it as a secret.
 /// </remarks>
-public sealed class PublicBroadcastKeyExport
+public sealed class PublicBroadcastKeyExport : IDisposable
 {
     private readonly byte[] _masterKey;
     private readonly byte[] _masterSalt;
+    private bool _disposed;
 
     internal PublicBroadcastKeyExport(
         int epoch,
@@ -42,13 +43,49 @@ public sealed class PublicBroadcastKeyExport
     /// <summary>The protection profile the key is used with.</summary>
     public SrtpProtectionProfile Profile => SrtpProtectionProfile.ForKind(ProfileKind);
 
-    // The master key and salt. Internal so the bytes are reachable only from the key-install seam, not
-    // from arbitrary application code holding the export.
-    internal ReadOnlyMemory<byte> MasterKey => _masterKey;
+    // The master key and salt. Internal so the bytes are reachable only from the key-install and wire-encode
+    // seams, not from arbitrary application code holding the export.
+    internal ReadOnlyMemory<byte> MasterKey
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _masterKey;
+        }
+    }
 
-    internal ReadOnlyMemory<byte> MasterSalt => _masterSalt;
+    internal ReadOnlyMemory<byte> MasterSalt
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _masterSalt;
+        }
+    }
 
-    internal SrtpSessionKeys ToSessionKeys() => new(_masterKey, _masterSalt);
+    internal SrtpSessionKeys ToSessionKeys()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return new SrtpSessionKeys(_masterKey, _masterSalt);
+    }
+
+    /// <summary>
+    /// Zeroes this export's copy of the key and salt bytes. The export carries secret material (spec §5.1);
+    /// dispose it once the key has been installed on the receiver or encoded for delivery so the plaintext
+    /// bytes do not linger in the heap. Disposing does not affect the <see cref="PublicBroadcastKey"/> it
+    /// came from, any other export, or an already-installed decrypt context — each holds its own copy.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        CryptographicOperations.ZeroMemory(_masterKey);
+        CryptographicOperations.ZeroMemory(_masterSalt);
+    }
 
     /// <summary>A redacted description; key bytes are never rendered.</summary>
     public override string ToString() =>
@@ -87,6 +124,17 @@ public static class PublicBroadcastKeyMessage
         if (broadcastSsrcs.Count == 0)
         {
             throw new ArgumentException("A broadcast key message must name at least one broadcast SSRC.", nameof(broadcastSsrcs));
+        }
+
+        // The SSRC count rides in a single byte on the wire, so more than 255 SSRCs cannot be encoded
+        // without silently truncating the count and producing a frame the decoder mis-parses. Refuse it up
+        // front. A broadcast tier is one SSRC; even a full simulcast set is a handful — 255 is a generous cap.
+        if (broadcastSsrcs.Count > byte.MaxValue)
+        {
+            throw new ArgumentException(
+                $"A broadcast key message carries at most {byte.MaxValue} SSRCs (the on-wire count is one byte), "
+                + $"but {broadcastSsrcs.Count} were supplied.",
+                nameof(broadcastSsrcs));
         }
 
         var key = export.MasterKey.Span;
