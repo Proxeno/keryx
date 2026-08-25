@@ -21,6 +21,16 @@ namespace Keryx.Rtp.Simulcast;
 /// </remarks>
 public sealed class SimulcastClassifier
 {
+    /// <summary>
+    /// Largest number of SSRC↔layer bindings the classifier will learn, across the media and repair
+    /// tables combined. A simulcast m-section carries a handful of layers (each a media SSRC and its RTX
+    /// repair SSRC); this cap is far above that, yet bounds the learned tables so a peer stamping a RID
+    /// (or repaired-RID) extension on a flood of invented SSRCs cannot grow them without limit. Once the
+    /// cap is reached a new SSRC is not bound, so an unrecognised one classifies as "unknown" and the
+    /// caller drops it — exactly the pre-binding behaviour.
+    /// </summary>
+    private const int MaxLearnedBindings = 64;
+
     private readonly RtpStreamIdentifierExtensions _extensions;
     private readonly object _lock = new();
     private readonly Dictionary<uint, SimulcastLayerId> _mediaBySsrc = new();
@@ -122,6 +132,19 @@ public sealed class SimulcastClassifier
         {
             // A late RID change for an already-bound SSRC is an interop anomaly, not the common path;
             // overwrite so the newest signalled binding wins.
+            if (table.ContainsKey(ssrc))
+            {
+                table[ssrc] = layerId;
+                return;
+            }
+
+            // Refuse to learn a new binding once the combined tables are full, so a RID/repaired-RID
+            // flood of invented SSRCs cannot grow the learned maps without bound.
+            if (_mediaBySsrc.Count + _repairBySsrc.Count >= MaxLearnedBindings)
+            {
+                return;
+            }
+
             table[ssrc] = layerId;
         }
     }

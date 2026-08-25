@@ -59,6 +59,37 @@ public class SimulcastClassifierTests
     }
 
     [Fact]
+    public void TryClassify_DoesNotLearnSsrcBindingsWithoutBoundUnderAFlood()
+    {
+        var classifier = NewClassifier();
+
+        // A peer stamps a RID on a flood of freshly invented SSRCs. Every packet still classifies from
+        // the RID on the wire, but the SSRC->layer bindings retained for later untagged lookup must stay
+        // bounded — otherwise the learned table grows without limit.
+        const int flood = 500;
+        const uint baseSsrc = 0x0001_0000u;
+        for (var i = 0; i < flood; i++)
+        {
+            RtpHeader.TryParse(SimulcastTestPackets.WithRid("hi", baseSsrc + (uint)i, seq: 1, ts: 90), out var tagged)
+                .Should().BeTrue();
+            classifier.TryClassify(tagged, out var classification).Should().BeTrue();
+            classification.Source.Should().Be(RtpLayerClassificationSource.RidExtension);
+        }
+
+        // The first SSRC was learned and still resolves an untagged packet by its learned binding.
+        RtpHeader.TryParse(SimulcastTestPackets.Plain(baseSsrc, seq: 2, ts: 180), out var early).Should().BeTrue();
+        classifier.TryClassify(early, out var earlyResult).Should().BeTrue();
+        earlyResult.Source.Should().Be(RtpLayerClassificationSource.LearnedSsrc);
+
+        // A late SSRC, past the learned-binding cap, was never retained: an untagged packet on it is
+        // unknown, exactly as any un-learned source is — so the flood cannot grow the table without bound.
+        RtpHeader.TryParse(SimulcastTestPackets.Plain(baseSsrc + flood - 1, seq: 2, ts: 180), out var late)
+            .Should().BeTrue();
+        classifier.TryClassify(late, out var lateResult).Should().BeFalse();
+        lateResult.Should().Be(default(RtpLayerClassification));
+    }
+
+    [Fact]
     public void Reset_ForgetsLearnedBindings()
     {
         var classifier = NewClassifier();
