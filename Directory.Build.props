@@ -11,7 +11,8 @@
     <IsPackable>false</IsPackable>
     <PackageId>Proxeno.$(MSBuildProjectName)</PackageId>
     <!-- Default package version. The pack workflow overrides this with the git tag at release time
-         (see .github/workflows/pack.yml); PR 3 ships the additive public transceiver API as 0.3.0. -->
-    <VersionPrefix>0.3.0</VersionPrefix>
+         (see .github/workflows/pack.yml). 0.3.1 ships the DoS-hardening fixes from the security review
+         (SCTP/RTP/SRTP per-source bounds, ICE consent freshness) on top of 0.3.0's public API. -->
+    <VersionPrefix>0.3.1</VersionPrefix>
   </PropertyGroup>
 </Project>
