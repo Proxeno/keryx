@@ -258,6 +258,139 @@ public sealed class PeerConnectionLoopbackTests
     }
 
     [Fact]
+    public async Task GetStatsReportExposesW3CShapedEntriesAfterMediaFlows()
+    {
+        var cancellationToken = new CancellationTokenSource(TimeSpan.FromSeconds(50)).Token;
+
+        await using var offerer = new PeerConnection(TestSupport.NewConfig());
+        await using var answerer = new PeerConnection(TestSupport.NewConfig());
+
+        offerer.OnLocalIceCandidate += (_, e) => answerer.AddIceCandidate(e.Candidate, e.SdpMid);
+        answerer.OnLocalIceCandidate += (_, e) => offerer.AddIceCandidate(e.Candidate, e.SdpMid);
+
+        var videoPacketsReceived = 0;
+        var audioPacketsReceived = 0;
+        answerer.OnRtpPacketReceived += (in RtpPacketInfo info, ReadOnlySpan<byte> payload) =>
+        {
+            switch (info.Kind)
+            {
+                case MediaKind.Video:
+                    Interlocked.Increment(ref videoPacketsReceived);
+                    break;
+                case MediaKind.Audio:
+                    Interlocked.Increment(ref audioPacketsReceived);
+                    break;
+                default:
+                    break;
+            }
+        };
+
+        // ---------------------------------------------------------------- signalling + connect
+        var offer = await offerer.CreateOfferAsync(cancellationToken);
+        await answerer.SetRemoteDescriptionAsync(offer, SdpType.Offer, cancellationToken);
+        var answer = await answerer.CreateAnswerAsync(cancellationToken);
+        await offerer.SetRemoteDescriptionAsync(answer, SdpType.Answer, cancellationToken);
+
+        (await offerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+        (await answerer.WaitForConnectedAsync(ConnectTimeout, cancellationToken)).Should().BeTrue();
+
+        // ---------------------------------------------------------------- media
+        var accessUnits = H264TestStream.ReadAccessUnits(30);
+        var timestamp = 0u;
+        foreach (var accessUnit in accessUnits)
+        {
+            offerer.SendVideoFrame(accessUnit, timestamp).Should().BeGreaterThan(0);
+            timestamp += 90000 / 30;
+            await Task.Delay(5, cancellationToken);
+        }
+
+        var opusPacket = new byte[80];
+        Random.Shared.NextBytes(opusPacket);
+        opusPacket[0] = 0xFC;
+        for (var i = 0; i < 50; i++)
+        {
+            offerer.SendAudioFrame(opusPacket, (uint)(i * 960)).Should().Be(1);
+            await Task.Delay(2, cancellationToken);
+        }
+
+        (await TestSupport.WaitForAsync(() =>
+            Volatile.Read(ref videoPacketsReceived) > 0 && Volatile.Read(ref audioPacketsReceived) >= 45)).Should().BeTrue();
+
+        // Let the periodic RTCP exchange run so the offerer learns the peer's reception quality.
+        (await TestSupport.WaitForAsync(() => offerer.GetStats().Video?.Quality is not null, 10_000)).Should().BeTrue();
+
+        // ---------------------------------------------------------------- offerer (sender) report
+        var senderReport = offerer.GetStatsReport();
+
+        var outbound = senderReport.OfType<RtcOutboundRtpStreamStats>().ToArray();
+        outbound.Should().HaveCount(2, "the offerer sends one audio and one video stream");
+        var outboundVideo = outbound.Single(s => s.Kind == "video");
+        var outboundAudio = outbound.Single(s => s.Kind == "audio");
+
+        outboundVideo.Ssrc.Should().Be(offerer.VideoSsrc);
+        outboundVideo.PacketsSent.Should().BeGreaterThan(30);
+        outboundVideo.BytesSent.Should().BeGreaterThan(0);
+        outboundVideo.PayloadType.Should().NotBeNull();
+        outboundVideo.CodecId.Should().NotBeNull();
+        outboundAudio.PacketsSent.Should().Be(50);
+        outboundAudio.BytesSent.Should().BeGreaterThan(0);
+
+        // codec entries the outbound streams reference must resolve, and carry a WebRTC MIME type.
+        var videoCodec = senderReport[outboundVideo.CodecId!].Should().BeOfType<RtcCodecStats>().Subject;
+        videoCodec.MimeType.Should().Be("video/H264");
+        videoCodec.ClockRate.Should().Be(90000);
+        videoCodec.PayloadType.Should().Be(outboundVideo.PayloadType!.Value);
+        var audioCodec = senderReport[outboundAudio.CodecId!].Should().BeOfType<RtcCodecStats>().Subject;
+        audioCodec.MimeType.Should().Be("audio/opus");
+
+        // remote-inbound-rtp, learned from the peer's reception report blocks.
+        var remoteInbound = senderReport.OfType<RtcRemoteInboundRtpStreamStats>().ToArray();
+        remoteInbound.Should().NotBeEmpty("the answerer's receiver reports feed remote-inbound-rtp");
+        remoteInbound.Should().Contain(s => s.Ssrc == offerer.VideoSsrc && s.LocalId == outboundVideo.Id);
+
+        // transport + selected candidate pair + its two candidates.
+        var transport = senderReport.OfType<RtcTransportStats>().Single();
+        transport.DtlsState.Should().Be("connected");
+        transport.SrtpCipher.Should().Be("SRTP_AES128_CM_HMAC_SHA1_80");
+        transport.DtlsCipher.Should().NotBeNullOrEmpty();
+        transport.SelectedCandidatePairId.Should().NotBeNull();
+
+        var pair = senderReport.OfType<RtcCandidatePairStats>().Single();
+        pair.Id.Should().Be(transport.SelectedCandidatePairId);
+        pair.Nominated.Should().BeTrue();
+        pair.State.Should().Be("succeeded");
+        senderReport[pair.LocalCandidateId].Should().BeOfType<RtcIceCandidateStats>()
+            .Which.Type.Should().Be("local-candidate");
+        var remoteCandidate = senderReport[pair.RemoteCandidateId].Should().BeOfType<RtcIceCandidateStats>().Subject;
+        remoteCandidate.Type.Should().Be("remote-candidate");
+        remoteCandidate.Protocol.Should().Be("udp");
+        remoteCandidate.Port.Should().BeGreaterThan(0);
+
+        // ---------------------------------------------------------------- answerer (receiver) report
+        var receiverReport = answerer.GetStatsReport();
+
+        var inbound = receiverReport.OfType<RtcInboundRtpStreamStats>().ToArray();
+        inbound.Should().HaveCount(2, "the answerer receives one audio and one video stream");
+        var inboundVideo = inbound.Single(s => s.Kind == "video");
+        var inboundAudio = inbound.Single(s => s.Kind == "audio");
+
+        inboundVideo.Ssrc.Should().Be(offerer.VideoSsrc);
+        inboundVideo.PacketsReceived.Should().BeGreaterThan(0);
+        inboundVideo.PayloadType.Should().NotBeNull();
+        inboundVideo.CodecId.Should().NotBeNull();
+        receiverReport[inboundVideo.CodecId!].Should().BeOfType<RtcCodecStats>()
+            .Which.MimeType.Should().Be("video/H264");
+        inboundAudio.PacketsReceived.Should().BeGreaterThan(0);
+        inboundAudio.Jitter.Should().NotBeNull();
+
+        receiverReport.OfType<RtcTransportStats>().Single().DtlsState.Should().Be("connected");
+        receiverReport.OfType<RtcCandidatePairStats>().Single().Nominated.Should().BeTrue();
+
+        await offerer.CloseAsync();
+        await answerer.CloseAsync();
+    }
+
+    [Fact]
     public async Task ClosingIsIdempotentAndTerminal()
     {
         var cancellationToken = new CancellationTokenSource(TimeSpan.FromSeconds(30)).Token;
