@@ -182,6 +182,67 @@ public sealed class SdpCodec
                 RtcpFeedback.GoogRemb,
                 RtcpFeedback.TransportCc);
 
+    /// <summary>
+    /// VP9 at 90 kHz with <c>nack</c>, <c>nack pli</c>, <c>ccm fir</c>, <c>goog-remb</c> and
+    /// <c>transport-cc</c> feedback, in Chrome's order, and Chrome's <c>profile-id=0</c> fmtp (8-bit 4:2:0).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Bare <c>nack</c> promises retransmission, which Keryx serves over RTX (RFC 4588). Offer this codec
+    /// together with a matching <see cref="Rtx"/> entry — a <c>PeerConnection</c> does that automatically —
+    /// or clear <see cref="Feedback"/> of <see cref="RtcpFeedback.Nack"/> if the m-section will carry no
+    /// repair stream.
+    /// </para>
+    /// <para>
+    /// Sending VP9 routes the negotiated payload type to
+    /// <c>Keryx.Rtp.Packetization.Vp9Packetizer</c>, wired into the same send seam VP8 and H.264 use.
+    /// </para>
+    /// </remarks>
+    /// <param name="payloadType">Payload type.</param>
+    /// <param name="profileId">VP9 profile-id; <c>0</c> is 8-bit 4:2:0, which browsers accept by default.</param>
+    /// <returns>The codec entry.</returns>
+    public static SdpCodec Vp9(int payloadType = 98, string profileId = "0")
+    {
+        ArgumentException.ThrowIfNullOrEmpty(profileId);
+        return new SdpCodec(payloadType, "VP9", 90000)
+            .WithFmtp("profile-id=" + profileId)
+            .WithFeedback(
+                RtcpFeedback.Nack,
+                RtcpFeedback.NackPli,
+                RtcpFeedback.CcmFir,
+                RtcpFeedback.GoogRemb,
+                RtcpFeedback.TransportCc);
+    }
+
+    /// <summary>
+    /// AV1 at 90 kHz with <c>nack</c>, <c>nack pli</c>, <c>ccm fir</c>, <c>goog-remb</c> and
+    /// <c>transport-cc</c> feedback, in Chrome's order, and a minimal <c>level-idx=5;profile=0;tier=0</c>
+    /// fmtp (Main profile, level 3.1, main tier — the AV1 RTP defaults browsers offer).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Bare <c>nack</c> promises retransmission, which Keryx serves over RTX (RFC 4588). Offer this codec
+    /// together with a matching <see cref="Rtx"/> entry — a <c>PeerConnection</c> does that automatically —
+    /// or clear <see cref="Feedback"/> of <see cref="RtcpFeedback.Nack"/> if the m-section will carry no
+    /// repair stream.
+    /// </para>
+    /// <para>
+    /// Sending AV1 routes the negotiated payload type to
+    /// <c>Keryx.Rtp.Packetization.Av1Packetizer</c>, wired into the same send seam VP8 and H.264 use.
+    /// </para>
+    /// </remarks>
+    /// <param name="payloadType">Payload type.</param>
+    /// <returns>The codec entry.</returns>
+    public static SdpCodec Av1(int payloadType = 45) =>
+        new SdpCodec(payloadType, "AV1", 90000)
+            .WithFmtp("level-idx=5;profile=0;tier=0")
+            .WithFeedback(
+                RtcpFeedback.Nack,
+                RtcpFeedback.NackPli,
+                RtcpFeedback.CcmFir,
+                RtcpFeedback.GoogRemb,
+                RtcpFeedback.TransportCc);
+
     /// <summary>An RTX repair codec bound to <paramref name="associatedPayloadType"/> via <c>apt</c>.</summary>
     /// <param name="payloadType">Payload type of the RTX stream.</param>
     /// <param name="associatedPayloadType">Payload type being repaired.</param>
