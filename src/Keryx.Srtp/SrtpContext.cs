@@ -20,18 +20,23 @@ public sealed class SrtpContext : IDisposable
     /// <param name="localKeys">Master key and salt used to protect outbound packets.</param>
     /// <param name="remoteKeys">Master key and salt used to unprotect inbound packets.</param>
     /// <param name="logger">Optional logger; defaults to <see cref="NullLogger"/>.</param>
+    /// <param name="maxReceiveSources">
+    /// Upper bound on the distinct inbound SSRCs the context keeps per-stream state for; see
+    /// <see cref="SrtpDecryptContext.DefaultMaxReceiveSources"/>.
+    /// </param>
     public SrtpContext(
         SrtpProtectionProfile profile,
         SrtpSessionKeys localKeys,
         SrtpSessionKeys remoteKeys,
-        IKeryxLogger? logger = null)
+        IKeryxLogger? logger = null,
+        int maxReceiveSources = SrtpDecryptContext.DefaultMaxReceiveSources)
     {
         ArgumentNullException.ThrowIfNull(profile);
         Profile = profile;
         Outbound = new SrtpEncryptContext(profile, localKeys, logger);
         try
         {
-            Inbound = new SrtpDecryptContext(profile, remoteKeys, logger);
+            Inbound = new SrtpDecryptContext(profile, remoteKeys, logger, maxReceiveSources);
         }
         catch
         {
@@ -51,14 +56,19 @@ public sealed class SrtpContext : IDisposable
     /// </param>
     /// <param name="role">Whether the local endpoint was the DTLS client or server.</param>
     /// <param name="logger">Optional logger; defaults to <see cref="NullLogger"/>.</param>
+    /// <param name="maxReceiveSources">
+    /// Upper bound on the distinct inbound SSRCs the context keeps per-stream state for; see
+    /// <see cref="SrtpDecryptContext.DefaultMaxReceiveSources"/>.
+    /// </param>
     public static SrtpContext CreateFromDtlsKeyingMaterial(
         SrtpProtectionProfile profile,
         ReadOnlySpan<byte> keyingMaterial,
         DtlsSrtpRole role,
-        IKeryxLogger? logger = null)
+        IKeryxLogger? logger = null,
+        int maxReceiveSources = SrtpDecryptContext.DefaultMaxReceiveSources)
     {
         var pair = DtlsSrtpKeyMaterial.Split(profile, keyingMaterial, role);
-        return new SrtpContext(profile, pair.Local, pair.Remote, logger);
+        return new SrtpContext(profile, pair.Local, pair.Remote, logger, maxReceiveSources);
     }
 
     /// <summary>The protection profile in force.</summary>
