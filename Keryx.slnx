@@ -14,6 +14,7 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Keryx.Benchmarks/Keryx.Benchmarks.csproj" />
     <Project Path="benchmarks/Keryx.ScaleHarness/Keryx.ScaleHarness.csproj" />
+    <Project Path="benchmarks/Keryx.ScalingSpike/Keryx.ScalingSpike.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Keryx.Core.Tests/Keryx.Core.Tests.csproj" />
