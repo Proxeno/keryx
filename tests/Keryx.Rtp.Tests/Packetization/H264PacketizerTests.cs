@@ -263,6 +263,67 @@ public class H264PacketizerTests
     }
 
     [Fact]
+    public void Depacketizer_rejects_a_max_access_unit_size_smaller_than_the_initial_capacity()
+    {
+        var act = () => new H264Depacketizer(initialCapacity: 1024, maxAccessUnitSize: 512);
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void Depacketizer_bounds_accumulation_when_the_marker_bit_is_withheld_and_recovers_after_the_cap()
+    {
+        // Growth per NAL is 4 (start code) + 32 = 36 bytes; a 216-byte cap holds exactly 6 of them,
+        // so every 7th payload overflows the cap and resets the accumulator. 35 iterations is exactly
+        // five such cycles, so the accumulator is guaranteed empty once the loop ends.
+        const int cap = 216;
+        var depacketizer = new H264Depacketizer(initialCapacity: 32, maxAccessUnitSize: cap);
+        var nal = SyntheticNal(0x01, 32);
+
+        for (var i = 0; i < 35; i++)
+        {
+            depacketizer.TryAddPayload(nal, marker: false, out _).Should().BeFalse();
+            depacketizer.AccessUnit.Length.Should().BeLessThanOrEqualTo(cap);
+        }
+
+        depacketizer.AccessUnit.Length.Should().Be(0);
+
+        // A fresh access unit after the reset still depacketizes normally.
+        var idr = SyntheticNal(0x65, 16);
+        depacketizer.TryAddPayload(idr, marker: true, out var accessUnit).Should().BeTrue();
+        accessUnit.ToArray().Should().Equal(AnnexBAccessUnit(idr));
+    }
+
+    [Fact]
+    public void Depacketizer_rejects_an_absurdly_large_declared_access_unit_without_overflowing()
+    {
+        var depacketizer = new H264Depacketizer(initialCapacity: 1024, maxAccessUnitSize: 1024 * 1024);
+        var hugeNal = SyntheticNal(0x01, 20 * 1024 * 1024); // far beyond the 1 MiB cap
+
+        depacketizer.TryAddPayload(hugeNal, marker: true, out var accessUnit).Should().BeFalse();
+        accessUnit.Length.Should().Be(0);
+        depacketizer.AccessUnit.Length.Should().Be(0);
+    }
+
+    [Fact]
+    public void Depacketizer_reassembles_correctly_with_a_configured_access_unit_cap()
+    {
+        var accessUnit = AnnexBAccessUnit(Sps, Pps, SyntheticNal(0x65, 5000));
+        var payloads = Packetize(accessUnit);
+        var depacketizer = new H264Depacketizer(maxAccessUnitSize: 1024 * 1024);
+
+        byte[]? reconstructed = null;
+        foreach (var payload in payloads)
+        {
+            if (depacketizer.TryAddPayload(payload.Data, payload.Marker, out var unit))
+            {
+                reconstructed = unit.ToArray();
+            }
+        }
+
+        reconstructed.Should().Equal(accessUnit);
+    }
+
+    [Fact]
     public void Packetizer_rejects_a_max_payload_size_too_small_for_a_fu_a_header()
     {
         var packetizer = new H264Packetizer();
