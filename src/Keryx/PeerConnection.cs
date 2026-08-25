@@ -940,6 +940,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
             MinPort = _config.MinPort,
             MaxPort = _config.MaxPort,
             Logger = _logger,
+            RelayOnly = _config.RelayOnly,
         };
 
         foreach (var server in _config.StunServers)

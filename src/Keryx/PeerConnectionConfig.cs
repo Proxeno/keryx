@@ -43,6 +43,17 @@ public sealed class PeerConnectionConfig
     public IList<TurnServerOptions> TurnServers { get; } = [];
 
     /// <summary>
+    /// Restricts this connection to a relayed candidate only, mirroring a browser's
+    /// <c>iceTransportPolicy: "relay"</c> (see <see cref="Keryx.Ice.IceAgentOptions.RelayOnly"/>).
+    /// Host and server-reflexive candidates are still gathered internally - a host candidate is the
+    /// base a TURN allocation is computed from - but never offered in the SDP or paired against a
+    /// remote candidate, so the session can only connect through a <see cref="TurnServers"/>
+    /// allocation. Off by default; requires at least one <see cref="TurnServers"/> entry to be of any
+    /// use.
+    /// </summary>
+    public bool RelayOnly { get; set; }
+
+    /// <summary>
     /// The local address to bind. Null binds every up, non-loopback IPv4 interface; set it to
     /// <see cref="IPAddress.Loopback"/> to keep a session on the loopback interface.
     /// </summary>

@@ -16,7 +16,7 @@ jobs:
       # coverage rather than a no-op.
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
-      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=Soak"
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=TurnRelayInterop&Category!=Soak"
 
   # Browser interop, CI-enforced. This job installs a headless Chrome, so the ChromeInterop tests
   # (excluded from build-test above) MUST actually run here. KERYX_REQUIRE_CHROME=1 turns a missing
@@ -148,5 +148,54 @@ jobs:
       - run: dotnet build Keryx.slnx --configuration Release
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=PionInterop"
         env:
+          KERYX_REQUIRE_PION: "1"
+          KERYX_PION_PEER: ${{ github.workspace }}/tests/interop/pion/pion-peer
+
+  # TURN-relay interop, CI-enforced. Every other interop lane above (Chrome, Firefox, pion) runs a
+  # host-candidate-only loopback path — no STUN, TURN or mDNS — so none of them ever proves a
+  # relayed candidate pair against a real second implementation; Keryx.Turn.Tests.CoturnInteropTests
+  # proves Keryx's own TURN client against coturn at the ICE-agent level, but nothing forces a full
+  # PeerConnection session through a coturn relay end to end. This job installs both coturn and Go
+  # and builds the pion peer, so the TurnRelayInterop test (excluded from build-test above) MUST
+  # actually run here.
+  #
+  # Both sides are restricted to the relay only, so the only path that can possibly connect is
+  # through coturn's allocation: the pion peer is launched with -turn-url pointing at coturn and
+  # sets webrtc.ICETransportPolicyRelay (pion's exact equivalent of a browser's
+  # iceTransportPolicy: "relay" — see tests/interop/pion/main.go), and the Keryx side sets
+  # PeerConnectionConfig.RelayOnly, which withholds every host/server-reflexive candidate from the
+  # offer/answer and the pairing table (see IceAgent.RebuildPairsLocked) while still gathering them
+  # internally as the TURN allocation's required base. The test asserts an H.264 + data-channel
+  # session completes and that the pair Keryx actually selected is a relayed one
+  # (PeerConnection.GetStatsReport()'s local-candidate CandidateType == "relay"), not merely that
+  # the handshake succeeded.
+  #
+  # KERYX_REQUIRE_TURN_RELAY=1 turns a missing/unusable coturn into a failure instead of the graceful
+  # skip local dev gets; KERYX_REQUIRE_PION=1 does the same for a missing Go toolchain or unbuildable
+  # peer, so either half of this lane going missing fails the build rather than silently passing.
+  turn-relay-interop:
+    runs-on: ubuntu-latest
+    # Safety bound: the TurnRelayInterop test carries its own ~75s handshake deadline, so a healthy
+    # run finishes in a couple of minutes. This ceiling guarantees a future regression can never hang
+    # the job for the six-hour GitHub default and burn CI minutes.
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: sudo apt-get update && sudo apt-get install -y coturn
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Build pion peer
+        working-directory: tests/interop/pion
+        run: |
+          go mod tidy
+          go build -o pion-peer .
+      - run: dotnet build Keryx.slnx --configuration Release
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=TurnRelayInterop"
+        env:
+          KERYX_REQUIRE_TURN_RELAY: "1"
           KERYX_REQUIRE_PION: "1"
           KERYX_PION_PEER: ${{ github.workspace }}/tests/interop/pion/pion-peer

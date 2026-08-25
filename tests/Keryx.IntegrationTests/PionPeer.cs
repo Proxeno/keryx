@@ -180,8 +180,26 @@ internal static class PionPeer
     /// <param name="signalUrl">The base signaling URL, e.g. <c>http://127.0.0.1:7984</c>.</param>
     /// <param name="portMin">Lowest UDP port the peer may bind for ICE host candidates.</param>
     /// <param name="portMax">Highest UDP port the peer may bind.</param>
+    /// <param name="turnUrl">
+    /// A TURN server URL (e.g. <c>turn:127.0.0.1:7996</c>). When supplied, along with
+    /// <paramref name="turnUser"/> and <paramref name="turnPassword"/>, the peer is launched in
+    /// TURN-relay-only mode: it sets that server as its sole ICE server and
+    /// <c>webrtc.ICETransportPolicyRelay</c>, pion's equivalent of a browser's
+    /// <c>iceTransportPolicy: "relay"</c>, so <paramref name="portMin"/>/<paramref name="portMax"/>
+    /// bound the socket it reaches the TURN server on rather than any host candidate (relay-only
+    /// gathers none). Null runs the plain loopback-host-candidates mode instead.
+    /// </param>
+    /// <param name="turnUser">The TURN long-term credential username; required with <paramref name="turnUrl"/>.</param>
+    /// <param name="turnPassword">The TURN long-term credential password; required with <paramref name="turnUrl"/>.</param>
     /// <returns>The started process.</returns>
-    internal static Process Launch(string executablePath, string signalUrl, int portMin, int portMax)
+    internal static Process Launch(
+        string executablePath,
+        string signalUrl,
+        int portMin,
+        int portMax,
+        string? turnUrl = null,
+        string? turnUser = null,
+        string? turnPassword = null)
     {
         var peer = new Process
         {
@@ -202,6 +220,16 @@ internal static class PionPeer
                  })
         {
             peer.StartInfo.ArgumentList.Add(arg);
+        }
+
+        if (!string.IsNullOrEmpty(turnUrl))
+        {
+            peer.StartInfo.ArgumentList.Add("-turn-url");
+            peer.StartInfo.ArgumentList.Add(turnUrl);
+            peer.StartInfo.ArgumentList.Add("-turn-user");
+            peer.StartInfo.ArgumentList.Add(turnUser ?? string.Empty);
+            peer.StartInfo.ArgumentList.Add("-turn-pass");
+            peer.StartInfo.ArgumentList.Add(turnPassword ?? string.Empty);
         }
 
         peer.Start();

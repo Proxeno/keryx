@@ -17,6 +17,16 @@
 //
 // The ICE/DTLS-SRTP path is pinned to 127.0.0.1 loopback host candidates only (no STUN/TURN,
 // no mDNS), so it runs on a headless CI runner exactly like the Chrome job.
+//
+// Passing -turn-url switches this into TURN-relay-only mode (the TurnRelayInterop lane): the
+// peer is given that TURN server as its sole ICE server and sets
+// webrtc.ICETransportPolicyRelay, pion's exact equivalent of a browser's
+// `iceTransportPolicy: "relay"`. That makes pion gather (and offer, and check) a relay
+// candidate only - see resolveCandidateTypes in
+// github.com/pion/webrtc/v4/icegatherer.go, which maps ICETransportPolicyRelay straight to
+// ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeRelay}) - so the loopback IP
+// filter below stays correct (the TURN server itself is loopback) and no host/srflx candidate
+// is ever produced to pair against.
 package main
 
 import (
@@ -125,6 +135,9 @@ func main() {
 	role := flag.String("role", "answer", "peer role; only 'answer' (Keryx offers) is implemented")
 	portMin := flag.Int("port-min", 7800, "lowest UDP port to bind for ICE host candidates")
 	portMax := flag.Int("port-max", 7899, "highest UDP port to bind for ICE host candidates")
+	turnURL := flag.String("turn-url", "", "TURN server URL (e.g. turn:127.0.0.1:7996); when set, ICE is restricted to that relay only (iceTransportPolicy=relay)")
+	turnUser := flag.String("turn-user", "", "TURN long-term credential username, required with -turn-url")
+	turnPass := flag.String("turn-pass", "", "TURN long-term credential password, required with -turn-url")
 	flag.Parse()
 
 	if *role != "answer" {
@@ -133,7 +146,7 @@ func main() {
 
 	st := newState(*role)
 
-	pc, err := newPeerConnection(uint16(*portMin), uint16(*portMax))
+	pc, err := newPeerConnection(uint16(*portMin), uint16(*portMax), *turnURL, *turnUser, *turnPass)
 	if err != nil {
 		log.Fatalf("create peer connection: %v", err)
 	}
@@ -163,11 +176,15 @@ func main() {
 }
 
 // newPeerConnection builds an API pinned to 127.0.0.1 loopback host candidates and constructs a
-// PeerConnection with no ICE servers, so DTLS-SRTP/ICE stays a pure loopback path.
-func newPeerConnection(portMin, portMax uint16) (*webrtc.PeerConnection, error) {
+// PeerConnection. With turnURL empty this has no ICE servers, so DTLS-SRTP/ICE stays a pure
+// loopback path (the plain PionInterop lane). With turnURL set, the connection is instead
+// restricted to that one TURN relay: see the package doc comment for how
+// ICETransportPolicyRelay turns into a relay-only candidate policy inside pion.
+func newPeerConnection(portMin, portMax uint16, turnURL, turnUser, turnPass string) (*webrtc.PeerConnection, error) {
 	s := webrtc.SettingEngine{}
 	// Loopback only: include the loopback candidate that pion excludes by default, then filter
-	// every other IP out so 127.0.0.1 is the sole host candidate (no STUN/TURN, no mDNS).
+	// every other IP out so 127.0.0.1 is the sole host/base address (no real STUN/TURN
+	// infrastructure needed - coturn itself listens on 127.0.0.1 too - and no mDNS).
 	s.SetIncludeLoopbackCandidate(true)
 	s.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
 	s.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
@@ -181,7 +198,21 @@ func newPeerConnection(portMin, portMax uint16) (*webrtc.PeerConnection, error) 
 	}
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(s), webrtc.WithMediaEngine(m))
-	return api.NewPeerConnection(webrtc.Configuration{})
+
+	config := webrtc.Configuration{}
+	if turnURL != "" {
+		config.ICEServers = []webrtc.ICEServer{{
+			URLs:       []string{turnURL},
+			Username:   turnUser,
+			Credential: turnPass,
+		}}
+		// The pion equivalent of a browser's iceTransportPolicy: "relay": pion resolves this
+		// straight into ice.WithCandidateTypes([]ice.CandidateType{ice.CandidateTypeRelay}), so
+		// gathering produces (and offers, and checks) a relay candidate only.
+		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
+
+	return api.NewPeerConnection(config)
 }
 
 // wireCallbacks attaches the connection-state, track, and data-channel handlers.

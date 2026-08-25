@@ -214,14 +214,21 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    /// <summary>A snapshot of the gathered local candidates.</summary>
+    /// <summary>
+    /// A snapshot of the gathered local candidates. When <see cref="IceAgentOptions.RelayOnly"/> is
+    /// set, the host and server-reflexive candidates gathered internally as TURN allocation bases are
+    /// withheld here - only relayed candidates are exposed, so an SDP built from this list can never
+    /// carry a non-relay candidate.
+    /// </summary>
     public IReadOnlyList<IceCandidate> LocalCandidates
     {
         get
         {
             lock (_lock)
             {
-                return [.. _localCandidates];
+                return _options.RelayOnly
+                    ? [.. _localCandidates.Where(static c => c.Type == IceCandidateType.Relayed)]
+                    : [.. _localCandidates];
             }
         }
     }
@@ -1254,6 +1261,16 @@ public sealed class IceAgent : IDisposable
         }
 
         _logger.Log(KeryxLogLevel.Debug, $"ICE local candidate {candidate}.");
+
+        // RelayOnly withholds a host/server-reflexive candidate from the outside world entirely: it
+        // stays in _localCandidates only as a TURN allocation base (HostCandidateForFamily), it is
+        // never surfaced through the event a PeerConnection turns into a trickled SDP candidate. See
+        // the matching filter on LocalCandidates for the non-trickle (initial offer/answer) path.
+        if (_options.RelayOnly && candidate.Type != IceCandidateType.Relayed)
+        {
+            return;
+        }
+
         _events.Enqueue(() => OnLocalCandidate?.Invoke(this, candidate));
         DrainEvents();
     }
@@ -1908,8 +1925,11 @@ public sealed class IceAgent : IDisposable
         {
             // The direct pair: one per remote candidate, against the highest-priority local
             // candidate that is not relayed. Every non-relayed local candidate shares the one
-            // socket, so pairing them all would only produce duplicate checks.
-            if (FindPairLocked(remote, viaRelay: null) is null)
+            // socket, so pairing them all would only produce duplicate checks. RelayOnly skips this
+            // path entirely - the host/server-reflexive candidates it is built from are gathered only
+            // as TURN allocation bases and must never be checked against, or the agent could connect
+            // directly and never touch the relay it is being asked to prove.
+            if (!_options.RelayOnly && FindPairLocked(remote, viaRelay: null) is null)
             {
                 IceCandidate? local = null;
                 foreach (var candidate in _localCandidates)
