@@ -108,13 +108,15 @@ public sealed class PublicTransceiverApiTests
     }
 
     [Fact]
-    public async Task AddTransceiver_AfterDescription_Throws()
+    public async Task AddTransceiver_AfterDescription_IsAllowed()
     {
         await using var peer = new PeerConnection(TestSupport.NewConfig());
         _ = await peer.CreateOfferAsync(TestTimeout());
 
-        var act = () => peer.AddTransceiver(MediaKind.Video);
-        act.Should().Throw<InvalidOperationException>("adding a transceiver mid-session is not supported yet");
+        // A mid-session add no longer throws (session-model.md §4.2): it joins the set and is offered on
+        // the next negotiation. Full add/remove-across-renegotiation coverage lives in RenegotiationTests.
+        var added = peer.AddTransceiver(MediaKind.Video, MediaDirection.SendOnly);
+        peer.Transceivers.Should().Contain(added);
     }
 
     [Fact]

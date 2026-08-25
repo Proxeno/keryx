@@ -47,6 +47,14 @@ public sealed partial class PeerConnection
     /// </summary>
     public event EventHandler? OnNegotiationNeeded;
 
+    /// <summary>The connection lock, exposed so a <see cref="RtpTransceiver"/> can serialise its own
+    /// state transitions (e.g. <see cref="RtpTransceiver.Stop"/>) against the negotiation machinery.</summary>
+    internal object NegotiationLock => _lock;
+
+    /// <summary>Re-runs the negotiation-needed check after a transceiver dirties the set (e.g. a
+    /// <see cref="RtpTransceiver.Stop"/>); raises <see cref="OnNegotiationNeeded"/> when appropriate.</summary>
+    internal void RaiseNegotiationNeeded() => UpdateNegotiationNeeded();
+
     /// <summary>Logs and raises <see cref="OnSignalingStateChanged"/>. Must be called with the lock released.</summary>
     private void RaiseSignalingStateChanged(SignalingState state)
     {
@@ -90,7 +98,10 @@ public sealed partial class PeerConnection
             var needed = false;
             foreach (var transceiver in _transceivers)
             {
-                if (!transceiver.Stopped && transceiver.NegotiationPending)
+                // A transceiver is pending whenever its current state (added, or stopped) is not yet
+                // reflected in a generated local description — a stop needs a renegotiation just as an
+                // add does, to re-emit the slot as a rejected section (session-model.md §4.2).
+                if (transceiver.NegotiationPending)
                 {
                     needed = true;
                     break;

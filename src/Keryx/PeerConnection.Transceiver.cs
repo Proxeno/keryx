@@ -25,6 +25,12 @@ public sealed partial class PeerConnection
     // in the constructor (a field initializer cannot reference another instance field).
     private readonly System.Collections.ObjectModel.ReadOnlyCollection<RtpTransceiver> _transceiversView;
 
+    // A lock-free immutable copy of the transceiver set, swapped whole under _lock whenever a transceiver
+    // is appended. The receive path resolves a packet's transceiver by mid (GetTransceiver) per packet,
+    // and a mid-session renegotiation can append a transceiver concurrently — reading this array snapshot
+    // rather than iterating the live list keeps that hot path allocation- and lock-free and race-free.
+    private volatile RtpTransceiver[] _transceiverSnapshot = [];
+
     // Cached first-of-kind handles for the legacy per-kind shim. "First of kind" is exact and stable
     // because the constructor creates the video transceiver before the audio one, so for every existing
     // single-video/single-audio consumer the first-of-kind transceiver is the only one of its kind.
@@ -37,9 +43,11 @@ public sealed partial class PeerConnection
     private bool _transceiverApiUsed;
 
     // Every local media and RTX SSRC mapped to the sender that owns it, with a flag marking RTX SSRCs.
-    // Read-mostly: senders are appended before negotiation, and thereafter the RTCP receive loop resolves
-    // "whose packet is this" by SSRC (session-model.md §1.5) without locking.
-    private readonly Dictionary<uint, LocalSsrcOwner> _localSsrcOwners = [];
+    // Read-mostly and swapped whole: the RTCP receive loop resolves "whose packet is this" by SSRC
+    // (session-model.md §1.5) lock-free, while a mid-session renegotiation may append a sender's SSRCs
+    // from the negotiation thread — so an append builds a new dictionary and publishes it atomically
+    // rather than mutating the live one under the reader.
+    private volatile Dictionary<uint, LocalSsrcOwner> _localSsrcOwners = [];
 
     /// <summary>
     /// Raised when applying a remote offer binds or creates a transceiver this application did not
@@ -51,11 +59,12 @@ public sealed partial class PeerConnection
 
     /// <summary>Every transceiver, in m-line order. The data channel is not a transceiver.</summary>
     /// <remarks>
-    /// This is a read-only view over the live set, not a snapshot: it reflects transceivers auto-created
-    /// while a remote offer is applied. Because both shipping consumers add transceivers before the first
-    /// negotiation and never renegotiate, that mutation is confined to <see cref="SetRemoteDescriptionAsync"/>
-    /// on the answerer; enumerate the collection off that path (before applying an offer, or after the
-    /// answer is built) rather than concurrently with it.
+    /// This is a read-only view over the live set, not a snapshot: it reflects transceivers appended by a
+    /// mid-session <see cref="AddTransceiver"/> and ones auto-created while a remote offer is applied. The
+    /// set is only ever appended to (never reordered or removed from — a stopped transceiver keeps its
+    /// slot), so an index, once observed, stays valid; enumerate the collection off the negotiation path
+    /// rather than concurrently with an add. The internal receive and diagnostic paths read a lock-free
+    /// snapshot instead, so they are unaffected by a concurrent add.
     /// </remarks>
     public IReadOnlyList<RtpTransceiver> Transceivers => _transceiversView;
 
@@ -65,7 +74,10 @@ public sealed partial class PeerConnection
     public RtpTransceiver? GetTransceiver(string mid)
     {
         ArgumentNullException.ThrowIfNull(mid);
-        foreach (var transceiver in _transceivers)
+
+        // Read the lock-free snapshot: this runs per packet on the receive path, concurrently with a
+        // possible mid-session append.
+        foreach (var transceiver in _transceiverSnapshot)
         {
             if (string.Equals(transceiver.Mid, mid, StringComparison.Ordinal))
             {
@@ -80,15 +92,18 @@ public sealed partial class PeerConnection
     /// Adds a transceiver for a media kind with an explicit direction (session-model.md §2.2). Its
     /// sender SSRC (and, for video, its rtx SSRC) is allocated immediately, so
     /// <see cref="RtpSender.Ssrc"/> is readable before negotiation; the mid is allocated when the next
-    /// offer is built. Valid before the first negotiation only in this release; adding a transceiver
-    /// after a description has been set throws until renegotiation lands.
+    /// offer is built. Valid before the first negotiation or mid-session: a transceiver added after the
+    /// connection is negotiated appears as a new m-line in the next offer (session-model.md §4.2) and,
+    /// once that renegotiation settles a send codec, streams against the existing SRTP context without a
+    /// rekey (§4.3). Raises <see cref="OnNegotiationNeeded"/> when the machine is
+    /// <see cref="SignalingState.Stable"/>.
     /// </summary>
     /// <param name="kind">The media kind; <see cref="MediaKind.Video"/> or <see cref="MediaKind.Audio"/>.</param>
     /// <param name="direction">The direction this side wants for the m-line.</param>
     /// <param name="init">Optional codec preference, pinned mid, rtx and simulcast declaration.</param>
     /// <returns>The new transceiver.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="kind"/> is not audio or video.</exception>
-    /// <exception cref="InvalidOperationException">A description has already been set, or the connection is closed.</exception>
+    /// <exception cref="InvalidOperationException">The connection is closed.</exception>
     public RtpTransceiver AddTransceiver(
         MediaKind kind,
         MediaDirection direction = MediaDirection.SendRecv,
@@ -114,12 +129,6 @@ public sealed partial class PeerConnection
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
-            if (_localDescription is not null || _remoteDescription is not null)
-            {
-                throw new InvalidOperationException(
-                    "Adding a transceiver after a description has been set (a mid-session add) is not supported yet;"
-                    + " add every transceiver before the first offer or answer.");
-            }
 
             // A pinned mid must be unique across the session, or the offer emits duplicate a=mid lines.
             if (init?.Mid is { } pinnedMid)
@@ -236,6 +245,12 @@ public sealed partial class PeerConnection
     private void AddTransceiverInternal(RtpTransceiver transceiver)
     {
         _transceivers.Add(transceiver);
+
+        // Publish the lock-free snapshot the receive path and the diagnostic readers consult. Callers
+        // hold _lock (the constructor runs single-threaded; every other add is under _lock), so the
+        // whole-array swap is atomic with respect to those readers.
+        _transceiverSnapshot = [.. _transceivers];
+
         switch (transceiver.Kind)
         {
             case MediaKind.Video:
@@ -249,12 +264,24 @@ public sealed partial class PeerConnection
         }
 
         var sender = transceiver.Sender;
-        _localSsrcOwners[sender.Ssrc] = new LocalSsrcOwner(sender, false);
+        var owners = new Dictionary<uint, LocalSsrcOwner>(_localSsrcOwners)
+        {
+            [sender.Ssrc] = new LocalSsrcOwner(sender, false),
+        };
         if (sender.RtxSsrcRaw != 0)
         {
-            _localSsrcOwners[sender.RtxSsrcRaw] = new LocalSsrcOwner(sender, true);
+            owners[sender.RtxSsrcRaw] = new LocalSsrcOwner(sender, true);
         }
+
+        _localSsrcOwners = owners;
     }
+
+    /// <summary>
+    /// The lock-free immutable copy of the transceiver set, for iteration off the negotiation thread. A
+    /// mid-session renegotiation can append a transceiver under <see cref="_lock"/> while a diagnostic or
+    /// timer-thread reader enumerates, so those readers iterate this snapshot rather than the live list.
+    /// </summary>
+    private RtpTransceiver[] SnapshotTransceivers() => _transceiverSnapshot;
 
     /// <summary>The first transceiver of <paramref name="kind"/>, or null when none is of that kind.</summary>
     private RtpTransceiver? FirstTransceiver(MediaKind kind) => kind switch
