@@ -73,6 +73,30 @@ public sealed class PeerConnectionConfig
     public bool GatherTcpCandidates { get; set; }
 
     /// <summary>
+    /// Emit the local description before ICE gathering has finished and trickle the remaining
+    /// candidates (RFC 8838), instead of blocking <see cref="PeerConnection.CreateOfferAsync(System.Threading.CancellationToken)"/>
+    /// and <see cref="PeerConnection.CreateAnswerAsync"/> until every candidate is gathered. Off by
+    /// default, which keeps the "gather, then offer" behaviour and the default golden SDP byte-identical.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// When set, the offer or answer returns promptly carrying whatever candidates were gathered
+    /// synchronously (per JSEP, possibly none) and — because gathering is still in flight — <em>without</em>
+    /// asserting <c>a=end-of-candidates</c>. Gathering then continues on a background task: each new
+    /// candidate is raised through <see cref="PeerConnection.OnLocalIceCandidate"/> for the consumer to
+    /// trickle over its signalling channel, and <see cref="PeerConnection.OnIceGatheringComplete"/> fires
+    /// once gathering finishes — the end-of-candidates signal, at which point the consumer can signal
+    /// end-of-candidates to the peer. The <c>a=ice-options:trickle</c> attribute is present either way.
+    /// </para>
+    /// <para>
+    /// The description is still valid for a vanilla-ICE peer: it just carries fewer (or no) candidates up
+    /// front. Inbound trickled candidates are always accepted via <see cref="PeerConnection.AddIceCandidate"/>,
+    /// independent of this flag.
+    /// </para>
+    /// </remarks>
+    public bool TrickleIceCandidates { get; set; }
+
+    /// <summary>
     /// The local address to bind. Null binds every up, non-loopback IPv4 interface; set it to
     /// <see cref="IPAddress.Loopback"/> to keep a session on the loopback interface.
     /// </summary>
