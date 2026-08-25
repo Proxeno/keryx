@@ -20,19 +20,41 @@ namespace Keryx.Rtp.Packetization;
 /// </remarks>
 public sealed class H264Depacketizer
 {
+    /// <summary>
+    /// Default upper bound on the size, in bytes, of a single access unit under reassembly. A remote
+    /// peer that withholds the marker bit (or spoofs FU-A/STAP-A fragment sizes) would otherwise drive
+    /// <see cref="EnsureCapacity"/> to double the reassembly buffer without limit. 8 MiB is far larger
+    /// than any real H.264 keyframe carried over RTP while still bounding memory.
+    /// </summary>
+    public const int DefaultMaxAccessUnitSize = 8 * 1024 * 1024;
+
     private readonly IKeryxLogger _logger;
+    private readonly int _maxAccessUnitSize;
     private byte[] _buffer;
     private int _length;
     private bool _inFragment;
 
     /// <summary>Creates a depacketizer.</summary>
     /// <param name="initialCapacity">Initial size of the reassembly buffer in bytes.</param>
+    /// <param name="maxAccessUnitSize">
+    /// Upper bound on the size, in bytes, of a single access unit under reassembly. Once reached, the
+    /// in-progress access unit is discarded and further payloads for it are dropped rather than growing
+    /// the buffer further; see <see cref="DefaultMaxAccessUnitSize"/>.
+    /// </param>
     /// <param name="logger">Optional logger; malformed payloads are reported at warning level.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="initialCapacity"/> is not positive.</exception>
-    public H264Depacketizer(int initialCapacity = 64 * 1024, IKeryxLogger? logger = null)
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="initialCapacity"/> is not positive, or <paramref name="maxAccessUnitSize"/> is
+    /// smaller than <paramref name="initialCapacity"/>.
+    /// </exception>
+    public H264Depacketizer(
+        int initialCapacity = 64 * 1024,
+        int maxAccessUnitSize = DefaultMaxAccessUnitSize,
+        IKeryxLogger? logger = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(initialCapacity);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAccessUnitSize, initialCapacity);
         _buffer = new byte[initialCapacity];
+        _maxAccessUnitSize = maxAccessUnitSize;
         _logger = logger ?? NullLogger.Instance;
     }
 
@@ -93,7 +115,11 @@ public sealed class H264Depacketizer
                 return false;
 
             default:
-                AppendNal(payload);
+                if (!AppendNal(payload))
+                {
+                    return false;
+                }
+
                 break;
         }
 
@@ -135,7 +161,11 @@ public sealed class H264Depacketizer
                 return false;
             }
 
-            AppendNal(payload.Slice(offset, size));
+            if (!AppendNal(payload.Slice(offset, size)))
+            {
+                return false;
+            }
+
             offset += size;
         }
 
@@ -158,8 +188,13 @@ public sealed class H264Depacketizer
 
         if (start)
         {
+            if (!EnsureCapacity((long)_length + 4 + 1 + body.Length))
+            {
+                DropAccessUnitTooLarge();
+                return false;
+            }
+
             var reconstructed = (byte)((indicator & 0xE0) | (fuHeader & 0x1F));
-            EnsureCapacity(_length + 4 + 1 + body.Length);
             AnnexB.FourByteStartCode.CopyTo(_buffer.AsSpan(_length));
             _length += 4;
             _buffer[_length++] = reconstructed;
@@ -170,9 +205,10 @@ public sealed class H264Depacketizer
             Warn("Dropping a FU-A continuation fragment with no preceding start fragment.");
             return false;
         }
-        else
+        else if (!EnsureCapacity((long)_length + body.Length))
         {
-            EnsureCapacity(_length + body.Length);
+            DropAccessUnitTooLarge();
+            return false;
         }
 
         body.CopyTo(_buffer.AsSpan(_length));
@@ -186,29 +222,63 @@ public sealed class H264Depacketizer
         return true;
     }
 
-    private void AppendNal(ReadOnlySpan<byte> nal)
+    private bool AppendNal(ReadOnlySpan<byte> nal)
     {
-        EnsureCapacity(_length + 4 + nal.Length);
+        if (!EnsureCapacity((long)_length + 4 + nal.Length))
+        {
+            DropAccessUnitTooLarge();
+            return false;
+        }
+
         AnnexB.FourByteStartCode.CopyTo(_buffer.AsSpan(_length));
         _length += 4;
         nal.CopyTo(_buffer.AsSpan(_length));
         _length += nal.Length;
+        return true;
     }
 
-    private void EnsureCapacity(int required)
+    /// <summary>
+    /// Grows the reassembly buffer, doubling, until it holds at least <paramref name="required"/> bytes.
+    /// </summary>
+    /// <param name="required">
+    /// The byte count as a <see cref="long"/> so a huge fragment/NAL size cannot itself overflow the
+    /// arithmetic before the cap check below runs.
+    /// </param>
+    /// <returns>
+    /// <see langword="false"/> without touching <see cref="_buffer"/> when <paramref name="required"/>
+    /// exceeds <see cref="_maxAccessUnitSize"/>; the caller is responsible for discarding the
+    /// in-progress access unit in that case.
+    /// </returns>
+    private bool EnsureCapacity(long required)
     {
-        if (_buffer.Length >= required)
+        if (required > _maxAccessUnitSize)
         {
-            return;
+            return false;
         }
 
-        var capacity = _buffer.Length;
+        if (_buffer.Length >= required)
+        {
+            return true;
+        }
+
+        // required <= _maxAccessUnitSize <= int.MaxValue here, so this fits in an int; the doubling
+        // below is done in long arithmetic and clamped to the cap, so it can neither overflow nor
+        // grow past _maxAccessUnitSize regardless of the starting capacity.
+        long capacity = _buffer.Length;
         while (capacity < required)
         {
             capacity *= 2;
         }
 
-        Array.Resize(ref _buffer, capacity);
+        capacity = Math.Min(capacity, _maxAccessUnitSize);
+        Array.Resize(ref _buffer, (int)capacity);
+        return true;
+    }
+
+    private void DropAccessUnitTooLarge()
+    {
+        Debug($"Dropping an in-progress H.264 access unit that exceeded the {_maxAccessUnitSize}-byte cap.");
+        Reset();
     }
 
     private void Warn(string message)
@@ -216,6 +286,14 @@ public sealed class H264Depacketizer
         if (_logger.IsEnabled(KeryxLogLevel.Warning))
         {
             _logger.Log(KeryxLogLevel.Warning, message);
+        }
+    }
+
+    private void Debug(string message)
+    {
+        if (_logger.IsEnabled(KeryxLogLevel.Debug))
+        {
+            _logger.Log(KeryxLogLevel.Debug, message);
         }
     }
 }
