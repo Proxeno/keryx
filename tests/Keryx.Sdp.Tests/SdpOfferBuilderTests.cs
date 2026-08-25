@@ -392,6 +392,32 @@ public class SdpOfferBuilderTests
     }
 
     [Fact]
+    public void Vp8_UsesChromesFeedbackOrderAndNoFmtp()
+    {
+        var vp8 = SdpCodec.Vp8();
+
+        vp8.PayloadType.Should().Be(96);
+        vp8.EncodingName.Should().Be("VP8");
+        vp8.ClockRate.Should().Be(90000);
+        vp8.Channels.Should().BeNull();
+        vp8.Fmtp.Should().BeNull();
+        vp8.Feedback.Should().Equal(
+            RtcpFeedback.Nack,
+            RtcpFeedback.NackPli,
+            RtcpFeedback.CcmFir,
+            RtcpFeedback.GoogRemb,
+            RtcpFeedback.TransportCc);
+        vp8.IsRtx.Should().BeFalse();
+        vp8.GetAssociatedPayloadType().Should().BeNull();
+    }
+
+    [Fact]
+    public void Vp8_PayloadTypeIsConfigurable()
+    {
+        SdpCodec.Vp8(98).PayloadType.Should().Be(98);
+    }
+
+    [Fact]
     public void Rtx_BindsToTheRepairedPayloadTypeThroughApt()
     {
         // RFC 4588 §8.1: "apt ... the payload type of the associated original stream".
