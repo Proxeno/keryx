@@ -131,6 +131,27 @@ public sealed class PeerConnectionConfig
     public bool EnableRetransmission { get; set; } = true;
 
     /// <summary>
+    /// Offer proactive forward error correction for video: an RFC 2198 <c>red</c> codec and an RFC 5109
+    /// <c>ulpfec</c> codec per video codec, so a receiver can rebuild an isolated lost media packet from
+    /// the survivors of its protection group without a retransmission round trip. Off by default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Off by default, and opt-in for the same reason the receive jitter buffer, receiver NACK and REMB
+    /// are: enabling it changes the wire shape — extra <c>a=rtpmap:… red/</c> and <c>ulpfec/</c> entries
+    /// and their payload types in the video <c>m=</c> line — so with the flag off the default golden SDP
+    /// stays byte-identical. FEC also spends steady uplink on repair packets whether or not loss occurs,
+    /// which retransmission does not, so it is the right tool only where the path loses packets and the
+    /// round trip is too long for NACK/RTX to repair in time.
+    /// </para>
+    /// <para>
+    /// Audio is deliberately excluded, as with retransmission: Opus repairs isolated loss with its own
+    /// in-band FEC (<c>useinbandfec=1</c>).
+    /// </para>
+    /// </remarks>
+    public bool EnableUlpfec { get; set; }
+
+    /// <summary>
     /// Offer the transport-wide congestion-control header extension
     /// (<c>draft-holmer-rmcat-transport-wide-cc-extensions-01</c>) via <c>a=extmap</c> and, once the
     /// answer keeps it, stamp a monotonically increasing transport-wide sequence number on every
@@ -231,6 +252,18 @@ public sealed class PeerConnectionConfig
     /// unused dynamic payload type, which is what browsers do.
     /// </summary>
     public int? RtxPayloadType { get; set; }
+
+    /// <summary>
+    /// Payload type to advertise for the RFC 2198 <c>red</c> codec when <see cref="EnableUlpfec"/> is set.
+    /// Null picks the lowest unused dynamic payload type, which is what browsers do.
+    /// </summary>
+    public int? RedPayloadType { get; set; }
+
+    /// <summary>
+    /// Payload type to advertise for the RFC 5109 <c>ulpfec</c> codec when <see cref="EnableUlpfec"/> is
+    /// set. Null picks the lowest unused dynamic payload type, which is what browsers do.
+    /// </summary>
+    public int? UlpfecPayloadType { get; set; }
 
     /// <summary>
     /// Retention limits for the ring of recently sent video packets a NACK is served from. The

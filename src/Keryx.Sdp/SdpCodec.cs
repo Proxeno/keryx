@@ -10,6 +10,12 @@ public sealed class SdpCodec
     /// <summary>The encoding name RFC 4588 gives the retransmission payload format.</summary>
     public const string RtxEncodingName = "rtx";
 
+    /// <summary>The encoding name RFC 2198 gives the redundant coding ("RED") payload format.</summary>
+    public const string RedEncodingName = "red";
+
+    /// <summary>The encoding name RFC 5109 gives the uneven level protection FEC payload format.</summary>
+    public const string UlpfecEncodingName = "ulpfec";
+
     /// <summary>The fmtp parameter naming the payload type an rtx entry repairs (RFC 4588 §8.1).</summary>
     public const string AssociatedPayloadTypeParameter = "apt";
 
@@ -35,6 +41,12 @@ public sealed class SdpCodec
 
     /// <summary>True when this entry is an RFC 4588 retransmission codec.</summary>
     public bool IsRtx => string.Equals(EncodingName, RtxEncodingName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when this entry is an RFC 2198 RED codec.</summary>
+    public bool IsRed => string.Equals(EncodingName, RedEncodingName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when this entry is an RFC 5109 ULPFEC codec.</summary>
+    public bool IsUlpfec => string.Equals(EncodingName, UlpfecEncodingName, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The payload type this entry repairs, read from the <c>apt</c> fmtp parameter.</summary>
     /// <returns>The associated payload type, or <see langword="null"/> when there is no usable <c>apt</c>.</returns>
@@ -183,4 +195,25 @@ public sealed class SdpCodec
     public static SdpCodec Rtx(int payloadType, int associatedPayloadType, int clockRate = 90000) =>
         new SdpCodec(payloadType, "rtx", clockRate)
             .WithFmtp("apt=" + associatedPayloadType.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+    /// <summary>
+    /// An RFC 2198 RED codec, which encapsulates a primary media block alongside ULPFEC repair data
+    /// under one payload type. Renders as <c>a=rtpmap:&lt;pt&gt; red/&lt;clock&gt;</c> with no fmtp, as
+    /// browsers advertise it.
+    /// </summary>
+    /// <param name="payloadType">Payload type of the RED stream.</param>
+    /// <param name="clockRate">RTP clock rate, matching the media it wraps.</param>
+    /// <returns>The codec entry.</returns>
+    public static SdpCodec Red(int payloadType, int clockRate = 90000) =>
+        new(payloadType, RedEncodingName, clockRate);
+
+    /// <summary>
+    /// An RFC 5109 ULPFEC codec, the repair payload format RED carries. Renders as
+    /// <c>a=rtpmap:&lt;pt&gt; ulpfec/&lt;clock&gt;</c> with no fmtp, as browsers advertise it.
+    /// </summary>
+    /// <param name="payloadType">Payload type of the ULPFEC stream.</param>
+    /// <param name="clockRate">RTP clock rate, matching the media it protects.</param>
+    /// <returns>The codec entry.</returns>
+    public static SdpCodec Ulpfec(int payloadType, int clockRate = 90000) =>
+        new(payloadType, UlpfecEncodingName, clockRate);
 }
