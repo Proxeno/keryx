@@ -17,11 +17,23 @@ namespace Keryx.Broadcast;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is the transport foundation. Per ingest packet it puts N outbound datagrams on one socket,
-/// which is what lets §3's batched <c>sendmmsg</c> sender have something to batch; today each send is
-/// a direct <see cref="Socket.SendTo(System.ReadOnlySpan{byte},SocketFlags,EndPoint)"/> and the send
-/// seam (<see cref="SendToViewer"/>) is where that batched sender will later slot in without touching
-/// any viewer's ICE/DTLS/SRTP.
+/// This is the transport foundation. Per ingest packet it puts N outbound datagrams on one socket, so
+/// the high-volume media egress flushes them in one <c>sendmmsg</c> via <see cref="SendBatch"/> (§3):
+/// a <see cref="BatchedDatagramSender"/> bound to the shared socket. The low-volume per-viewer control
+/// plane — ICE checks/keepalives, the DTLS handshake, RTCP — still leaves through the per-datagram
+/// send seam (<see cref="SendToViewer"/>, driven by each viewer's <c>IceAgent.SendRaw</c>).
+/// </para>
+/// <para>
+/// <b>Socket send coordination.</b> Two producers now write the one shared socket: the media fan-out
+/// (<see cref="SendBatch"/>, called from the ingest/fan-out thread) and per-viewer control traffic
+/// (<see cref="SendToViewer"/>, called from the receive loop and ICE/DTLS timer threads). A
+/// <see cref="BatchedDatagramSender"/> is <i>not</i> thread-safe — it reuses per-instance native
+/// marshalling buffers — so every send on this endpoint, control and media alike, is serialised
+/// through one <see cref="_sendLock"/>. That single lock is the endpoint's whole concurrency model for
+/// egress: control and media never race the socket or the batch sender's reused buffers, yet because
+/// the control plane is low-volume and each media flush is one bounded <c>sendmmsg</c>, the lock is
+/// held only briefly and control-plane latency is unaffected. The inbound receive loop is lock-free
+/// and independent of the send path (concurrent send + receive on one UDP socket is safe).
 /// </para>
 /// <para>
 /// Baseline packaging is a single socket. <c>SO_REUSEPORT</c> shards (one socket per send worker, all
@@ -34,6 +46,11 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
 {
     private const int ReceiveBufferSize = 2048;
 
+    // A backpressured media flush retries its un-sent tail a few times, then drops the remainder rather
+    // than stall the fan-out on one full socket buffer (broadcast-scale.md §3.1: one viewer's transient
+    // ENOBUFS must never hold up the batch).
+    private const int MaxFlushAttempts = 4;
+
     private readonly BroadcastEndpointOptions _options;
     private readonly IKeryxLogger _logger;
     private readonly Socket _socket;
@@ -41,6 +58,15 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
     private readonly IceExternalSendHandler _send;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _receiveLoop;
+
+    // The one send path for the shared socket. Both the media fan-out (SendBatch) and per-viewer
+    // control traffic (SendToViewer) send under _sendLock: the batch sender reuses native marshalling
+    // buffers and is single-sender-only, so serialising all egress here is what keeps control and media
+    // from racing the socket or those buffers. _batchScratch is the reused BroadcastDatagram -> Datagram
+    // staging array, touched only under the lock.
+    private readonly object _sendLock = new();
+    private readonly BatchedDatagramSender _batchSender;
+    private Datagram[] _batchScratch = [];
 
     // Read-mostly demux state. _byEndPoint routes established 5-tuples (the hot path); _byUfrag is the
     // first-contact index a new viewer's STUN Binding request is matched against. Both are keyed so a
@@ -72,9 +98,13 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
         var bound = (IPEndPoint)_socket.LocalEndPoint!;
         LocalEndPoint = bound;
         _advertisedEndPoint = new IPEndPoint(_options.AdvertisedAddress ?? _options.BindEndPoint.Address, bound.Port);
+        _batchSender = new BatchedDatagramSender(_socket);
         _send = SendToViewer;
         _receiveLoop = Task.Run(() => ReceiveLoopAsync(_cts.Token), CancellationToken.None);
-        _logger.Log(KeryxLogLevel.Info, $"Broadcast endpoint listening on {bound}, advertising {_advertisedEndPoint}.");
+        _logger.Log(
+            KeryxLogLevel.Info,
+            $"Broadcast endpoint listening on {bound}, advertising {_advertisedEndPoint} "
+            + $"(batched send: {(_batchSender.UsesNativeBatchSend ? "native sendmmsg" : "managed fallback")}).");
     }
 
     /// <summary>The shared socket's bound transport address (with the OS-assigned port resolved).</summary>
@@ -164,6 +194,14 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
 
         _cts.Cancel();
         _socket.Close();
+
+        // Free the batch sender's native buffers, but only once no flush is mid-send: taking _sendLock
+        // lets any in-flight SendBatch/SendToViewer complete first (the socket is already closed, so a
+        // late send simply no-ops).
+        lock (_sendLock)
+        {
+            _batchSender.Dispose();
+        }
 
         try
         {
@@ -296,29 +334,136 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
         return true;
     }
 
-    private void SendToViewer(ReadOnlySpan<byte> datagram, IPEndPoint destination)
+    /// <summary>True when the shared socket's batched send path uses the native <c>sendmmsg(2)</c> fast
+    /// path; false when the managed one-syscall-per-datagram fallback is in use (non-Linux, or the
+    /// native symbol was unavailable).</summary>
+    public bool UsesNativeBatchSend => _batchSender.UsesNativeBatchSend;
+
+    /// <summary>
+    /// Flushes one fan-out batch — the per-viewer datagrams a <c>BroadcastFanout</c> pass produced for
+    /// this ingest packet — out of the shared socket in as few syscalls as possible: one
+    /// <c>sendmmsg(2)</c> on Linux, a managed <see cref="Socket.SendTo(System.ReadOnlySpan{byte},SocketFlags,EndPoint)"/>
+    /// loop elsewhere. This is the high-volume media egress; it bypasses the per-datagram control seam
+    /// (<see cref="SendToViewer"/>) precisely so the fan-out can batch.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Serialised against control traffic and other flushes through the endpoint's single send lock
+    /// (see the type remarks): the batch sender is not thread-safe, so callers may invoke this from any
+    /// thread, but each call takes the lock for the duration of its flush. Call it once per ingest
+    /// packet with that packet's whole fan-out; it never throws for a per-datagram send error.
+    /// </para>
+    /// <para>
+    /// Each datagram's <see cref="BroadcastDatagram.Payload"/> is read in place (a window into the
+    /// owning subscriber's output buffer) and must stay valid for the duration of the call — do not
+    /// begin the next fan-out pass for these subscribers until <see cref="SendBatch"/> returns.
+    /// </para>
+    /// </remarks>
+    /// <param name="datagrams">The fan-out's produced datagrams: per-viewer payload plus destination.</param>
+    /// <returns>The number of leading datagrams accepted by the kernel; a short count means the socket
+    /// send buffer filled and the un-sent tail was dropped for this packet.</returns>
+    public int SendBatch(IReadOnlyList<BroadcastDatagram> datagrams)
     {
-        // The mirror of Normalize on the way out: a dual-stack v6 socket cannot send to a native IPv4
-        // endpoint, so map an IPv4 destination to its v4-mapped v6 form first.
-        if (_socket.AddressFamily == AddressFamily.InterNetworkV6
-            && destination.AddressFamily == AddressFamily.InterNetwork)
+        ArgumentNullException.ThrowIfNull(datagrams);
+
+        var count = datagrams.Count;
+        if (count == 0)
         {
-            destination = new IPEndPoint(destination.Address.MapToIPv6(), destination.Port);
+            return 0;
         }
 
+        lock (_sendLock)
+        {
+            if (_batchScratch.Length < count)
+            {
+                _batchScratch = new Datagram[count];
+            }
+
+            for (var i = 0; i < count; i++)
+            {
+                var datagram = datagrams[i];
+                var destination = datagram.Destination is IPEndPoint ip
+                    ? NormalizeOutbound(ip)
+                    : datagram.Destination;
+                _batchScratch[i] = new Datagram(datagram.Payload, destination);
+            }
+
+            return FlushLocked(count);
+        }
+    }
+
+    // Drain the staged batch through the shared socket's sender. Held under _sendLock. A partial send
+    // (backpressure) retries the un-sent tail a bounded number of times, then drops it: a fan-out must
+    // never stall on one full socket buffer. Never throws for a send error.
+    private int FlushLocked(int count)
+    {
+        var total = 0;
+        var attempts = 0;
         try
         {
-            _socket.SendTo(datagram, SocketFlags.None, destination);
+            while (total < count)
+            {
+                var sent = _batchSender.Send(_batchScratch.AsSpan(total, count - total));
+                total += sent;
+                if (total >= count || ++attempts >= MaxFlushAttempts)
+                {
+                    break;
+                }
+            }
         }
         catch (SocketException ex)
         {
-            _logger.Log(KeryxLogLevel.Warning, $"Failed to send a broadcast datagram to {destination}.", ex);
+            // A non-transient rejection (e.g. EMSGSIZE) of the datagram at the front of the window;
+            // those ahead of it already went out. Drop the rest of this packet's batch and count it.
+            _logger.Log(KeryxLogLevel.Warning, "A broadcast fan-out batch was truncated by a send error.", ex);
         }
         catch (ObjectDisposedException)
         {
-            // The endpoint was disposed while a send was in flight.
+            // The endpoint was disposed while a flush was in flight.
+        }
+
+        if (total < count)
+        {
+            _logger.Log(
+                KeryxLogLevel.Trace,
+                $"Broadcast fan-out flush sent {total}/{count} datagrams; the tail was dropped (send buffer full).");
+        }
+
+        return total;
+    }
+
+    private void SendToViewer(ReadOnlySpan<byte> datagram, IPEndPoint destination)
+    {
+        var to = NormalizeOutbound(destination);
+        lock (_sendLock)
+        {
+            try
+            {
+                _socket.SendTo(datagram, SocketFlags.None, to);
+            }
+            catch (SocketException ex)
+            {
+                _logger.Log(KeryxLogLevel.Warning, $"Failed to send a broadcast datagram to {to}.", ex);
+            }
+            catch (ObjectDisposedException)
+            {
+                // The endpoint was disposed while a send was in flight.
+            }
         }
     }
+
+    // The mirror of Normalize on the way out: a dual-stack v6 socket cannot send to a native IPv4
+    // endpoint, so map an IPv4 destination to its v4-mapped v6 form first.
+    private IPEndPoint NormalizeOutbound(IPEndPoint destination)
+        => _socket.AddressFamily == AddressFamily.InterNetworkV6
+            && destination.AddressFamily == AddressFamily.InterNetwork
+            ? new IPEndPoint(destination.Address.MapToIPv6(), destination.Port)
+            : destination;
+
+    // Test seam: drives the coordinated control-plane send path (the SendToViewer half of the send
+    // lock) directly, so a stress test can pound control traffic concurrently with SendBatch media.
+    internal void SendControlForTest(byte[] datagram, IPEndPoint destination)
+        => SendToViewer(datagram, destination);
 
     private static Socket CreateSocket(IPEndPoint bind)
     {
