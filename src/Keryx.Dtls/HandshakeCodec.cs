@@ -177,6 +177,21 @@ internal static class HandshakeCodec
         return hello;
     }
 
+    /// <summary>
+    /// Builds a HelloVerifyRequest body (RFC 6347 §4.2.1): <c>server_version</c> followed by an
+    /// opaque <c>cookie&lt;0..255&gt;</c>. The version is not used by the peer — Keryx's client parser
+    /// ignores it — so DTLS 1.2 is written for consistency with the rest of the flight.
+    /// </summary>
+    public static byte[] BuildHelloVerifyRequest(ReadOnlySpan<byte> cookie)
+    {
+        var buffer = new byte[3 + cookie.Length];
+        var writer = new ByteWriter(buffer);
+        writer.WriteU16(ProtocolVersions.Dtls12);
+        writer.WriteU8((byte)cookie.Length);
+        writer.WriteBytes(cookie);
+        return writer.Written.ToArray();
+    }
+
     public static byte[] ParseHelloVerifyRequestCookie(ReadOnlySpan<byte> body)
     {
         var reader = new ByteReader(body);

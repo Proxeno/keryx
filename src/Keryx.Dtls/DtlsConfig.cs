@@ -52,6 +52,22 @@ public sealed class DtlsConfig
     public bool RequirePeerCertificate { get; init; } = true;
 
     /// <summary>
+    /// As a server, answer the first (cookieless) <c>ClientHello</c> with a
+    /// <c>HelloVerifyRequest</c> carrying a stateless cookie and only continue once the client
+    /// echoes a valid cookie in a second <c>ClientHello</c> (RFC 6347 §4.2.1).
+    /// </summary>
+    /// <remarks>
+    /// The cookie round-trip proves the client can receive at its claimed source before the server
+    /// allocates any handshake state, which is the anti-spoofing / amplification defence a generic
+    /// DTLS server needs. In WebRTC the exchange is unnecessary — DTLS only starts once ICE has
+    /// already validated the peer's address — so this defaults to <see langword="false"/> and the
+    /// WebRTC handshake is byte-for-byte unchanged. Turn it on for non-WebRTC or defence-in-depth
+    /// deployments. It has no effect in the <see cref="DtlsRole.Client"/> role, which already honours
+    /// a server-issued <c>HelloVerifyRequest</c> whether or not this is set.
+    /// </remarks>
+    public bool RequireDtlsCookie { get; init; }
+
+    /// <summary>
     /// Largest datagram Keryx will emit. Clamped to the lower transport's
     /// <see cref="IDatagramTransport.MaxDatagramSize"/>. Defaults to 1200 bytes, the value WebRTC
     /// implementations use to stay inside the path MTU.

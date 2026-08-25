@@ -31,14 +31,22 @@ namespace Keryx.Dtls;
 /// operations on secret material use constant-time comparisons
 /// (<see cref="CryptographicOperations.FixedTimeEquals(ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>);
 /// parsing, state-machine dispatch, and error paths are not constant-time and their timing may
-/// reveal message structure. Session resumption, renegotiation, HelloVerifyRequest cookie
-/// generation as a server, and DTLS 1.0/1.3 are not implemented. Treat it as suitable for WebRTC
+/// reveal message structure. As a server it can issue a HelloVerifyRequest with a stateless cookie
+/// (RFC 6347 §4.2.1) when <see cref="DtlsConfig.RequireDtlsCookie"/> is set; the cookie is verified
+/// in constant time. Session resumption, renegotiation, and DTLS 1.0/1.3 are not implemented. Treat it as suitable for WebRTC
 /// media/data-channel use where ICE has already validated the peer address, and review it yourself
 /// before relying on it in a hostile setting.</para>
 /// </remarks>
 public sealed class DtlsTransport : IDatagramTransport, IDisposable
 {
     private const int RandomLength = 32;
+
+    /// <summary>
+    /// A per-transport random HMAC key for stateless HelloVerifyRequest cookies. Generated once per
+    /// endpoint and never leaves it, so the cookie the server issues can only be verified by the same
+    /// server, and no per-client state has to be stored to remember an outstanding cookie.
+    /// </summary>
+    private readonly byte[] _cookieSecret = RandomNumberGenerator.GetBytes(32);
 
     private readonly IDatagramTransport _lower;
     private readonly DtlsConfig _config;
@@ -403,6 +411,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             {
                 CryptographicOperations.ZeroMemory(_masterSecret);
             }
+
+            CryptographicOperations.ZeroMemory(_cookieSecret);
 
             foreach (var (buffer, _) in _inboundAppData)
             {
@@ -1053,6 +1063,18 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.ProtocolVersion);
         }
 
+        // RFC 6347 §4.2.1 cookie exchange. When enabled, the first ClientHello carries no valid
+        // cookie: answer it with a HelloVerifyRequest and allocate nothing (no ECDHE key, no
+        // negotiated parameters, no master secret) until the client proves it can receive at its
+        // claimed source by echoing the cookie in a second ClientHello. A wrong or missing cookie is
+        // re-challenged, never accepted. In WebRTC ICE has already validated the peer, so this is off
+        // by default and the flow below is entered directly.
+        if (_config.RequireDtlsCookie && !CookieIsValidLocked(hello))
+        {
+            IssueHelloVerifyRequestLocked(hello);
+            return;
+        }
+
         _sawClientHello = true;
 
         if (Array.IndexOf(hello.CompressionMethods, (byte)0) < 0)
@@ -1124,6 +1146,79 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             0));
 
         SendFlightLocked(flight, expectResponse: true);
+    }
+
+    /// <summary>
+    /// Answers a ClientHello that carried no valid cookie with a HelloVerifyRequest (RFC 6347
+    /// §4.2.1). This allocates no connection state: it derives no keys and creates no ECDHE key, so a
+    /// spoofed-source flood costs the server only an HMAC, and the first genuine round-trip is what
+    /// gates any real work. The exchange is deliberately stateless — the server does not run its own
+    /// retransmit timer for the request; the client drives it by resending its ClientHello, which
+    /// re-emits the same cookie through the flight machinery.
+    /// </summary>
+    private void IssueHelloVerifyRequestLocked(ClientHelloMessage hello)
+    {
+        var cookie = ComputeCookie(hello);
+        var body = HandshakeCodec.BuildHelloVerifyRequest(cookie);
+
+        // RFC 6347 §4.2.1: the initial ClientHello and the HelloVerifyRequest are both excluded from
+        // the handshake transcript, which restarts at the second (cookie'd) ClientHello. The dispatch
+        // has already appended this ClientHello, so drop it here — mirroring the client, which resets
+        // its transcript on receiving the HelloVerifyRequest.
+        _transcript.SetLength(0);
+
+        // The HelloVerifyRequest is always message_seq 0 and is NOT built through
+        // NewHandshakeMessageLocked (which would both add it to the transcript and advance the send
+        // sequence). The next server message — the ServerHello sent once the cookie verifies — is
+        // message_seq 1, which is exactly what the client expects after consuming this request.
+        var message = HandshakeMessage.Serialize(HandshakeType.HelloVerifyRequest, 0, body);
+        _nextSendMessageSeq = 1;
+
+        _log.Log(KeryxLogLevel.Debug, $"Issuing a stateless HelloVerifyRequest with a {cookie.Length}-byte cookie.");
+        SendFlightLocked([new FlightItem(ContentType.Handshake, message, 0)], expectResponse: false);
+    }
+
+    /// <summary>
+    /// Constant-time check that <paramref name="hello"/> carries a cookie this server issued for the
+    /// same client parameters. A missing cookie is never valid.
+    /// </summary>
+    private bool CookieIsValidLocked(ClientHelloMessage hello)
+    {
+        if (hello.Cookie.Length == 0)
+        {
+            return false;
+        }
+
+        var expected = ComputeCookie(hello);
+        return CryptographicOperations.FixedTimeEquals(hello.Cookie, expected);
+    }
+
+    /// <summary>
+    /// Computes the stateless cookie: <c>HMAC-SHA256(per-transport secret, client-identity fields)</c>.
+    /// RFC 6347 §4.2.1 binds the cookie to the client's source address and ClientHello parameters; the
+    /// <see cref="IDatagramTransport"/> seam exposes no peer address (ICE has already validated it),
+    /// so the identity bound here is the ClientHello's <c>client_random</c> together with the offered
+    /// version, session_id, cipher_suites and compression_methods — every one of which the client MUST
+    /// reproduce unchanged in its second ClientHello (RFC 6347 §4.2.1), so the cookie round-trips
+    /// deterministically. No per-client state is stored; only the per-transport secret is kept.
+    /// </summary>
+    private byte[] ComputeCookie(ClientHelloMessage hello)
+    {
+        var suites = hello.CipherSuites;
+        var length = 2 + hello.Random.Length + 1 + hello.SessionId.Length + (suites.Length * 2) + hello.CompressionMethods.Length;
+        var buffer = new byte[length];
+        var writer = new ByteWriter(buffer);
+        writer.WriteU16(hello.Version);
+        writer.WriteBytes(hello.Random);
+        writer.WriteU8((byte)hello.SessionId.Length);
+        writer.WriteBytes(hello.SessionId);
+        foreach (var suite in suites)
+        {
+            writer.WriteU16(suite);
+        }
+
+        writer.WriteBytes(hello.CompressionMethods);
+        return HMACSHA256.HashData(_cookieSecret, writer.Written);
     }
 
     private void HandleClientKeyExchangeLocked(byte[] body)
