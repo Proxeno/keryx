@@ -513,4 +513,43 @@ public sealed class PeerConnectionConfig
     /// and prove it against a real browser.
     /// </summary>
     internal IReadOnlyList<ushort>? DtlsOfferedNamedGroups { get; set; }
+
+    // The public-broadcast shared receive keys installed on this connection (spec §5.3). Applied to the
+    // enumerated broadcast SSRCs only; every other SSRC stays on the connection's DTLS-derived keys.
+    private List<Broadcast.PublicBroadcastReceiveKeyInstall>? _broadcastReceiveInstalls;
+
+    internal IReadOnlyList<Broadcast.PublicBroadcastReceiveKeyInstall> BroadcastReceiveInstalls =>
+        _broadcastReceiveInstalls ?? (IReadOnlyList<Broadcast.PublicBroadcastReceiveKeyInstall>)[];
+
+    /// <summary>
+    /// Installs a shared <b>public-broadcast</b> receive key (spec §5.1, §5.3): the connection will use
+    /// <paramref name="export"/>'s key to decrypt inbound media on the named broadcast
+    /// <paramref name="broadcastSsrcs"/>, instead of its own DTLS-derived keys. Everything else on the
+    /// connection — the data channel, RTCP, and any other (e.g. private) m-line — keeps its DTLS keys, so
+    /// the shared key can never be applied to, and its keyholders never forge into, a private stream on
+    /// this transport. Call it again with the same SSRC scope and a later epoch to rotate; the connection
+    /// holds both epochs across the switch.
+    /// </summary>
+    /// <remarks>
+    /// The word "public" is on the type and the method by construction: installing a shared key is an
+    /// assertion that the media it decrypts is public content. This is a Keryx-defined capability with no
+    /// browser interop (spec §5.1) — the key arrives over the viewer's already-authenticated data channel
+    /// as a <see cref="Broadcast.PublicBroadcastKeyMessage"/>.
+    /// </remarks>
+    /// <param name="export">The shared key exported from the broadcast's <see cref="Broadcast.PublicBroadcastKey"/>.</param>
+    /// <param name="broadcastSsrcs">The broadcast SSRC(s) the key decrypts. Must be non-empty.</param>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="broadcastSsrcs"/> is empty.</exception>
+    public void InstallPublicBroadcastReceiveKey(Broadcast.PublicBroadcastKeyExport export, params uint[] broadcastSsrcs)
+    {
+        ArgumentNullException.ThrowIfNull(export);
+        ArgumentNullException.ThrowIfNull(broadcastSsrcs);
+        if (broadcastSsrcs.Length == 0)
+        {
+            throw new ArgumentException("A public-broadcast receive key must be scoped to at least one SSRC.", nameof(broadcastSsrcs));
+        }
+
+        (_broadcastReceiveInstalls ??= []).Add(new Broadcast.PublicBroadcastReceiveKeyInstall(export, [.. broadcastSsrcs]));
+    }
 }
+

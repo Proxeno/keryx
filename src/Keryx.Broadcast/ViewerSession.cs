@@ -18,6 +18,7 @@ public sealed class ViewerSession
 {
     private readonly object _lock = new();
     private readonly List<IPEndPoint> _boundEndPoints = [];
+    private object? _sharedKeyTier;
 
     internal ViewerSession(string id, PeerConnection connection, string localIceUfrag)
     {
@@ -74,6 +75,43 @@ public sealed class ViewerSession
             var snapshot = _boundEndPoints.ToArray();
             _boundEndPoints.Clear();
             return snapshot;
+        }
+    }
+
+    internal void CopyBoundEndPointsTo(List<IPEndPoint> destination)
+    {
+        lock (_lock)
+        {
+            destination.AddRange(_boundEndPoints);
+        }
+    }
+
+    // Claims this session for exactly one shared-key broadcast tier (spec §5.4 invariant: a session is
+    // never enrolled into two different broadcasts' shared keys). Returns true if the session is now
+    // owned by <paramref name="tier"/> (either freshly claimed or already claimed by it); false if it is
+    // already claimed by a different tier.
+    internal bool TryClaimSharedKeyTier(object tier)
+    {
+        lock (_lock)
+        {
+            if (_sharedKeyTier is null || ReferenceEquals(_sharedKeyTier, tier))
+            {
+                _sharedKeyTier = tier;
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    internal void ReleaseSharedKeyTier(object tier)
+    {
+        lock (_lock)
+        {
+            if (ReferenceEquals(_sharedKeyTier, tier))
+            {
+                _sharedKeyTier = null;
+            }
         }
     }
 }

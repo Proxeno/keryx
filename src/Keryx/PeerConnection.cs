@@ -104,6 +104,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private DtlsTransport? _dtls;
     private SctpAssociation? _sctp;
     private SrtpContext? _srtp;
+    private readonly Broadcast.PublicBroadcastReceiveKeys? _broadcastReceive;
     private Task? _driver;
 
     // Trickle mode only (PeerConnectionConfig.TrickleIceCandidates): the background task gathering ICE
@@ -160,6 +161,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
         // own the pre-allocated SSRCs and track ids, so the per-kind identity accessors resolve to them.
         _transceiversView = new System.Collections.ObjectModel.ReadOnlyCollection<RtpTransceiver>(_transceivers);
         BuildLegacyTransceivers();
+
+        // Shared-key public-broadcast receive keys (spec §5.3), if any were installed on the config. These
+        // are independent of the DTLS handshake — the whole point is that they are not DTLS-derived — so
+        // they are built at construction and consulted, SSRC-scoped, on the RTP receive path.
+        if (_config.BroadcastReceiveInstalls.Count > 0)
+        {
+            var receiveKeys = new Broadcast.PublicBroadcastReceiveKeys(_logger);
+            foreach (var install in _config.BroadcastReceiveInstalls)
+            {
+                receiveKeys.Install(install.Export, install.BroadcastSsrcs);
+            }
+
+            _broadcastReceive = receiveKeys;
+        }
 
         if (_config.EnableCongestionControl)
         {
@@ -1022,6 +1037,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         Safely(() => ice?.Close());
         Safely(() => ice?.Dispose());
         Safely(() => srtp?.Dispose());
+        Safely(() => _broadcastReceive?.Dispose());
         if (_ownsCertificate)
         {
             Safely(_certificate.Dispose);
