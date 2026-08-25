@@ -290,6 +290,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// </summary>
     public uint VideoRtxSsrc => FirstSender(MediaKind.Video)?.RtxSsrc ?? 0;
 
+    /// <summary>
+    /// The synchronisation source of the outbound video FlexFEC repair stream, published as the second
+    /// member of <c>a=ssrc-group:FEC-FR</c> when RFC 8627 FlexFEC is offered; 0 when it is not.
+    /// </summary>
+    public uint VideoFlexFecSsrc => FirstSender(MediaKind.Video)?.FlexFecSsrc ?? 0;
+
     /// <summary>The synchronisation source of the outbound audio stream.</summary>
     public uint AudioSsrc => FirstSender(MediaKind.Audio)?.Ssrc ?? 0;
 
@@ -1194,6 +1200,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FidSemantics, [sender.Ssrc, sender.RtxSsrcRaw]));
                         video.Ssrcs.Add(sender.RtxSsrcRaw);
                     }
+
+                    if (codecs.Exists(static c => c.IsFlexfec) && sender.FlexFecSsrcRaw != 0)
+                    {
+                        // RFC 8627 §5.1.2: FEC-FR binds the media source to the FlexFEC repair source that
+                        // protects it. Both sources publish the same cname, which the builder writes.
+                        video.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FecFrSemantics, [sender.Ssrc, sender.FlexFecSsrcRaw]));
+                        video.Ssrcs.Add(sender.FlexFecSsrcRaw);
+                    }
                 }
 
                 builder.AddMedia(video);
@@ -1347,7 +1361,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
             codecs.AddRange(repairs);
         }
 
-        if (_config.EnableUlpfec)
+        // FlexFEC and ULPFEC are alternatives; when both are enabled FlexFEC wins.
+        if (_config.EnableFlexFec)
+        {
+            AppendFlexFecCodec(codecs, used);
+        }
+        else if (_config.EnableUlpfec)
         {
             AppendUlpfecCodecs(codecs, used);
         }
@@ -1383,6 +1402,34 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         codecs.Add(SdpCodec.Red(redPayloadType, clockRate));
         codecs.Add(SdpCodec.Ulpfec(ulpfecPayloadType, clockRate));
+    }
+
+    /// <summary>
+    /// Appends one RFC 8627 (flexfec-03) <c>flexfec-03</c> codec to the video codec list, drawing its
+    /// payload type from the still-free dynamic range. FlexFEC rides its own SSRC — bound to the media
+    /// stream by <c>a=ssrc-group:FEC-FR</c> — so, unlike ULPFEC, it needs no RED codec.
+    /// </summary>
+    private void AppendFlexFecCodec(List<SdpCodec> codecs, HashSet<int> used)
+    {
+        var clockRate = 90000;
+        foreach (var codec in codecs)
+        {
+            if (!codec.IsRtx && !codec.IsRed && !codec.IsUlpfec && !codec.IsFlexfec)
+            {
+                clockRate = codec.ClockRate;
+                break;
+            }
+        }
+
+        if (NextDynamicPayloadType(used, _config.FlexFecPayloadType) is not { } flexFecPayloadType)
+        {
+            _logger.Log(
+                KeryxLogLevel.Warning,
+                "No dynamic payload type is free for the flexfec-03 codec; FlexFEC is not offered.");
+            return;
+        }
+
+        codecs.Add(SdpCodec.FlexFec(flexFecPayloadType, clockRate));
     }
 
     private static int? NextDynamicPayloadType(HashSet<int> used, int? preferred)

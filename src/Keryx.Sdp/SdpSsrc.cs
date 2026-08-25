@@ -73,6 +73,13 @@ public sealed record SsrcGroup(string Semantics, IReadOnlyList<uint> Ssrcs)
     /// <summary>The <c>SIM</c> semantics used to group simulcast layers.</summary>
     public const string SimulcastSemantics = "SIM";
 
+    /// <summary>
+    /// The <c>FEC-FR</c> (FEC flow, FlexFEC) semantics of RFC 8627 §5.1.2: the first source is the media
+    /// stream, the second the FlexFEC repair stream that protects it. This is how a FlexFEC repair
+    /// stream — carried on its own SSRC — is bound to the stream it protects.
+    /// </summary>
+    public const string FecFrSemantics = "FEC-FR";
+
     /// <summary>Parses an <c>a=ssrc-group</c> attribute value.</summary>
     /// <param name="value">The attribute value, without the <c>a=ssrc-group:</c> prefix.</param>
     /// <param name="group">Receives the parsed group.</param>

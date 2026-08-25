@@ -16,6 +16,9 @@ public sealed class SdpCodec
     /// <summary>The encoding name RFC 5109 gives the uneven level protection FEC payload format.</summary>
     public const string UlpfecEncodingName = "ulpfec";
 
+    /// <summary>The encoding name RFC 8627 (flexfec-03) gives the flexible FEC repair payload format.</summary>
+    public const string FlexfecEncodingName = "flexfec-03";
+
     /// <summary>The fmtp parameter naming the payload type an rtx entry repairs (RFC 4588 §8.1).</summary>
     public const string AssociatedPayloadTypeParameter = "apt";
 
@@ -47,6 +50,9 @@ public sealed class SdpCodec
 
     /// <summary>True when this entry is an RFC 5109 ULPFEC codec.</summary>
     public bool IsUlpfec => string.Equals(EncodingName, UlpfecEncodingName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when this entry is an RFC 8627 (flexfec-03) FlexFEC codec.</summary>
+    public bool IsFlexfec => string.Equals(EncodingName, FlexfecEncodingName, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The payload type this entry repairs, read from the <c>apt</c> fmtp parameter.</summary>
     /// <returns>The associated payload type, or <see langword="null"/> when there is no usable <c>apt</c>.</returns>
@@ -277,4 +283,16 @@ public sealed class SdpCodec
     /// <returns>The codec entry.</returns>
     public static SdpCodec Ulpfec(int payloadType, int clockRate = 90000) =>
         new(payloadType, UlpfecEncodingName, clockRate);
+
+    /// <summary>
+    /// An RFC 8627 (flexfec-03) FlexFEC codec, the repair payload format carried on its own SSRC and
+    /// bound to the media stream through <c>a=ssrc-group:FEC-FR</c>. Renders as
+    /// <c>a=rtpmap:&lt;pt&gt; flexfec-03/&lt;clock&gt;</c> with no fmtp, as browsers advertise it. Unlike
+    /// ULPFEC it is not wrapped in RED; the repair packet is an ordinary RTP packet on the FEC stream.
+    /// </summary>
+    /// <param name="payloadType">Payload type of the FlexFEC stream.</param>
+    /// <param name="clockRate">RTP clock rate, matching the media it protects.</param>
+    /// <returns>The codec entry.</returns>
+    public static SdpCodec FlexFec(int payloadType, int clockRate = 90000) =>
+        new(payloadType, FlexfecEncodingName, clockRate);
 }
