@@ -100,6 +100,40 @@ public sealed class IceAgentOptions
     /// </summary>
     public IMdnsResolver? MdnsResolver { get; set; }
 
+    /// <summary>
+    /// The greatest number of <c>.local</c> candidate resolutions that may be in flight at once. Each
+    /// resolution opens one or two UDP sockets and sends a LAN multicast query, so this bounds socket
+    /// use and multicast amplification. Names that arrive while every slot is busy queue for a slot
+    /// rather than being dropped, so a legitimate burst is served a few at a time; the flood ceiling
+    /// is <see cref="MaxPendingMdnsResolutions"/>. Kept small - a handful - by default.
+    /// </summary>
+    public int MaxConcurrentMdnsResolutions { get; set; } = 4;
+
+    /// <summary>
+    /// The greatest number of distinct <c>.local</c> names that may be awaiting resolution at once
+    /// (running or queued for a concurrency slot). This is the flood ceiling: once reached, further
+    /// distinct names are dropped cleanly instead of each spawning a queued task, so a hostile peer
+    /// flooding distinct names cannot exhaust tasks. Generous next to a legitimate single-digit
+    /// session, so a real burst is admitted in full and only a flood is turned away.
+    /// </summary>
+    public int MaxPendingMdnsResolutions { get; set; } = 32;
+
+    /// <summary>
+    /// How long a <c>.local</c> name that failed to resolve is remembered so an immediate re-signal
+    /// of the same name is skipped instead of re-querying the LAN. Bounds query amplification from a
+    /// peer repeating the same unresolvable name; short so a name that comes up later still retries.
+    /// </summary>
+    public TimeSpan MdnsNegativeCacheDuration { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The greatest number of remote candidates a session retains. <c>_remoteCandidates</c> and the
+    /// derived check list have no natural bound, and each add rebuilds pairs and asks each TURN
+    /// allocation for a permission, so a hostile signalling peer trickling huge candidate counts
+    /// drives CPU and memory growth. RFC 8445 permits limiting the set; additional remote candidates
+    /// past the cap are dropped cleanly. The default dwarfs any legitimate session.
+    /// </summary>
+    public int MaxRemoteCandidates { get; set; } = 100;
+
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }
 
@@ -142,6 +176,10 @@ public sealed class IceAgentOptions
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(CheckInterval, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(CheckRetransmissionTimeout, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxCheckTransmissions, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentMdnsResolutions, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxPendingMdnsResolutions, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxRemoteCandidates, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(MdnsNegativeCacheDuration.Ticks);
         ArgumentOutOfRangeException.ThrowIfNegative(MinPort);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxPort, 65535);
         if (MinPort > 0 && MaxPort < MinPort)
