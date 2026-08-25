@@ -430,6 +430,25 @@ public sealed class PeerConnectionConfig
     public int MaxReceiveSources { get; set; } = 256;
 
     /// <summary>
+    /// Hard cap on the number of RTP transceivers (media m-sections) this connection retains. Defaults
+    /// to 64, far above any legitimate session: a single sendrecv audio/video call needs two, and even a
+    /// large-conference SFU rarely carries more than a few dozen simultaneously active m-sections. The
+    /// data-channel m-section is not a transceiver and does not count against this.
+    /// </summary>
+    /// <remarks>
+    /// The transceiver set is append-only — a stopped transceiver keeps its slot — so without a cap a
+    /// remote peer could grow it, the inbound route table and the local-SSRC ownership map without bound
+    /// by presenting one enormous offer, or by renegotiating with ever-more m-sections. Two paths honour
+    /// the cap. A remote offer that presents more RTP m-sections than the cap allows has the sections
+    /// within the cap negotiated normally; each additional offered m-section is answered as rejected
+    /// (port 0, per RFC 8843 §5.3.1) rather than binding a transceiver, so the connection still works for
+    /// the sections within the cap. The application's own <see cref="PeerConnection.AddTransceiver"/> and
+    /// <see cref="PeerConnection.AddTrack"/> throw once the set is full. Must be at least the number of
+    /// transceivers the configuration itself creates (one per configured media kind).
+    /// </remarks>
+    public int MaxMediaSections { get; set; } = 64;
+
+    /// <summary>
     /// A testing and diagnostics seam: called once with the ICE agent's datagram transport, and the
     /// transport it returns is what the connection sends on and receives from. Null (the default)
     /// uses the ICE transport directly.

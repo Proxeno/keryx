@@ -130,6 +130,15 @@ public sealed partial class PeerConnection
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
 
+            // Honour the media-section cap (session-model.md §3.2): the transceiver set is append-only, so
+            // a full set stays full. Refuse rather than grow it past the configured bound.
+            if (_transceivers.Count >= _config.MaxMediaSections)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot add a transceiver: the connection already has {_transceivers.Count} "
+                    + $"m-section(s), the configured MaxMediaSections cap ({_config.MaxMediaSections}).");
+            }
+
             // A pinned mid must be unique across the session, or the offer emits duplicate a=mid lines.
             if (init?.Mid is { } pinnedMid)
             {
@@ -393,9 +402,13 @@ public sealed partial class PeerConnection
     /// direction, its direction defaults to the complement of the offered direction (a <c>recvonly</c>
     /// offer makes this side the sender, everything else makes it a receiver), reproducing the historical
     /// answerer rule exactly. <paramref name="created"/> reports whether a transceiver was auto-created,
-    /// so the caller can raise <see cref="OnTransceiver"/> for it.
+    /// so the caller can raise <see cref="OnTransceiver"/> for it. Returns null when the offered m-line
+    /// would require auto-creating a transceiver but the media-section cap
+    /// (<see cref="PeerConnectionConfig.MaxMediaSections"/>) is already reached; the caller then answers
+    /// that m-line as rejected (port 0) rather than growing the transceiver set without bound. Reusing an
+    /// existing transceiver never trips the cap, since it does not grow the set. Called under <c>_lock</c>.
     /// </summary>
-    private RtpTransceiver BindOfferedMediaLine(
+    private RtpTransceiver? BindOfferedMediaLine(
         MediaKind kind,
         string mid,
         MediaDirection offeredDirection,
@@ -430,6 +443,14 @@ public sealed partial class PeerConnection
 
         if (bound is null)
         {
+            // Auto-creating would grow the append-only transceiver set (and the route table and SSRC-owner
+            // map the caller builds alongside it). Past the media-section cap, refuse: the caller rejects
+            // this offered m-line (port 0) so a peer cannot drive that state without bound.
+            if (_transceivers.Count >= _config.MaxMediaSections)
+            {
+                return null;
+            }
+
             // Auto-create for an m-line beyond what the local side prepared.
             var sender = new RtpSender(
                 this,

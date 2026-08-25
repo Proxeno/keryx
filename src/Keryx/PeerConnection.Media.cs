@@ -964,7 +964,12 @@ public sealed partial class PeerConnection
                 $"An MTU of {_config.Mtu} leaves only {maxPayload} byte(s) for an RTP payload.");
         }
 
-        foreach (var transceiver in _transceivers)
+        // Iterate the lock-free published snapshot, not the live _transceivers list: a mid-session
+        // AddTransceiver appends to that list under _lock while this runs on the apply/driver path, and
+        // enumerating the live list would race that append ("collection modified"). The snapshot holds the
+        // same transceiver instances, so settling each sender's Track through it is unaffected. Taking
+        // _lock here instead would nest it around the per-sender _sendLock this method already acquires.
+        foreach (var transceiver in SnapshotTransceivers())
         {
             var sender = transceiver.Sender;
             if (sender.Negotiated is not { } negotiated)
@@ -1265,6 +1270,18 @@ public sealed partial class PeerConnection
 
     /// <summary>Test-only: number of distinct inbound sources with a retained receive jitter buffer.</summary>
     internal int ReceiveStreamCountForTest => _receiveStreams.Count;
+
+    /// <summary>
+    /// Test-only: number of m-sections the inbound route table carries per-mid routes for, so a test can
+    /// assert an over-large offer does not grow the route table past the media-section cap.
+    /// </summary>
+    internal int InboundRouteMidCountForTest => Volatile.Read(ref _routeTable).MidCount;
+
+    /// <summary>
+    /// Test-only: number of local SSRCs (media plus RTX) mapped to an owning sender, so a test can assert
+    /// an over-large offer does not grow the SSRC-ownership map past the media-section cap.
+    /// </summary>
+    internal int LocalSsrcOwnerCountForTest => _localSsrcOwners.Count;
 
     /// <summary>
     /// Test-only: the live SRTP context instance, so a test can assert by reference identity that an
@@ -1682,6 +1699,9 @@ public sealed partial class PeerConnection
 
         /// <summary>An empty table: every lookup misses and yields the unknown route.</summary>
         internal static RouteTable Empty { get; } = new([], [], [], 0);
+
+        /// <summary>Test-only: the number of m-sections this table carries per-mid routes for.</summary>
+        internal int MidCount => _byMid.Count;
 
         /// <summary>
         /// Resolves a freshly received packet mid-first: the MID header extension when the peer stamped

@@ -1404,6 +1404,34 @@ public sealed partial class PeerConnection : IAsyncDisposable
     }
 
     /// <summary>
+    /// Mirrors an offered RTP m-section back rejected (port 0, RFC 8843 §5.3.1, JSEP §5.2.1), keeping the
+    /// slot index-aligned. Used both for an offered section that was already rejected (port 0) and for one
+    /// the media-section cap refused to bind (session-model.md §3.2). Echoes the offered media type,
+    /// protocol and rtcp-mux, marks the section <c>inactive</c>, and carries a single well-formed format so
+    /// the m-line parses; it holds no transceiver, SSRC or msid.
+    /// </summary>
+    private static SdpMediaOffer BuildMirroredRejection(MediaDescription offered, string mid)
+    {
+        var rejected = new SdpMediaOffer(mid, offered.Media, offered.Protocol)
+        {
+            Port = 0,
+            Direction = MediaDirection.Inactive,
+            RtcpMux = offered.RtcpMux,
+        };
+
+        var firstFormat = offered.GetPayloadTypes().FirstOrDefault(-1);
+        if (firstFormat >= 0)
+        {
+            var rtpMap = offered.GetRtpMap(firstFormat);
+            rejected.Codecs.Add(rtpMap is null
+                ? new SdpCodec(firstFormat, "unknown", 90000)
+                : new SdpCodec(firstFormat, rtpMap.EncodingName, rtpMap.ClockRate, rtpMap.Channels));
+        }
+
+        return rejected;
+    }
+
+    /// <summary>
     /// Copies <paramref name="source"/>'s video codecs and, when <paramref name="enableRtx"/> is set,
     /// gives each one bare <c>nack</c> feedback and a matching RFC 4588 <c>rtx</c> entry on a free
     /// dynamic payload type. The source codecs themselves are never mutated.
@@ -1635,23 +1663,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
             // without binding a live transceiver to it.
             if (offered.Port == 0)
             {
-                var rejected = new SdpMediaOffer(mid, offered.Media, offered.Protocol)
-                {
-                    Port = 0,
-                    Direction = MediaDirection.Inactive,
-                    RtcpMux = offered.RtcpMux,
-                };
-
-                var firstFormat = offered.GetPayloadTypes().FirstOrDefault(-1);
-                if (firstFormat >= 0)
-                {
-                    var rtpMap = offered.GetRtpMap(firstFormat);
-                    rejected.Codecs.Add(rtpMap is null
-                        ? new SdpCodec(firstFormat, "unknown", 90000)
-                        : new SdpCodec(firstFormat, rtpMap.EncodingName, rtpMap.ClockRate, rtpMap.Channels));
-                }
-
-                builder.AddMedia(rejected);
+                builder.AddMedia(BuildMirroredRejection(offered, mid));
                 continue;
             }
 
@@ -1666,6 +1678,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
             var offeredDirection = offered.DirectionOrDefault;
             var kind = ToMediaKind(offered.Media);
             var boundTransceiver = kind is MediaKind.Video or MediaKind.Audio ? GetTransceiver(mid) : null;
+
+            // An audio/video m-line the applied offer bound no transceiver to was refused by the
+            // media-section cap (session-model.md §3.2, MaxMediaSections). Mirror it back rejected
+            // (port 0, RFC 8843 §5.3.1), keeping the m-line slot aligned without carrying live media —
+            // the sections within the cap answer normally.
+            if (kind is MediaKind.Video or MediaKind.Audio && boundTransceiver is null)
+            {
+                builder.AddMedia(BuildMirroredRejection(offered, mid));
+                continue;
+            }
+
             MediaDirection negotiatedDirection;
             if (boundTransceiver is not null)
             {
@@ -2068,10 +2091,31 @@ public sealed partial class PeerConnection : IAsyncDisposable
             if (kind is MediaKind.Audio or MediaKind.Video && media.Port != 0)
             {
                 var bindMid = media.Mid ?? mediaIndex.ToString(CultureInfo.InvariantCulture);
-                var bound = BindOfferedMediaLine(kind, bindMid, media.DirectionOrDefault, associated, out var created);
-                if (created)
+
+                // Bind under _lock: BindOfferedMediaLine reads and (on auto-create) appends the live
+                // _transceivers list, and the invariant is that every add happens under _lock — otherwise
+                // an application-concurrent AddTransceiver (which holds _lock) races this mutation. The
+                // apply path holds no lock here, so this take is not re-entrant.
+                RtpTransceiver? bound;
+                lock (_lock)
                 {
-                    autoCreated.Add(bound);
+                    bound = BindOfferedMediaLine(kind, bindMid, media.DirectionOrDefault, associated, out var created);
+                    if (bound is not null && created)
+                    {
+                        autoCreated.Add(bound);
+                    }
+                }
+
+                // The media-section cap refused this offered m-line (session-model.md §3.2): bind nothing,
+                // build no route or SSRC mapping for it, and leave it unbound so BuildAnswer rejects it
+                // (port 0). The connection keeps working for every section within the cap.
+                if (bound is null)
+                {
+                    _logger.Log(
+                        KeryxLogLevel.Warning,
+                        $"Rejecting offered {kind} m-section '{bindMid}': the MaxMediaSections cap "
+                        + $"({_config.MaxMediaSections}) is reached.");
+                    continue;
                 }
 
                 var mid = media.Mid ?? string.Empty;
