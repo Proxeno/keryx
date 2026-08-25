@@ -11,9 +11,10 @@ namespace Keryx;
 /// Obtain one from <see cref="PeerConnection.AddTransceiver(MediaKind, MediaDirection, RtpTransceiverInit?)"/>
 /// or <see cref="PeerConnection.AddTrack(MediaKind, System.Collections.Generic.IReadOnlyList{SdpCodec})"/>,
 /// enumerate the set with <see cref="PeerConnection.Transceivers"/>, or receive one auto-created for an
-/// offered m-line through <see cref="PeerConnection.OnTransceiver"/>. In this release transceivers are
-/// added before the first negotiation (matching both shipping consumers); renegotiation to add or
-/// remove them mid-session is a later feature.
+/// offered m-line through <see cref="PeerConnection.OnTransceiver"/>. Transceivers may be added before
+/// the first negotiation or mid-session: a mid-session add appears as a new m-line in the next offer and
+/// <see cref="Stop"/> re-emits its slot as a rejected (port-0) section, both driven by a renegotiation
+/// (session-model.md §4.2).
 /// </remarks>
 public sealed class RtpTransceiver
 {
@@ -55,11 +56,35 @@ public sealed class RtpTransceiver
     /// <summary>The primary codec negotiated for this m-line, <see langword="null"/> before it settles.</summary>
     public NegotiatedCodec? NegotiatedCodec { get; internal set; }
 
-    // Stopping a transceiver (rejected port-0 re-emission) is deliberately not exposed in 0.3.0: it
-    // needs the renegotiation machinery a later release adds, so the public surface carries no Stop() /
-    // Stopped it cannot honour. This internal flag is always false today and lets the binding logic that
-    // will consult it in a later PR compile unchanged; reintroducing the public members then is additive.
-    internal bool Stopped => false;
+    /// <summary>
+    /// Marks this transceiver stopped (session-model.md §3.3/§4.2): the next offer re-emits its m-line
+    /// slot as a rejected (port-0) section at its fixed index and mid, and once that renegotiation
+    /// settles the m-line carries no media. The slot is kept, never reordered or freed (recycling is a
+    /// later optimisation). Idempotent. A stop dirties the connection, so
+    /// <see cref="PeerConnection.OnNegotiationNeeded"/> is raised when the machine is
+    /// <see cref="SignalingState.Stable"/>, prompting the renegotiation.
+    /// </summary>
+    public void Stop()
+    {
+        var owner = Sender.Owner;
+        lock (owner.NegotiationLock)
+        {
+            if (_stopped)
+            {
+                return;
+            }
+
+            _stopped = true;
+            NegotiationPending = true;
+        }
+
+        owner.RaiseNegotiationNeeded();
+    }
+
+    /// <summary>Whether <see cref="Stop"/> has been called; a stopped transceiver never sends or receives.</summary>
+    public bool Stopped => _stopped;
+
+    private volatile bool _stopped;
 
     /// <summary>The per-transceiver codec preference list used when THIS side offers, or empty to fall
     /// back to the connection's per-kind codec config.</summary>
@@ -105,6 +130,9 @@ public sealed class RtpSender : IRtpForwarder
         RtxSsrcRaw = rtxSsrc;
         TrackId = trackId;
     }
+
+    /// <summary>The connection that owns this sender, for internal callbacks (e.g. negotiation-needed).</summary>
+    internal PeerConnection Owner => _owner;
 
     /// <summary>The media kind this sender emits.</summary>
     public MediaKind Kind { get; }

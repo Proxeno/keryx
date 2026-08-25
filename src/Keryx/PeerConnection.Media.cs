@@ -543,8 +543,10 @@ public sealed partial class PeerConnection
     /// <summary>Builds one <see cref="TransceiverStats"/> per transceiver, in m-line order (§2.2).</summary>
     private IReadOnlyList<TransceiverStats> BuildTransceiverStats()
     {
-        var stats = new List<TransceiverStats>(_transceivers.Count);
-        foreach (var transceiver in _transceivers)
+        // Iterate the lock-free snapshot: a mid-session renegotiation can append a transceiver concurrently.
+        var transceivers = SnapshotTransceivers();
+        var stats = new List<TransceiverStats>(transceivers.Length);
+        foreach (var transceiver in transceivers)
         {
             var sender = transceiver.Sender;
             var track = sender.Track;
@@ -812,82 +814,9 @@ public sealed partial class PeerConnection
 
     private void CreateTrackSenders(IceAgent ice, SrtpProfile profile)
     {
-        var transportCcId = _sendTransportCcExtensionId;
-
-        // When the TWCC extension is negotiated every packet carries the one-byte header extension, so
-        // its fixed overhead comes out of the payload budget and out of the send-history slab size.
-        var extensionReserve = transportCcId is null ? 0 : TransportCcExtension.OneByteHeaderOverhead;
-
-        var datagram = Math.Min(_config.Mtu, (_transport ?? ice.Transport).MaxDatagramSize);
-        var maxPayload = datagram - RtpHeader.FixedLength - extensionReserve - profile.RtpOverhead;
-        if (maxPayload < 64)
-        {
-            throw new InvalidOperationException(
-                $"An MTU of {_config.Mtu} leaves only {maxPayload} byte(s) for an RTP payload.");
-        }
-
         // Build a wire sender for every transceiver whose negotiation settled on a send codec, in m-line
-        // order. Refactored to run per transceiver so it can be driven both from the connection driver
-        // (here) and, in a later phase, from a mid-session apply against the live SRTP context.
-        foreach (var transceiver in _transceivers)
-        {
-            var sender = transceiver.Sender;
-            if (sender.Negotiated is not { } negotiated)
-            {
-                continue;
-            }
-
-            if (transceiver.Kind == MediaKind.Video)
-            {
-                var videoMaxPayload = maxPayload;
-                RtxRetransmitter? rtx = null;
-
-                if (_config.EnableRetransmission && negotiated.RtxPayloadType is { } rtxPayloadType)
-                {
-                    // An RTX packet is the original packet plus the two-octet OSN (RFC 4588 §4), so the
-                    // media stream gives those two bytes back to keep repairs inside the same MTU.
-                    videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
-                    var history = new RtpSendHistory(
-                        RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
-                        _config.RetransmissionHistory);
-                    rtx = new RtxRetransmitter(
-                        sender.RtxSsrcRaw,
-                        rtxPayloadType,
-                        negotiated.ClockRate,
-                        history,
-                        _config.Retransmission,
-                        logger: _logger);
-
-                    _logger.Log(
-                        KeryxLogLevel.Info,
-                        $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{sender.RtxSsrcRaw:x8}, "
-                        + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
-                }
-
-                sender.Track = new TrackSender(
-                    this,
-                    negotiated.Mid,
-                    MediaKind.Video,
-                    new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
-                    new H264Packetizer(),
-                    videoMaxPayload,
-                    profile.RtpOverhead,
-                    transportCcId,
-                    rtx);
-            }
-            else if (transceiver.Kind == MediaKind.Audio)
-            {
-                sender.Track = new TrackSender(
-                    this,
-                    negotiated.Mid,
-                    MediaKind.Audio,
-                    new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
-                    new OpusPacketizer(),
-                    maxPayload,
-                    profile.RtpOverhead,
-                    transportCcId);
-            }
-        }
+        // order, against the just-derived SRTP context.
+        BuildNegotiatedTrackSenders(_transport ?? ice.Transport, profile);
 
         if (_congestionController is { } controller)
         {
@@ -915,6 +844,127 @@ public sealed partial class PeerConnection
             _logger.Log(
                 KeryxLogLevel.Info,
                 $"Receiver transport-cc feedback enabled on extmap {extensionId}.");
+        }
+    }
+
+    /// <summary>
+    /// After a mid-session renegotiation (session-model.md §4.3), wires a wire sender for any transceiver
+    /// whose negotiation just settled on a send codec but that has no live sender yet — against the
+    /// <em>existing</em> SRTP context, which is never re-derived or rekeyed by an ordinary renegotiation.
+    /// A no-op before the driver has derived SRTP (the driver's <see cref="CreateTrackSenders"/> then
+    /// builds every sender) and a no-op when no transceiver was added, so it is safe to call after every
+    /// answer apply. Senders already streaming keep their sequence/timestamp/rtx state untouched.
+    /// </summary>
+    private void EnsureLiveSenders()
+    {
+        SrtpContext? srtp;
+        IDatagramTransport? transport;
+        lock (_lock)
+        {
+            srtp = _srtp;
+            transport = _transport;
+        }
+
+        if (srtp is null || transport is null)
+        {
+            return;
+        }
+
+        BuildNegotiatedTrackSenders(transport, srtp.Profile);
+    }
+
+    /// <summary>
+    /// Builds a <see cref="TrackSender"/> for every transceiver whose negotiation settled on a send codec
+    /// and that does not already have one, in m-line order, against <paramref name="profile"/>'s SRTP
+    /// overhead. Each build takes <see cref="_sendLock"/> and skips a transceiver that already has a live
+    /// sender, so a sender already streaming is never rebuilt (its sequence/timestamp/rtx state survives a
+    /// renegotiation, session-model.md §4.2/§4.3). Runs both from the connection driver (initial) and from
+    /// a mid-session apply (<see cref="EnsureLiveSenders"/>).
+    /// </summary>
+    private void BuildNegotiatedTrackSenders(IDatagramTransport transport, SrtpProfile profile)
+    {
+        var transportCcId = _sendTransportCcExtensionId;
+
+        // When the TWCC extension is negotiated every packet carries the one-byte header extension, so
+        // its fixed overhead comes out of the payload budget and out of the send-history slab size.
+        var extensionReserve = transportCcId is null ? 0 : TransportCcExtension.OneByteHeaderOverhead;
+
+        var datagram = Math.Min(_config.Mtu, transport.MaxDatagramSize);
+        var maxPayload = datagram - RtpHeader.FixedLength - extensionReserve - profile.RtpOverhead;
+        if (maxPayload < 64)
+        {
+            throw new InvalidOperationException(
+                $"An MTU of {_config.Mtu} leaves only {maxPayload} byte(s) for an RTP payload.");
+        }
+
+        foreach (var transceiver in _transceivers)
+        {
+            var sender = transceiver.Sender;
+            if (sender.Negotiated is not { } negotiated)
+            {
+                continue;
+            }
+
+            lock (_sendLock)
+            {
+                // Already streaming (from this or an earlier negotiation): leave it — and its live
+                // sequence/timestamp/rtx state — untouched.
+                if (sender.Track is not null)
+                {
+                    continue;
+                }
+
+                if (transceiver.Kind == MediaKind.Video)
+                {
+                    var videoMaxPayload = maxPayload;
+                    RtxRetransmitter? rtx = null;
+
+                    if (_config.EnableRetransmission && negotiated.RtxPayloadType is { } rtxPayloadType)
+                    {
+                        // An RTX packet is the original packet plus the two-octet OSN (RFC 4588 §4), so the
+                        // media stream gives those two bytes back to keep repairs inside the same MTU.
+                        videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
+                        var history = new RtpSendHistory(
+                            RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
+                            _config.RetransmissionHistory);
+                        rtx = new RtxRetransmitter(
+                            sender.RtxSsrcRaw,
+                            rtxPayloadType,
+                            negotiated.ClockRate,
+                            history,
+                            _config.Retransmission,
+                            logger: _logger);
+
+                        _logger.Log(
+                            KeryxLogLevel.Info,
+                            $"RTX enabled: pt {rtxPayloadType}, ssrc 0x{sender.RtxSsrcRaw:x8}, "
+                            + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
+                    }
+
+                    sender.Track = new TrackSender(
+                        this,
+                        negotiated.Mid,
+                        MediaKind.Video,
+                        new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
+                        new H264Packetizer(),
+                        videoMaxPayload,
+                        profile.RtpOverhead,
+                        transportCcId,
+                        rtx);
+                }
+                else if (transceiver.Kind == MediaKind.Audio)
+                {
+                    sender.Track = new TrackSender(
+                        this,
+                        negotiated.Mid,
+                        MediaKind.Audio,
+                        new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
+                        new OpusPacketizer(),
+                        maxPayload,
+                        profile.RtpOverhead,
+                        transportCcId);
+                }
+            }
         }
     }
 
@@ -1053,6 +1103,13 @@ public sealed partial class PeerConnection
 
     /// <summary>Test-only: number of distinct inbound sources with a retained receive jitter buffer.</summary>
     internal int ReceiveStreamCountForTest => _receiveStreams.Count;
+
+    /// <summary>
+    /// Test-only: the live SRTP context instance, so a test can assert by reference identity that an
+    /// ordinary renegotiation neither re-derives nor rekeys it (session-model.md §4.3). Null before the
+    /// DTLS handshake derives the keys.
+    /// </summary>
+    internal object? SrtpContextForTest => _srtp;
 
     /// <summary>
     /// Decapsulates one inbound RFC 4588 RTX packet back to the media packet it repairs and delivers it
@@ -1743,8 +1800,9 @@ public sealed partial class PeerConnection
             var now = DateTimeOffset.UtcNow;
 
             // Iterate the transceiver set in m-line order (video then audio for the legacy set), so the
-            // reports emit in the same order as before.
-            foreach (var transceiver in _transceivers)
+            // reports emit in the same order as before. Iterate the lock-free snapshot: a mid-session
+            // renegotiation can append a transceiver from another thread while this timer callback runs.
+            foreach (var transceiver in SnapshotTransceivers())
             {
                 SendReportFor(transceiver.Kind, transceiver.Sender.Track, now);
             }
@@ -1812,7 +1870,7 @@ public sealed partial class PeerConnection
             var sources = new List<uint>();
             var now = DateTimeOffset.UtcNow;
 
-            foreach (var transceiver in _transceivers)
+            foreach (var transceiver in SnapshotTransceivers())
             {
                 var track = transceiver.Sender.Track;
                 if (track is null)

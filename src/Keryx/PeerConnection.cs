@@ -45,8 +45,14 @@ namespace Keryx;
 /// reception-report loss and REMB drive a send-side GCC estimator whose target bitrate paces outbound
 /// RTP and is published through <see cref="TargetBitrateChanged"/> for an encoder to consume. Off by
 /// default, leaving the immediate, unbuffered send path in place.</para>
-/// <para><b>Not implemented.</b> No ULPFEC or RED, no simulcast, no renegotiation, no ICE restart and
-/// no IPv6 relay candidates.</para>
+/// <para><b>Renegotiation.</b> A repeat offer/answer from <see cref="SignalingState.Stable"/> adds,
+/// removes or repoints m-lines (session-model.md §4.2): the session id stays constant while the o=
+/// version increments, the existing ICE transport, DTLS and SRTP context are reused untouched (no
+/// re-gather, no rekey — §4.3), and a transceiver added mid-session streams against the live SRTP
+/// context once its renegotiation settles. Glare handling (rollback) and ICE restart are not yet
+/// implemented.</para>
+/// <para><b>Not implemented.</b> No ULPFEC or RED, no rollback/glare handling, no ICE restart and no
+/// IPv6 relay candidates.</para>
 /// </remarks>
 public sealed partial class PeerConnection : IAsyncDisposable
 {
@@ -54,6 +60,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     /// <summary>The one-byte <c>a=extmap</c> id offered for the RFC 8843 §9.2 MID header extension.</summary>
     private const int MidHeaderExtensionId = 4;
+
+    /// <summary>The initial <c>o=</c> session version, matching Chrome, which starts at 2 (session-model.md §4.2).</summary>
+    private const long InitialSessionVersion = 2;
 
     private readonly PeerConnectionConfig _config;
     private readonly TimeProvider _time;
@@ -68,6 +77,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private readonly string _cname;
     private readonly string _streamId;
     private readonly uint _rtcpSenderSsrc;
+
+    // The o= session identity (RFC 8829 §5.2.2, session-model.md §4.2). The session id is generated once
+    // and stays constant for the connection's life, so every renegotiation re-emits the same
+    // o=<username> <session-id>; the version starts at Chrome's 2 and increments per generated local
+    // description, so each new offer or answer carries a strictly greater o= version. Guarded by _lock.
+    private readonly string _sessionId = SdpOrigin.NewSessionId();
+    private long _sessionVersion = InitialSessionVersion;
 
     private IceAgent? _ice;
     private IDatagramTransport? _transport;
@@ -368,7 +384,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         RaiseSignalingStateChanged(SignalingState.HaveLocalOffer);
 
-        await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
+        // A renegotiation reuses the existing ICE transport, credentials and gathered candidates — a
+        // plain renegotiation is not an ICE restart (session-model.md §4.2), so gather only the first time.
+        if (ice.State == IceAgentState.New)
+        {
+            await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         var session = BuildOffer(ice);
         AttachLocalCandidates(session, ice);
@@ -380,6 +401,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
             // The offer now reflects the current transceiver set: clear any pending negotiation-needed
             // intent so the machine does not re-raise OnNegotiationNeeded for changes already in flight.
             MarkLocalDescriptionAppliedLocked();
+
+            // The next generated local description carries a strictly greater o= version (§4.2).
+            BumpSessionVersionLocked();
         }
 
         var sdp = session.ToSdpString();
@@ -447,6 +471,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
             // answer covered are no longer pending negotiation.
             _signalingState = SignalingState.Stable;
             MarkLocalDescriptionAppliedLocked();
+
+            // The next generated local description carries a strictly greater o= version (§4.2).
+            BumpSessionVersionLocked();
         }
 
         RaiseSignalingStateChanged(SignalingState.Stable);
@@ -454,6 +481,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
         var sdp = session.ToSdpString();
         _logger.Log(KeryxLogLevel.Info, "Created answer; starting the connection driver.");
         StartDriver();
+
+        // For a mid-session renegotiation the driver is already running against a live SRTP context; wire
+        // a wire sender for any transceiver this answer just settled on a send codec for, without
+        // disturbing senders already streaming (session-model.md §4.3). A no-op on the first answer,
+        // where the driver builds every sender once SRTP is derived.
+        EnsureLiveSenders();
         UpdateNegotiationNeeded();
         return sdp;
     }
@@ -478,7 +511,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         // Validate the transition up front (RFC 8829 §3.2) so an out-of-order description is rejected before
         // any of it is applied. An answer is only valid while a local offer is pending; a remote offer is
-        // only valid from Stable (glare and repeat offers need rollback/renegotiation, which land later).
+        // valid from Stable — the initial negotiation and every subsequent renegotiation (session-model.md
+        // §4.2) — while glare (an offer arriving with a local offer pending) needs rollback, which is a
+        // later PR.
         lock (_lock)
         {
             if (type == SdpType.Answer)
@@ -494,7 +529,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 throw new InvalidOperationException(
                     _signalingState == SignalingState.HaveLocalOffer
                         ? "Cannot apply a remote offer while a local offer is pending (glare); rollback is not supported yet."
-                        : "A remote offer is already pending; repeat offers (renegotiation) are not supported yet.");
+                        : "A remote offer is already pending; answer it before applying another.");
             }
         }
 
@@ -510,6 +545,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
             RaiseSignalingStateChanged(SignalingState.Stable);
             StartDriver();
+
+            // A mid-session renegotiation answer may have settled a send codec on a transceiver added
+            // since connect; wire its sender against the live SRTP context (session-model.md §4.3). A
+            // no-op on the first answer, where the driver builds every sender once SRTP is derived.
+            EnsureLiveSenders();
             UpdateNegotiationNeeded();
         }
         else
@@ -949,6 +989,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
             Cname = _cname,
             StreamId = _streamId,
             TrickleIce = true,
+
+            // Constant session id, incrementing version across renegotiations (session-model.md §4.2).
+            SessionId = _sessionId,
+            SessionVersion = CurrentSessionVersion(),
         };
 
         // Allocate mids for any application-added transceivers (session-model.md §3.1), then walk the
@@ -961,6 +1005,16 @@ public sealed partial class PeerConnection : IAsyncDisposable
         {
             var sender = transceiver.Sender;
             var mid = transceiver.Mid!;
+
+            // A stopped transceiver keeps its m-line slot at its fixed index and mid, re-emitted as a
+            // rejected (port-0) section (JSEP §5.2.1, session-model.md §3.3/§4.2). It never reorders or
+            // frees the slot — recycling stopped slots is a later optimisation.
+            if (transceiver.Stopped)
+            {
+                builder.AddMedia(BuildRejectedSection(transceiver, mid));
+                continue;
+            }
+
             if (transceiver.Kind == MediaKind.Video)
             {
                 IReadOnlyList<SdpCodec> videoSource = transceiver.OfferCodecs.Count > 0
@@ -1029,6 +1083,49 @@ public sealed partial class PeerConnection : IAsyncDisposable
         {
             section.HeaderExtensions.Add(new SdpExtMap(MidHeaderExtensionId, RtpHeaderExtensionUri.Mid));
         }
+    }
+
+    /// <summary>
+    /// The <c>o=</c> version string for the description being built now (session-model.md §4.2). Read
+    /// without the lock: a description is only ever built from a single negotiation thread, and the value
+    /// is bumped by <see cref="BumpSessionVersionLocked"/> once the built description is applied.
+    /// </summary>
+    private string CurrentSessionVersion() =>
+        Interlocked.Read(ref _sessionVersion).ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Increments the <c>o=</c> session version so the next generated local description carries a strictly
+    /// greater version (RFC 8829 §5.2.2). Called under <see cref="_lock"/> as each local description is
+    /// applied; the session id is never touched, keeping the session identity constant.
+    /// </summary>
+    private void BumpSessionVersionLocked() => _sessionVersion++;
+
+    /// <summary>
+    /// Builds a rejected (port-0) m-section for a stopped transceiver, keeping its fixed mid and a
+    /// well-formed format list (JSEP §5.2.1, session-model.md §3.3). The section carries no direction
+    /// attribute payload beyond <c>inactive</c>, no SSRC and no msid — it only holds the slot.
+    /// </summary>
+    private SdpMediaOffer BuildRejectedSection(RtpTransceiver transceiver, string mid)
+    {
+        var mediaType = transceiver.Kind == MediaKind.Video ? "video" : "audio";
+        var section = new SdpMediaOffer(mid, mediaType)
+        {
+            Port = 0,
+            Direction = MediaDirection.Inactive,
+        };
+        AddMidExtmap(section);
+
+        // A rejected m-line still needs a format list, so echo the primary codec this transceiver would
+        // otherwise offer (falling back to the per-kind config).
+        IReadOnlyList<SdpCodec> source = transceiver.OfferCodecs.Count > 0
+            ? transceiver.OfferCodecs
+            : transceiver.Kind == MediaKind.Video ? [.. _config.VideoCodecs] : [.. _config.AudioCodecs];
+        if (source.Count > 0)
+        {
+            section.Codecs.Add(CloneCodec(source[0]));
+        }
+
+        return section;
     }
 
     /// <summary>
@@ -1143,6 +1240,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
             Cname = _cname,
             StreamId = _streamId,
             TrickleIce = true,
+
+            // Constant session id, incrementing version across renegotiations (session-model.md §4.2).
+            SessionId = _sessionId,
+            SessionVersion = CurrentSessionVersion(),
         };
 
         // The transport-wide sequence number the send path stamps is shared across the BUNDLE; the
@@ -1159,6 +1260,31 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 var application = SdpMediaOffer.Application(mid, _config.SctpPort, _config.MaxMessageSize);
                 application.Protocol = offered.Protocol;
                 builder.AddMedia(application);
+                continue;
+            }
+
+            // A rejected (port-0) offered RTP section — a peer that stopped/removed a transceiver
+            // (session-model.md §4.2) — is mirrored back rejected, keeping the m-line slot aligned
+            // without binding a live transceiver to it.
+            if (offered.Port == 0)
+            {
+                var rejected = new SdpMediaOffer(mid, offered.Media, offered.Protocol)
+                {
+                    Port = 0,
+                    Direction = MediaDirection.Inactive,
+                    RtcpMux = offered.RtcpMux,
+                };
+
+                var firstFormat = offered.GetPayloadTypes().FirstOrDefault(-1);
+                if (firstFormat >= 0)
+                {
+                    var rtpMap = offered.GetRtpMap(firstFormat);
+                    rejected.Codecs.Add(rtpMap is null
+                        ? new SdpCodec(firstFormat, "unknown", 90000)
+                        : new SdpCodec(firstFormat, rtpMap.EncodingName, rtpMap.ClockRate, rtpMap.Channels));
+                }
+
+                builder.AddMedia(rejected);
                 continue;
             }
 
@@ -1441,7 +1567,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
             }
 
             var kind = ToMediaKind(media.Media);
-            if (kind is MediaKind.Audio or MediaKind.Video)
+            if (kind is MediaKind.Audio or MediaKind.Video && media.Port != 0)
             {
                 var bindMid = media.Mid ?? mediaIndex.ToString(CultureInfo.InvariantCulture);
                 var bound = BindOfferedMediaLine(kind, bindMid, media.DirectionOrDefault, associated, out var created);

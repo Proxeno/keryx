@@ -37,7 +37,7 @@ public sealed partial class PeerConnection
     private void AddCodecStats(List<RtcStat> stats, DateTimeOffset now)
     {
         var seen = new HashSet<uint>();
-        foreach (var transceiver in _transceivers)
+        foreach (var transceiver in SnapshotTransceivers())
         {
             if (transceiver.NegotiatedCodec is not { } codec || codec.IsRtx || !seen.Add((uint)codec.PayloadType))
             {
@@ -59,7 +59,7 @@ public sealed partial class PeerConnection
     private void AddRtpStreamStats(List<RtcStat> stats, DateTimeOffset now)
     {
         // Outbound and remote-inbound (from the peer's reception reports), per send transceiver.
-        foreach (var transceiver in _transceivers)
+        foreach (var transceiver in SnapshotTransceivers())
         {
             var sender = transceiver.Sender;
             if (sender.Track is not { } track || sender.Ssrc == 0)
@@ -199,7 +199,7 @@ public sealed partial class PeerConnection
     private RtpTransceiver? FindReceivingTransceiver(uint ssrc, MediaKind kind)
     {
         RtpTransceiver? kindMatch = null;
-        foreach (var transceiver in _transceivers)
+        foreach (var transceiver in SnapshotTransceivers())
         {
             if (transceiver.Receiver.RemoteSsrc == ssrc)
             {
