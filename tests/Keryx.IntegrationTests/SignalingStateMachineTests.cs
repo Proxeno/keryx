@@ -124,19 +124,34 @@ public sealed class SignalingStateMachineTests
     }
 
     [Fact]
-    public async Task ApplyRemoteOffer_InHaveLocalOffer_ThrowsGlare()
+    public async Task ApplyRemoteOffer_InHaveLocalOffer_ResolvesGlareByRollingBackLocalOffer()
     {
         var cancellationToken = TestTimeout();
         await using var a = new PeerConnection(TestSupport.NewConfig());
         await using var b = new PeerConnection(TestSupport.NewConfig());
 
+        var states = new List<SignalingState>();
+        a.OnSignalingStateChanged += (_, s) => states.Add(s);
+
         var offerA = await a.CreateOfferAsync(cancellationToken);
         var offerB = await b.CreateOfferAsync(cancellationToken);
-
-        // a has a local offer pending; applying b's offer is glare, which needs rollback (not yet here).
-        var act = () => a.SetRemoteDescriptionAsync(offerB, SdpType.Offer, cancellationToken);
-        await act.Should().ThrowAsync<InvalidOperationException>("glare is rejected until rollback lands");
         a.SignalingState.Should().Be(SignalingState.HaveLocalOffer);
+
+        // Glare: a has a local offer pending when b's offer arrives. a rolls its local offer back to Stable
+        // and lets b's offer win, landing in HaveRemoteOffer, from which it can answer (session-model.md §4.4).
+        await a.SetRemoteDescriptionAsync(offerB, SdpType.Offer, cancellationToken);
+        a.SignalingState.Should().Be(SignalingState.HaveRemoteOffer);
+
+        // The transition passed through Stable (the rollback) before HaveRemoteOffer (the remote offer).
+        states.Should().Equal(
+            SignalingState.HaveLocalOffer,
+            SignalingState.Stable,
+            SignalingState.HaveRemoteOffer);
+
+        // a can now answer b's offer.
+        var answer = await a.CreateAnswerAsync(cancellationToken);
+        answer.Should().NotBeNullOrEmpty();
+        a.SignalingState.Should().Be(SignalingState.Stable);
         _ = offerA;
     }
 

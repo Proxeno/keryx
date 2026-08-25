@@ -49,7 +49,13 @@ namespace Keryx;
 /// removes or repoints m-lines (session-model.md §4.2): the session id stays constant while the o=
 /// version increments, the existing ICE transport, DTLS and SRTP context are reused untouched (no
 /// re-gather, no rekey — §4.3), and a transceiver added mid-session streams against the live SRTP
-/// context once its renegotiation settles. Glare handling (rollback) is not yet implemented.</para>
+/// context once its renegotiation settles.</para>
+/// <para><b>Rollback.</b> A proposed-but-not-yet-answered offer can be discarded (JSEP §4.1.8.2):
+/// <see cref="Rollback"/> rolls back a pending local offer and <see cref="SetRemoteDescriptionAsync"/>
+/// with <see cref="SdpType.Rollback"/> rolls back a pending remote offer, each returning
+/// <see cref="SignalingState"/> to <see cref="SignalingState.Stable"/> and restoring the transceiver set
+/// to its pre-offer shape (session-model.md §4.4). This also resolves glare: a remote offer that arrives
+/// while a local offer is pending rolls the local offer back and applies the remote one.</para>
 /// <para><b>ICE restart.</b> <see cref="RestartIce"/> or
 /// <see cref="CreateOfferAsync(bool, System.Threading.CancellationToken)"/> with <c>iceRestart: true</c>
 /// restarts ICE on a connected session (RFC 8445 §9): the offer carries fresh ICE credentials and
@@ -57,8 +63,8 @@ namespace Keryx;
 /// a new connectivity-check phase that switches the selected pair. The DTLS/SRTP context is preserved
 /// across the restart (RFC 8842). A fresh DTLS handshake with re-derived SRTP keys on restart is
 /// <em>deferred</em> (session-model.md §7): SRTP is not re-keyed here.</para>
-/// <para><b>Not implemented.</b> No ULPFEC or RED, no rollback/glare handling, no SRTP re-keying on ICE
-/// restart (deferred), and no IPv6 relay candidates.</para>
+/// <para><b>Not implemented.</b> No ULPFEC or RED, no SRTP re-keying on ICE restart (deferred), and no
+/// IPv6 relay candidates.</para>
 /// </remarks>
 public sealed partial class PeerConnection : IAsyncDisposable
 {
@@ -113,6 +119,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
     // OnNegotiationNeeded has been raised for the current pending change set and not yet cleared by a
     // local description apply; coalesces multiple AddTransceiver calls into a single event.
     private bool _negotiationNeeded;
+
+    // The last-stable state captured when the machine left Stable for a pending offer (session-model.md
+    // §4.4). Non-null only while a local or remote offer is pending; restored by a rollback and cleared
+    // once an exchange settles back to Stable. Guarded by _lock.
+    private SignalingSnapshot? _rollbackSnapshot;
 
     // Set by RestartIce() to arm the next CreateOfferAsync as an ICE restart (RFC 8445 §9): the next
     // offer regenerates the local ICE credentials, re-emits candidates and runs a fresh connectivity
@@ -439,6 +450,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     break;
             }
 
+            // Capture the last-stable state before this offer mutates any of it (mid allocation, the
+            // negotiation-needed flag, the o= version), so Rollback() can restore it (session-model.md §4.4).
+            _rollbackSnapshot = CaptureStableSnapshotLocked();
             _signalingState = SignalingState.HaveLocalOffer;
             ice = EnsureIceLocked(IceRole.Controlling);
 
@@ -544,8 +558,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
             _localDescription = session;
 
             // Applying the local answer completes the exchange: back to Stable, and any transceivers this
-            // answer covered are no longer pending negotiation.
+            // answer covered are no longer pending negotiation. The pending offer is settled, so there is
+            // nothing left to roll back.
             _signalingState = SignalingState.Stable;
+            _rollbackSnapshot = null;
             MarkLocalDescriptionAppliedLocked();
 
             // The next generated local description carries a strictly greater o= version (§4.2).
@@ -571,25 +587,37 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// Applies a remote description. For <see cref="SdpType.Answer"/> the answer is validated against
     /// the local offer, the negotiated codecs, ICE credentials, candidates, DTLS fingerprint and role
     /// are extracted, and the connection driver is started. For <see cref="SdpType.Offer"/> the offer
-    /// is recorded so that <see cref="CreateAnswerAsync"/> can answer it.
+    /// is recorded so that <see cref="CreateAnswerAsync"/> can answer it — and if a local offer is already
+    /// pending (glare) that local offer is first rolled back so the remote offer wins (session-model.md
+    /// §4.4). For <see cref="SdpType.Rollback"/> a pending remote offer is discarded and the connection
+    /// returns to <see cref="SignalingState.Stable"/> (JSEP §4.1.8.2); <paramref name="sdp"/> is ignored.
     /// </summary>
-    /// <param name="sdp">The description, exactly as signalling delivered it.</param>
-    /// <param name="type">Whether <paramref name="sdp"/> is an offer or an answer.</param>
+    /// <param name="sdp">The description, exactly as signalling delivered it. Ignored for <see cref="SdpType.Rollback"/>.</param>
+    /// <param name="type">Whether <paramref name="sdp"/> is an offer, an answer, or a rollback.</param>
     /// <param name="cancellationToken">Reserved; applying a description does no I/O.</param>
     /// <returns>A completed task once the description has been applied.</returns>
     /// <exception cref="SdpException">The description could not be parsed, or the answer violates JSEP alignment.</exception>
     /// <exception cref="InvalidOperationException">The description is not valid in the current signaling state.</exception>
     public Task SetRemoteDescriptionAsync(string sdp, SdpType type, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrEmpty(sdp);
         cancellationToken.ThrowIfCancellationRequested();
         ObjectDisposedException.ThrowIf(_closed != 0, this);
+
+        // A rollback discards a pending remote offer and carries no meaningful SDP (JSEP §4.1.8.2), so it
+        // is handled before the description is required or parsed.
+        if (type == SdpType.Rollback)
+        {
+            return RollbackRemoteOffer();
+        }
+
+        ArgumentException.ThrowIfNullOrEmpty(sdp);
 
         // Validate the transition up front (RFC 8829 §3.2) so an out-of-order description is rejected before
         // any of it is applied. An answer is only valid while a local offer is pending; a remote offer is
         // valid from Stable — the initial negotiation and every subsequent renegotiation (session-model.md
-        // §4.2) — while glare (an offer arriving with a local offer pending) needs rollback, which is a
-        // later PR.
+        // §4.2) — while a remote offer arriving with a local offer pending is glare, resolved below by
+        // rolling the local offer back and letting the remote offer win (session-model.md §4.4).
+        var glare = false;
         lock (_lock)
         {
             if (type == SdpType.Answer)
@@ -600,12 +628,40 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         $"Cannot apply an answer in the {_signalingState} state; an answer is only valid while a local offer is pending.");
                 }
             }
-            else if (_signalingState != SignalingState.Stable)
+            else
             {
-                throw new InvalidOperationException(
-                    _signalingState == SignalingState.HaveLocalOffer
-                        ? "Cannot apply a remote offer while a local offer is pending (glare); rollback is not supported yet."
-                        : "A remote offer is already pending; answer it before applying another.");
+                switch (_signalingState)
+                {
+                    case SignalingState.Stable:
+                        break;
+                    case SignalingState.HaveLocalOffer:
+                        glare = true;
+                        break;
+                    default:
+                        throw new InvalidOperationException(
+                            "A remote offer is already pending; answer it before applying another.");
+                }
+            }
+        }
+
+        // Glare (RFC 8829 §3.4.1, session-model.md §4.4): our own local offer is still pending. Roll it
+        // back to Stable so the incoming remote offer applies cleanly as if from Stable — the remote offer
+        // wins. Neither shipping consumer hits this (Proxeno only offers, each vuefix PC only answers).
+        if (glare)
+        {
+            var rolledBack = false;
+            lock (_lock)
+            {
+                if (_signalingState == SignalingState.HaveLocalOffer)
+                {
+                    RollbackToStableLocked();
+                    rolledBack = true;
+                }
+            }
+
+            if (rolledBack)
+            {
+                RaiseSignalingStateChanged(SignalingState.Stable);
             }
         }
 
@@ -617,6 +673,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
             lock (_lock)
             {
                 _signalingState = SignalingState.Stable;
+                _rollbackSnapshot = null;
             }
 
             RaiseSignalingStateChanged(SignalingState.Stable);
@@ -630,6 +687,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
         else
         {
+            // Capture the last-stable state before the offer mutates the route table and transceiver set,
+            // so a subsequent SetRemoteDescriptionAsync(rollback) can restore it (session-model.md §4.4).
+            lock (_lock)
+            {
+                _rollbackSnapshot = CaptureStableSnapshotLocked();
+            }
+
             ApplyRemoteOffer(description);
 
             lock (_lock)
