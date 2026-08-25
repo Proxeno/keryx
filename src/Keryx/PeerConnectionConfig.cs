@@ -164,6 +164,32 @@ public sealed class PeerConnectionConfig
     public bool EnableReceiverTransportCcFeedback { get; set; } = true;
 
     /// <summary>
+    /// Offer the absolute send time header extension
+    /// (<c>http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time</c>) via <c>a=extmap</c> and, once
+    /// it is negotiated, run the classic receive-side delay-gradient bandwidth estimator over the
+    /// abs-send-time each inbound packet carries and return the estimate to the sender as REMB
+    /// (<c>draft-alvestrand-rmcat-remb-03</c>). A sender that also negotiates the extension stamps its
+    /// transmit timestamp on every outbound packet, so two Keryx peers estimate each other's forward path
+    /// end to end.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Off by default, like the receive jitter buffer and automatic NACK — enabling it changes the wire
+    /// shape (an extra <c>a=extmap</c> in the offer, an extra header extension on every outbound packet)
+    /// and spends a little uplink returning REMB, so it stays opt-in and the default golden SDP is
+    /// byte-identical. REMB is the legacy congestion-control signal; where a peer also negotiates
+    /// transport-wide-cc the sender's estimator prefers that and REMB only ever caps it, so this is most
+    /// useful for interop with endpoints that speak REMB but not transport-cc.
+    /// </para>
+    /// <para>
+    /// The abs-send-time <c>a=extmap</c> appears only when this is set, and the receive-side estimator is
+    /// built only when the extension is actually negotiated, so with the flag off the path stays entirely
+    /// dormant.
+    /// </para>
+    /// </remarks>
+    public bool EnableReceiverRemb { get; set; }
+
+    /// <summary>
     /// Enable the send-side Google Congestion Control estimator and its leaky-bucket pacer. When set,
     /// inbound transport-wide-cc feedback, reception-report loss and REMB drive a
     /// <see cref="Keryx.Rtp.CongestionControl.GccCongestionController"/> whose target bitrate is

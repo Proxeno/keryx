@@ -124,6 +124,39 @@ public sealed class SdpOfferShapeTests
     }
 
     [Fact]
+    public async Task AbsSendTimeExtmapIsAbsentByDefault()
+    {
+        await using var peer = new PeerConnection(TestSupport.NewConfig());
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // The default golden offer must stay byte-identical: the abs-send-time extmap only appears when
+        // EnableReceiverRemb is set.
+        offer.Should().NotContain(SdpExtMap.AbsoluteSendTimeUri);
+    }
+
+    [Fact]
+    public async Task EnablingReceiverRembOffersTheAbsSendTimeExtensionOnEveryRtpSection()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableReceiverRemb = true;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        var parsed = SessionDescription.Parse(offer);
+
+        parsed.MediaDescriptions.Single(m => m.Media == "audio")
+            .GetExtMaps().Should().ContainSingle(e => e.IsAbsoluteSendTime).Which.Id.Should().Be(2);
+
+        parsed.MediaDescriptions.Single(m => m.Media == "video")
+            .GetExtMaps().Should().ContainSingle(e => e.IsAbsoluteSendTime).Which.Id.Should().Be(2);
+
+        // The data channel section carries no RTP header extensions.
+        parsed.MediaDescriptions.Single(m => m.Media == "application")
+            .GetExtMaps().Should().NotContain(e => e.IsAbsoluteSendTime);
+    }
+
+    [Fact]
     public async Task MediaSentBeforeConnectingIsDroppedAndCounted()
     {
         await using var peer = new PeerConnection(TestSupport.NewConfig());

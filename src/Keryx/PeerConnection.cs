@@ -682,7 +682,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
             Interlocked.Read(ref _twccCount),
             Interlocked.Read(ref _receiverReportCount),
             Interlocked.Read(ref _receiverNacksSent),
-            Interlocked.Read(ref _receiverTransportCcFeedbacksSent)),
+            Interlocked.Read(ref _receiverTransportCcFeedbacksSent),
+            Interlocked.Read(ref _rembsReceived),
+            Interlocked.Read(ref _rembsSent)),
         Interlocked.Read(ref _rtpReceived),
         Interlocked.Read(ref _rtcpReceived),
         Interlocked.Read(ref _srtpFailures),
@@ -1029,6 +1031,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     video.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
                 }
 
+                if (_config.EnableReceiverRemb)
+                {
+                    video.HeaderExtensions.Add(SdpExtMap.AbsoluteSendTime(AbsSendTimeExtensionId));
+                }
+
                 if (transceiver.Direction.Sends())
                 {
                     video.TrackId = sender.TrackId;
@@ -1055,6 +1062,11 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 if (_config.EnableTransportWideCc)
                 {
                     audio.HeaderExtensions.Add(SdpExtMap.TransportWideCc(TransportCcExtensionId));
+                }
+
+                if (_config.EnableReceiverRemb)
+                {
+                    audio.HeaderExtensions.Add(SdpExtMap.AbsoluteSendTime(AbsSendTimeExtensionId));
                 }
 
                 if (transceiver.Direction.Sends())
@@ -1249,6 +1261,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         // The transport-wide sequence number the send path stamps is shared across the BUNDLE; the
         // first sending section that echoed the extension fixes its id for the whole connection.
         byte? answerSendTransportCcId = null;
+        byte? answerSendAbsSendTimeId = null;
 
         for (var i = 0; i < offer.MediaDescriptions.Count; i++)
         {
@@ -1333,6 +1346,22 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         // receive-only answer still parses inbound transport-wide sequence numbers and
                         // returns feedback, even though it never stamps (that is _sendTransportCcExtensionId).
                         _negotiatedTransportCcExtensionId ??= (byte)extMap.Id;
+                        break;
+                    }
+                }
+            }
+
+            if (_config.EnableReceiverRemb)
+            {
+                // RFC 8285 §5: echo the offered abs-send-time mapping, keeping the offerer's id, so the
+                // extension is negotiated symmetrically. The negotiated id drives the receive-side REMB
+                // estimator regardless of media direction, exactly as the transport-cc id above.
+                foreach (var extMap in offered.GetExtMaps())
+                {
+                    if (extMap.IsAbsoluteSendTime && extMap.Id is >= 1 and <= 14)
+                    {
+                        section.HeaderExtensions.Add(SdpExtMap.AbsoluteSendTime(extMap.Id));
+                        _negotiatedAbsSendTimeExtensionId ??= (byte)extMap.Id;
                         break;
                     }
                 }
@@ -1492,6 +1521,18 @@ public sealed partial class PeerConnection : IAsyncDisposable
                             }
                         }
                     }
+
+                    if (_config.EnableReceiverRemb && answerSendAbsSendTimeId is null)
+                    {
+                        foreach (var extMap in section.HeaderExtensions)
+                        {
+                            if (extMap.IsAbsoluteSendTime && extMap.Id is >= 1 and <= 14)
+                            {
+                                answerSendAbsSendTimeId = (byte)extMap.Id;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1510,6 +1551,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         _sendTransportCcExtensionId = answerSendTransportCcId;
+        _sendAbsSendTimeExtensionId = answerSendAbsSendTimeId;
         return builder.Build();
     }
 
@@ -1730,6 +1772,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
         string? ufrag = null;
         string? password = null;
         byte? transportCcExtensionId = null;
+        byte? absSendTimeExtensionId = null;
         byte midExtensionId = 0;
         var routes = new Dictionary<byte, RtpRoute>();
         var routesByMid = new Dictionary<string, Dictionary<byte, RtpRoute>>(StringComparer.Ordinal);
@@ -1751,6 +1794,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
                     if (extMap.IsTransportWideCc && extMap.Id is >= 1 and <= 14)
                     {
                         transportCcExtensionId = (byte)extMap.Id;
+                        break;
+                    }
+                }
+            }
+
+            // The abs-send-time extension is likewise transport-wide; the first section that kept it in the
+            // answer fixes the id the send path stamps and the receive path parses for the REMB estimator.
+            if (absSendTimeExtensionId is null)
+            {
+                foreach (var extMap in media.HeaderExtensions)
+                {
+                    if (extMap.IsAbsoluteSendTime && extMap.Id is >= 1 and <= 14)
+                    {
+                        absSendTimeExtensionId = (byte)extMap.Id;
                         break;
                     }
                 }
@@ -1900,6 +1957,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         _sendTransportCcExtensionId = transportCcExtensionId;
         _negotiatedTransportCcExtensionId = transportCcExtensionId;
+        _sendAbsSendTimeExtensionId = absSendTimeExtensionId;
+        _negotiatedAbsSendTimeExtensionId = absSendTimeExtensionId;
 
         Volatile.Write(ref _routeTable, new RouteTable(routes, routesByMid, ssrcToMid, midExtensionId));
         Volatile.Write(ref _rtxSsrcToMediaSsrc, rtxToMedia);
