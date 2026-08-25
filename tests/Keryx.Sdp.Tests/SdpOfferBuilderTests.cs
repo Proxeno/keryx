@@ -418,6 +418,60 @@ public class SdpOfferBuilderTests
     }
 
     [Fact]
+    public void Vp9_UsesChromesFeedbackOrderAndProfileFmtp()
+    {
+        var vp9 = SdpCodec.Vp9();
+
+        vp9.PayloadType.Should().Be(98);
+        vp9.EncodingName.Should().Be("VP9");
+        vp9.ClockRate.Should().Be(90000);
+        vp9.Channels.Should().BeNull();
+        vp9.Fmtp.Should().Be("profile-id=0");
+        vp9.Feedback.Should().Equal(
+            RtcpFeedback.Nack,
+            RtcpFeedback.NackPli,
+            RtcpFeedback.CcmFir,
+            RtcpFeedback.GoogRemb,
+            RtcpFeedback.TransportCc);
+        vp9.IsRtx.Should().BeFalse();
+        vp9.GetAssociatedPayloadType().Should().BeNull();
+    }
+
+    [Fact]
+    public void Vp9_PayloadTypeAndProfileAreConfigurable()
+    {
+        var vp9 = SdpCodec.Vp9(100, profileId: "2");
+        vp9.PayloadType.Should().Be(100);
+        vp9.Fmtp.Should().Be("profile-id=2");
+    }
+
+    [Fact]
+    public void Av1_UsesChromesFeedbackOrderAndMinimalFmtp()
+    {
+        var av1 = SdpCodec.Av1();
+
+        av1.PayloadType.Should().Be(45);
+        av1.EncodingName.Should().Be("AV1");
+        av1.ClockRate.Should().Be(90000);
+        av1.Channels.Should().BeNull();
+        av1.Fmtp.Should().Be("level-idx=5;profile=0;tier=0");
+        av1.Feedback.Should().Equal(
+            RtcpFeedback.Nack,
+            RtcpFeedback.NackPli,
+            RtcpFeedback.CcmFir,
+            RtcpFeedback.GoogRemb,
+            RtcpFeedback.TransportCc);
+        av1.IsRtx.Should().BeFalse();
+        av1.GetAssociatedPayloadType().Should().BeNull();
+    }
+
+    [Fact]
+    public void Av1_PayloadTypeIsConfigurable()
+    {
+        SdpCodec.Av1(46).PayloadType.Should().Be(46);
+    }
+
+    [Fact]
     public void Rtx_BindsToTheRepairedPayloadTypeThroughApt()
     {
         // RFC 4588 §8.1: "apt ... the payload type of the associated original stream".

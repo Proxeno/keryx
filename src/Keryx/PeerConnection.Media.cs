@@ -1031,6 +1031,16 @@ public sealed partial class PeerConnection
             return new Vp8Packetizer();
         }
 
+        if (string.Equals(encodingName, "VP9", StringComparison.OrdinalIgnoreCase))
+        {
+            return new Vp9Packetizer();
+        }
+
+        if (string.Equals(encodingName, "AV1", StringComparison.OrdinalIgnoreCase))
+        {
+            return new Av1Packetizer();
+        }
+
         throw new InvalidOperationException(
             $"No send-side packetizer is wired for the negotiated video codec '{encodingName}'.");
     }
