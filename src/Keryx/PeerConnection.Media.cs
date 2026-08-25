@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 using Keryx.Core;
 using Keryx.Dtls;
@@ -453,7 +454,7 @@ public sealed partial class PeerConnection
     {
         var report = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
         var pli = new RtcpPictureLossIndication(_rtcpSenderSsrc, mediaSsrc);
-        return SendRtcpCompound([report, pli]);
+        return SendRtcpCompound(report, pli);
     }
 
     /// <summary>
@@ -480,7 +481,7 @@ public sealed partial class PeerConnection
         }
 
         var report = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
-        return SendRtcpCompound([report, nack]);
+        return SendRtcpCompound(report, nack);
     }
 
     /// <summary>
@@ -495,7 +496,7 @@ public sealed partial class PeerConnection
         var sequenceNumber = unchecked((byte)Interlocked.Increment(ref _firSequence));
         var report = new RtcpReceiverReport { SenderSsrc = _rtcpSenderSsrc };
         var fir = new RtcpFullIntraRequest(_rtcpSenderSsrc, 0, mediaSsrc, sequenceNumber);
-        return SendRtcpCompound([report, fir]) ? sequenceNumber : null;
+        return SendRtcpCompound(report, fir) ? sequenceNumber : null;
     }
 
     /// <summary>
@@ -1545,11 +1546,12 @@ public sealed partial class PeerConnection
         {
             var trackers = Volatile.Read(ref _simulcastByMid);
             if (trackers.TryGetValue(route.Mid, out var tracker)
-                && tracker.TryClassify(packet.Header, out var classification)
-                && handler is not null
-                && !classification.LayerId.IsEmpty)
+                && tracker.TryClassify(packet.Header, out _, out var resolvedRid)
+                && handler is not null)
             {
-                rid = classification.LayerId.ToString();
+                // resolvedRid is the tracker's cached per-layer RID (null for the empty layer), so the
+                // hot path reuses one string per layer instead of calling ToString() every packet.
+                rid = resolvedRid;
             }
         }
 
@@ -2263,9 +2265,7 @@ public sealed partial class PeerConnection
             try
             {
                 var length = RtcpPacket.WriteCompound(packets, _rtcpTx);
-                var protectedLength = srtp.Outbound.ProtectRtcp(_rtcpTx.AsSpan(0, length), _rtcpTx);
-                transport.Send(_rtcpTx.AsSpan(0, protectedLength));
-                return true;
+                return ProtectAndSendRtcpLocked(srtp, transport, length);
             }
             catch (InvalidOperationException)
             {
@@ -2281,6 +2281,86 @@ public sealed partial class PeerConnection
                 return false;
             }
         }
+    }
+
+    /// <summary>
+    /// Sends a single RTCP packet without wrapping it in a one-element array — the allocation-free path for
+    /// the per-cadence TWCC and REMB feedback packets. Byte-for-byte identical wire output to passing a
+    /// one-element list to <see cref="SendRtcpCompound(IReadOnlyList{RtcpPacket})"/>.
+    /// </summary>
+    private bool SendRtcpCompound(RtcpPacket packet)
+    {
+        lock (_sendLock)
+        {
+            var srtp = _srtp;
+            var transport = _transport;
+            if (srtp is null || transport is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var length = packet.WriteTo(_rtcpTx);
+                return ProtectAndSendRtcpLocked(srtp, transport, length);
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+            catch (ByteBufferException ex)
+            {
+                _logger.Log(KeryxLogLevel.Warning, "Dropping an oversized RTCP packet that did not fit the send buffer.", ex);
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sends a two-packet RTCP compound (a report plus one feedback packet — PLI, NACK or FIR) without
+    /// allocating the two-element array. The two packets are written back to back exactly as
+    /// <see cref="RtcpPacket.WriteCompound"/> would, so the wire output is unchanged.
+    /// </summary>
+    private bool SendRtcpCompound(RtcpPacket first, RtcpPacket second)
+    {
+        lock (_sendLock)
+        {
+            var srtp = _srtp;
+            var transport = _transport;
+            if (srtp is null || transport is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var length = first.WriteTo(_rtcpTx);
+                length += second.WriteTo(_rtcpTx.AsSpan(length));
+                return ProtectAndSendRtcpLocked(srtp, transport, length);
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+            catch (ByteBufferException ex)
+            {
+                _logger.Log(KeryxLogLevel.Warning, "Dropping an oversized RTCP compound that did not fit the send buffer.", ex);
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Protects the <paramref name="length"/>-byte RTCP plaintext already written into <see cref="_rtcpTx"/>
+    /// and sends it. Caller must hold <see cref="_sendLock"/> and have null-checked the SRTP context and
+    /// transport; may throw <see cref="InvalidOperationException"/> when the transport is torn down mid-send,
+    /// which each overload's catch turns into a dropped report.
+    /// </summary>
+    private bool ProtectAndSendRtcpLocked(SrtpContext srtp, IDatagramTransport transport, int length)
+    {
+        var protectedLength = srtp.Outbound.ProtectRtcp(_rtcpTx.AsSpan(0, length), _rtcpTx);
+        transport.Send(_rtcpTx.AsSpan(0, protectedLength));
+        return true;
     }
 
     /// <summary>
@@ -2356,7 +2436,7 @@ public sealed partial class PeerConnection
     /// transport-cc generator, then flushes a feedback packet back to the sender when the draft's cadence
     /// is due. No-op unless the extension was negotiated and receiver feedback is enabled. Runs on the
     /// single ICE receive loop, so the generator needs no locking; the flush itself sends under the send
-    /// lock through <see cref="SendRtcpCompound"/>.
+    /// lock through <see cref="SendRtcpCompound(System.Collections.Generic.IReadOnlyList{Keryx.Rtp.Rtcp.RtcpPacket})"/>.
     /// </summary>
     private void RecordTransportCcArrival(in RtpPacket packet)
     {
@@ -2376,7 +2456,7 @@ public sealed partial class PeerConnection
         if (generator.ShouldBuildFeedback(now)
             && generator.TryBuildFeedback(_rtcpSenderSsrc, packet.Header.Ssrc, out var feedback)
             && feedback is not null
-            && SendRtcpCompound([feedback]))
+            && SendRtcpCompound(feedback))
         {
             Interlocked.Increment(ref _receiverTransportCcFeedbacksSent);
         }
@@ -2387,7 +2467,7 @@ public sealed partial class PeerConnection
     /// then emits an RtcpReceiverEstimatedMaxBitrate back to the sender when the feedback cadence is due.
     /// No-op unless the extension was negotiated and REMB generation is enabled. Runs on the single ICE
     /// receive loop, so the generator needs no locking; the flush itself sends under the send lock through
-    /// <see cref="SendRtcpCompound"/>.
+    /// <see cref="SendRtcpCompound(System.Collections.Generic.IReadOnlyList{Keryx.Rtp.Rtcp.RtcpPacket})"/>.
     /// </summary>
     private void RecordAbsSendTimeArrival(in RtpPacket packet)
     {
@@ -2405,7 +2485,7 @@ public sealed partial class PeerConnection
         if (generator.ShouldBuildFeedback(now)
             && generator.TryBuildFeedback(_rtcpSenderSsrc, out var remb)
             && remb is not null
-            && SendRtcpCompound([remb]))
+            && SendRtcpCompound(remb))
         {
             Interlocked.Increment(ref _rembsSent);
         }
@@ -2888,6 +2968,10 @@ public sealed partial class PeerConnection
         private readonly object _gate = new();
         private readonly object _drainLock = new();
         private readonly Queue<QueuedPacket> _queue = new();
+
+        // The packets one drain admits, reused across drains (cleared at the head of each) so a drain
+        // never allocates a fresh list. Only ever touched under _drainLock, which serialises whole drains.
+        private readonly List<QueuedPacket> _ready = [];
         private ITimer? _timer;
         private bool _timerArmed;
         private bool _disposed;
@@ -2920,15 +3004,20 @@ public sealed partial class PeerConnection
         internal void Enqueue(ReadOnlySpan<byte> packet)
         {
             // Pacing is opt-in, so this copy — out of the caller's reusable buffer and into the queue —
-            // only happens when congestion control is enabled. The copy is oversized by the SRTP
-            // overhead so the drain can protect the packet in place, exactly as the direct path does.
-            var copy = new byte[packet.Length + _srtpOverhead];
+            // only happens when congestion control is enabled. Rent the copy buffer from the shared pool
+            // rather than allocating one per packet; the drain returns it after the send (even on a send
+            // fault). It is rented oversized by the SRTP overhead so the drain can protect the packet in
+            // place, exactly as the direct path does. ArrayPool may hand back a larger array, so the
+            // plaintext length is carried on the QueuedPacket rather than inferred from copy.Length.
+            var copy = ArrayPool<byte>.Shared.Rent(packet.Length + _srtpOverhead);
             packet.CopyTo(copy);
             var arm = false;
             lock (_gate)
             {
                 if (_disposed)
                 {
+                    // Never enqueued, so the drain will not return it: hand it straight back to the pool.
+                    ArrayPool<byte>.Shared.Return(copy);
                     return;
                 }
 
@@ -2968,7 +3057,9 @@ public sealed partial class PeerConnection
 
         private void DrainOnce()
         {
-            List<QueuedPacket>? ready = null;
+            // Reuse the member list across drains rather than allocating one per drain. Safe because
+            // _drainLock serialises whole drains, so no two drains ever touch _ready concurrently.
+            _ready.Clear();
             var wait = Timeout.InfiniteTimeSpan;
             lock (_gate)
             {
@@ -2983,7 +3074,7 @@ public sealed partial class PeerConnection
                     var head = _queue.Peek();
                     if (_pacer.TryConsume(head.Length))
                     {
-                        (ready ??= []).Add(_queue.Dequeue());
+                        _ready.Add(_queue.Dequeue());
                     }
                     else
                     {
@@ -3006,12 +3097,7 @@ public sealed partial class PeerConnection
                 }
             }
 
-            if (ready is null)
-            {
-                return;
-            }
-
-            foreach (var packet in ready)
+            foreach (var packet in _ready)
             {
                 try
                 {
@@ -3023,6 +3109,14 @@ public sealed partial class PeerConnection
                     // reused index (RFC 3711 §9.1) during a teardown/reset race. Drop this packet
                     // and keep draining the rest rather than crashing the host; RTP tolerates loss.
                     _logger.Log(KeryxLogLevel.Warning, "Dropping a paced RTP packet after a send failure.", ex);
+                }
+                finally
+                {
+                    // The rented copy buffer's lifetime ends at the send, so return it to the pool
+                    // whether the send succeeded or threw — the invariant is enqueue → drain → send →
+                    // return, with the return never skipped even on a fault. Cleared from _ready in the
+                    // next drain's Clear(), so no dangling reference survives the return.
+                    ArrayPool<byte>.Shared.Return(packet.Buffer);
                 }
             }
         }
@@ -3038,7 +3132,14 @@ public sealed partial class PeerConnection
                 }
 
                 _disposed = true;
-                _queue.Clear();
+
+                // Return every still-queued copy buffer to the pool instead of dropping it on the floor:
+                // these were rented in Enqueue and no drain will ever send them now.
+                while (_queue.Count > 0)
+                {
+                    ArrayPool<byte>.Shared.Return(_queue.Dequeue().Buffer);
+                }
+
                 timer = _timer;
                 _timer = null;
             }

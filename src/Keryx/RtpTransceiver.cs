@@ -227,19 +227,44 @@ public sealed class RtpSender : IRtpForwarder
 /// </summary>
 public sealed class RtpReceiver
 {
-    private volatile object? _remoteSsrc;
+    /// <summary>Sentinel for "no remote SSRC learned yet"; any real uint SSRC encodes as a non-negative long.</summary>
+    private const long NoRemoteSsrc = -1;
+
+    // The last demultiplexed remote SSRC, held as a sentinel long rather than a boxed uint? so the
+    // per-packet write on the inbound path never allocates. -1 means "none learned yet"; otherwise the
+    // low 32 bits hold the uint SSRC (every uint encodes as a non-negative long, disjoint from -1).
+    // Volatile.Read/Write reproduce the exact publication/visibility the prior volatile reference field
+    // gave: the single ICE receive loop publishes it, any thread reads it back through the uint? getters.
+    private long _remoteSsrc = NoRemoteSsrc;
 
     /// <summary>The remote sender's SSRC, learned from inbound RTP; <see langword="null"/> until one arrives.</summary>
-    public uint? Ssrc => (uint?)_remoteSsrc;
+    public uint? Ssrc => ReadRemoteSsrc();
 
     /// <summary>The negotiated receive payload type(s) for this m-line.</summary>
     public IReadOnlyList<byte> PayloadTypes { get; internal set; } = [];
 
-    /// <summary>The last demultiplexed remote SSRC snapshot; a single volatile reference write/read, no lock.</summary>
+    /// <summary>The last demultiplexed remote SSRC snapshot; a single volatile long write/read, no lock, no boxing.</summary>
     internal uint? RemoteSsrc
     {
-        get => (uint?)_remoteSsrc;
-        set => _remoteSsrc = value;
+        get => ReadRemoteSsrc();
+        set
+        {
+            var encoded = value is { } ssrc ? ssrc : NoRemoteSsrc;
+
+            // Only publish on an actual change (the receive loop is the sole writer, so this read is
+            // race-free) so a steady stream from one source neither writes nor boxes: zero-alloc,
+            // zero-write in the common case.
+            if (Volatile.Read(ref _remoteSsrc) != encoded)
+            {
+                Volatile.Write(ref _remoteSsrc, encoded);
+            }
+        }
+    }
+
+    private uint? ReadRemoteSsrc()
+    {
+        var value = Volatile.Read(ref _remoteSsrc);
+        return value < 0 ? null : (uint)value;
     }
 }
 

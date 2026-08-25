@@ -30,6 +30,10 @@ internal sealed class SimulcastReceiveTracker
         public long MediaPackets;
         public long RepairPackets;
         public uint MediaSsrc;
+
+        // The RID string for this layer, materialized once (lazily) and reused for every subsequent
+        // packet on the same stable SSRC↔layer binding, so the hot receive path stops re-allocating it.
+        public string? Rid;
     }
 
     private readonly SimulcastClassifier _classifier;
@@ -47,9 +51,15 @@ internal sealed class SimulcastReceiveTracker
     /// <summary>Classifies a packet and folds it into the per-layer counters. Never throws.</summary>
     /// <param name="header">The parsed inbound RTP header.</param>
     /// <param name="classification">On success, the layer the packet belongs to.</param>
+    /// <param name="rid">
+    /// On success, the layer's cached RID string (materialized once per layer and reused thereafter), or
+    /// <see langword="null"/> for the empty/unassigned layer. Reuses the same instance while the
+    /// SSRC↔layer binding is stable, so the receive path allocates a RID only on a layer transition.
+    /// </param>
     /// <returns>True when the packet was classified to a layer.</returns>
-    public bool TryClassify(in RtpHeader header, out RtpLayerClassification classification)
+    public bool TryClassify(in RtpHeader header, out RtpLayerClassification classification, out string? rid)
     {
+        rid = null;
         if (!_classifier.TryClassify(header, out classification))
         {
             return false;
@@ -71,6 +81,12 @@ internal sealed class SimulcastReceiveTracker
             {
                 counters.MediaPackets++;
                 counters.MediaSsrc = classification.Ssrc;
+            }
+
+            // Materialize the RID once per layer and cache it; a stable binding then reuses this string.
+            if (!classification.LayerId.IsEmpty)
+            {
+                rid = counters.Rid ??= classification.LayerId.ToString();
             }
         }
 
