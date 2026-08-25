@@ -16,7 +16,7 @@ jobs:
       # coverage rather than a no-op.
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
-      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=PionInterop&Category!=Soak"
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=Soak"
 
   # Browser interop, CI-enforced. This job installs a headless Chrome, so the ChromeInterop tests
   # (excluded from build-test above) MUST actually run here. KERYX_REQUIRE_CHROME=1 turns a missing
@@ -38,6 +38,86 @@ jobs:
         env:
           KERYX_REQUIRE_CHROME: "1"
           KERYX_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+  # Firefox interop, CI-enforced. A third real-engine lane alongside the Chrome lane, reusing the
+  # same role-flexible fixture and the same BrowserLauncher seam. It is valuable precisely because
+  # Firefox exercises paths Chrome does not: it negotiates two-byte RTP header extensions more
+  # readily, prefers a different codec/PT ordering, makes its own a=setup role choice, and does H.264
+  # only through the downloadable OpenH264 GMP rather than a built-in codec. This job installs Firefox,
+  # so the FirefoxInterop tests (excluded from build-test above) MUST actually run here.
+  # KERYX_REQUIRE_FIREFOX=1 turns a missing or unlaunchable browser into a failure instead of the
+  # graceful skip local dev gets, so an interop regression fails the build rather than passing.
+  # The lane proves all three shapes against Firefox: Keryx offers H.264 + data channels and Firefox
+  # decodes/round-trips (media-server), Firefox offers sendonly and Keryx receives its H.264 (ingest),
+  # and Keryx forwards RTP that Firefox receives (SFU egress). Two things make H.264 work headless on a
+  # Linux runner that macOS does not need: the OpenH264 GMP is registered into each test profile, and
+  # its sandbox is disabled (MOZ_DISABLE_GMP_SANDBOX) so the plugin process can start — without it
+  # Firefox rejects Keryx's H.264 video m-section, which is Keryx's BUNDLE tag, and then gathers no ICE
+  # candidates at all. Data channels use classic SCTP DATA (not RFC 8260 I-DATA), which is what Firefox
+  # handles — see PeerConnection.StartSctp.
+  firefox-interop:
+    runs-on: ubuntu-latest
+    # Safety bound: the FirefoxInterop tests each carry their own ~90s deadline and run serially, so a
+    # healthy run finishes in a few minutes. This ceiling guarantees a future regression can never hang
+    # the job for the six-hour GitHub default and burn CI minutes.
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-firefox@v1
+        id: setup-firefox
+        with:
+          firefox-version: latest
+      # Keryx speaks H.264 only, and Firefox needs Cisco's OpenH264 GMP to encode/decode it (Firefox
+      # ships no built-in H.264): it downloads the GMP on demand. Warming it once into a template
+      # profile — waiting for the registration pref, not just the plugin file — and copying that profile
+      # into each test's throwaway profile via KERYX_FIREFOX_GMP_DIR keeps every test from racing the
+      # download at SDP time. Best effort: the tests' prefs also enable Firefox's own on-demand fetch as
+      # a fallback, so a slow warm-up does not fail the job outright.
+      - name: Warm up OpenH264 GMP
+        run: |
+          FF="${{ steps.setup-firefox.outputs.firefox-path }}"
+          PROFILE="$HOME/keryx-ff-gmp"
+          mkdir -p "$PROFILE"
+          cat > "$PROFILE/user.js" <<'EOF'
+          user_pref("media.gmp-gmpopenh264.enabled", true);
+          user_pref("media.gmp-gmpopenh264.autoupdate", true);
+          user_pref("media.gmp-manager.updateEnabled", true);
+          user_pref("toolkit.telemetry.enabled", false);
+          user_pref("datareporting.policy.dataSubmissionEnabled", false);
+          user_pref("app.update.enabled", false);
+          EOF
+          "$FF" --headless --no-remote --new-instance --profile "$PROFILE" about:blank &
+          FF_PID=$!
+          # Wait for the plugin file AND the registration pref: Firefox only loads a GMP whose version
+          # is recorded in prefs.js, and that write lands after the download, so killing on the file
+          # alone leaves a profile that ignores the plugin (BrowserLauncher copies prefs.js to register
+          # it in each test profile). Require both before killing.
+          for i in $(seq 1 40); do
+            if ls "$PROFILE"/gmp-gmpopenh264/*/libgmpopenh264.* >/dev/null 2>&1 \
+               && grep -q 'gmp-gmpopenh264.version' "$PROFILE/prefs.js" 2>/dev/null; then
+              echo "OpenH264 GMP downloaded and registered."
+              break
+            fi
+            sleep 2
+          done
+          sleep 2
+          kill "$FF_PID" 2>/dev/null || true
+          echo "KERYX_FIREFOX_GMP_DIR=$PROFILE" >> "$GITHUB_ENV"
+          grep 'gmp-gmpopenh264.version' "$PROFILE/prefs.js" 2>/dev/null || echo "OpenH264 GMP not registered after warm-up (tests will fetch on demand)"
+      - run: dotnet build Keryx.slnx --configuration Release
+      # The DTLS-SRTP/ICE path uses host candidates only — no STUN, TURN or mDNS — so it runs headless.
+      # It is not loopback-only: headless Firefox gathers just its real interface address and binds its
+      # socket to it, and on Linux a 127.0.0.1-bound socket cannot reach a non-loopback peer, so the
+      # Keryx test peer binds IPAddress.Any to meet Firefox on the interface Firefox chose. The Firefox
+      # profile still disables mDNS (obfuscate_host_addresses=false) so the candidate is a real address
+      # rather than a .local name. See TestSupport.NewConfig for why Chrome tolerates loopback-only.
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=FirefoxInterop"
+        env:
+          KERYX_REQUIRE_FIREFOX: "1"
+          KERYX_FIREFOX_PATH: ${{ steps.setup-firefox.outputs.firefox-path }}
 
   # pion (Go WebRTC) reference-implementation interop, CI-enforced. A second, non-browser peer to
   # catch bugs a single implementation would mask. This job installs Go and builds the pion peer, so

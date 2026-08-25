@@ -1,11 +1,12 @@
 <!doctype html>
 <!--
-  Keryx Chrome interop client. Served by the integration test host; drives a real
-  RTCPeerConnection against a Keryx peer over HTTP signaling. One role-flexible
-  fixture: the ?role= query string picks who offers and in which direction, so the
-  same page covers the media-server shape (Keryx offers) and the SFU shapes (the
-  browser offers, Keryx answers). A sibling project extends this same page — do not
-  fork it.
+  Keryx browser interop client. Served by the integration test host; drives a real
+  RTCPeerConnection against a Keryx peer over HTTP signaling. Engine-agnostic: the
+  same page runs unchanged in headless Chrome and headless Firefox (the standard
+  RTCPeerConnection JS API), so both real-engine CI lanes share one fixture. One
+  role-flexible page: the ?role= query string picks who offers and in which direction,
+  so it covers the media-server shape (Keryx offers) and the SFU shapes (the browser
+  offers, Keryx answers). A sibling project extends this same page — do not fork it.
 
     ?role=answer      (default) Keryx offers; the browser answers.
         GET  /offer   -> { type: "offer",  sdp }   (Keryx is the offerer)
@@ -74,8 +75,12 @@ function wireChannel(dc) {
   };
 }
 
-// A moving, always-changing picture so Chrome's encoder produces a steady RTP stream
-// (a still frame would be encoded once and then go quiet). Used only by role=offer-send.
+// A moving, always-changing picture so the browser's encoder produces a steady RTP stream
+// (a still frame would be encoded once and then go quiet). Used only by role=offer-send, which
+// only the Chrome lane exercises: headless Chrome encodes H.264 from a canvas capture in every
+// environment, whereas headless Firefox has no portable H.264 encoder (it encodes on Linux but
+// not on macOS), so the Firefox lane omits the browser-sends-video shape rather than drive a
+// source it cannot reliably encode.
 function makeSyntheticVideoTrack() {
   const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 240 });
   const ctx = canvas.getContext("2d");
