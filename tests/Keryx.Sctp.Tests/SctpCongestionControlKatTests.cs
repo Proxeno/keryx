@@ -57,7 +57,11 @@ public class SctpCongestionControlKatTests
     [Fact]
     public async Task SlowStartOpensCongestionWindowByAtMostOneMtuPerSack()
     {
-        using var harness = new SctpAssociationTests.Harness();
+        // Sender A runs on a frozen clock that is never advanced: the transfer is loss-free so no
+        // retransmission is ever needed, and holding the clock guarantees no spurious T3 fires under
+        // CPU load to collapse cwnd/ssthresh mid-flight. Window growth here is SACK-driven (data), so
+        // it is unaffected by freezing time.
+        using var harness = new SctpAssociationTests.Harness(new TestTimeProvider());
         var telemetry = harness.A.CreateChannel("telemetry");
         await harness.ConnectAsync();
         WaitFor(() => harness.B.Channels.ContainsKey("telemetry")).Should().BeTrue();
@@ -102,7 +106,11 @@ public class SctpCongestionControlKatTests
     [Fact]
     public async Task CongestionAvoidanceGrowsAboutOneMtuPerRttAfterLoss()
     {
-        using var harness = new SctpAssociationTests.Harness();
+        // Sender A runs on a frozen clock that is never advanced. The single deliberate loss is
+        // recovered by fast retransmit (gap-ack driven, not timer driven), and phase 2 is loss-free,
+        // so no real timer is needed; holding the clock rules out a spurious T3 resetting cwnd during
+        // the congestion-avoidance climb this test measures.
+        using var harness = new SctpAssociationTests.Harness(new TestTimeProvider());
         var telemetry = harness.A.CreateChannel("telemetry");
         await harness.ConnectAsync();
         WaitFor(() => harness.B.Channels.ContainsKey("telemetry")).Should().BeTrue();
@@ -167,20 +175,37 @@ public class SctpCongestionControlKatTests
     [Fact]
     public async Task TimeoutCollapsesCwndToOneMtuAndHalvesSsthreshToFloor()
     {
-        using var harness = new SctpAssociationTests.Harness();
+        // The sender (A) runs on a manually advanced clock. All of A's timeout deadlines (INIT, T3,
+        // heartbeat) are computed from this frozen clock, so no timer can trip while the machine is
+        // under load — the CPU-starvation race that let a spurious T3 collapse cwnd before the test
+        // even began ("Expected 4380, found 1200") is gone. The one T3 this test needs is forced
+        // deterministically by advancing the clock past the RTO; the periodic Tick still runs on real
+        // time and observes the advanced clock, so the timeout fires as a real code path, not a mock.
+        var time = new TestTimeProvider();
+        using var harness = new SctpAssociationTests.Harness(time);
         var telemetry = harness.A.CreateChannel("telemetry");
         await harness.ConnectAsync();
         WaitFor(() => harness.B.Channels.ContainsKey("telemetry")).Should().BeTrue();
         WaitFor(() => telemetry.State == DataChannelState.Open).Should().BeTrue();
         Quiesce();
 
+        // The clock never moved during setup, so no retransmission timer could have fired: cwnd is
+        // still exactly the initial window.
         harness.A.Association.GetStatistics().CongestionWindow.Should().Be(InitialCwnd);
 
         // A single small message whose only transmission is dropped. With nothing else outstanding
-        // there are no gap acks, so fast retransmit cannot fire — only the T3 timer recovers it.
+        // there are no gap acks, so fast retransmit cannot fire — only the T3 timer recovers it. The
+        // send arms A's T3 timer at (frozen-now + RTO); with the clock held it will not fire yet.
         harness.A.Transport.DropNextDataDatagrams(1);
         telemetry.SendText("lost then retransmitted on T3");
         WaitFor(() => harness.A.Transport.DroppedDatagrams == 1).Should().BeTrue();
+
+        // Nothing has advanced time, so the message sits unrecovered and cwnd is untouched.
+        harness.A.Association.GetStatistics().CongestionWindow.Should().Be(InitialCwnd);
+
+        // Advance well past the (doubling-capped, <=60s) RTO so the very next real-time Tick sees the
+        // T3 deadline elapsed and runs the retransmission-timeout code path exactly once.
+        time.Advance(TimeSpan.FromSeconds(5));
 
         // RFC 4960 §7.2.3: a T3 timeout sets ssthresh = max(cwnd/2, 4*MTU) and cwnd = 1*MTU.
         WaitFor(() => harness.A.Association.GetStatistics().CongestionWindow < InitialCwnd, 10_000)
@@ -199,7 +224,11 @@ public class SctpCongestionControlKatTests
     [Fact]
     public async Task LossOnAMultiChunkMessageHalvesSsthreshToFloorAndRecovers()
     {
-        using var harness = new SctpAssociationTests.Harness();
+        // Sender A runs on a frozen clock that is never advanced. The dropped first chunk is recovered
+        // by fast retransmit (three miss indications from the later chunks' gap acks), which is data
+        // driven, so freezing time cannot stall recovery; it only removes the chance of a spurious T3
+        // firing under load and disturbing the ssthresh trajectory this test pins.
+        using var harness = new SctpAssociationTests.Harness(new TestTimeProvider());
         var telemetry = harness.A.CreateChannel("telemetry");
         await harness.ConnectAsync();
         WaitFor(() => harness.B.Channels.ContainsKey("telemetry")).Should().BeTrue();
