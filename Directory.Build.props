@@ -11,8 +11,9 @@
     <IsPackable>false</IsPackable>
     <PackageId>Proxeno.$(MSBuildProjectName)</PackageId>
     <!-- Default package version. The pack workflow overrides this with the git tag at release time
-         (see .github/workflows/pack.yml). 0.3.1 ships the DoS-hardening fixes from the security review
-         (SCTP/RTP/SRTP per-source bounds, ICE consent freshness) on top of 0.3.0's public API. -->
-    <VersionPrefix>0.3.1</VersionPrefix>
+         (see .github/workflows/pack.yml). 0.3.2 completes the security-review follow-ups on top of
+         0.3.1: ICE mDNS/candidate caps, DTLS epoch-0 malformed-body discard, SCTP TSN-index + state
+         guards, and an H.264 depacketizer bound. -->
+    <VersionPrefix>0.3.2</VersionPrefix>
   </PropertyGroup>
 </Project>
