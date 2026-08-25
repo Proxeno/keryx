@@ -31,6 +31,18 @@ public sealed partial class PeerConnection
     private readonly object _sendLock = new();
     private readonly byte[] _rxPlain = new byte[2048];
 
+    // Nonce-safety guard for the broadcast key-bridge one-owner rule (broadcast-scale.md §4). Every SRTP
+    // encrypt context this connection hands out — its own send context behind TryForwardRtp, and the
+    // sibling send-keyed context CreateSendKeyedSrtpContext mints for the broadcast fan-out — shares this
+    // connection's ONE DTLS-derived send master key. Two independent SRTP packet-index counters over one
+    // key+SSRC repeat the AES-CM keystream and the AES-GCM nonce (catastrophic), so a given send SSRC must
+    // be driven by exactly one of the two paths for the connection's lifetime. This registry records which
+    // path first claimed each send SSRC; the other path then throws instead of silently reusing the nonce
+    // space. A claim is a permanent latch: once an SSRC's index space under the fixed send key is spent by
+    // one path it can never be re-owned, because a fresh context on that key+SSRC would restart at index 0
+    // and collide with what already went out.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<uint, SsrcSendPathOwner> _ssrcSendPathOwners = new();
+
     // Scratch buffer the reconstructed media packet is written into when an inbound RFC 4588 RTX packet
     // is decapsulated. Distinct from _rxPlain (which still holds the RTX packet being read) so the two
     // never overlap, and touched only from the single ICE receive loop that drives HandleRtp.
@@ -264,6 +276,14 @@ public sealed partial class PeerConnection
             return false;
         }
 
+        // Nonce-safety guard (broadcast-scale.md §4 one-owner rule): if this send SSRC was handed to a
+        // bridged broadcast fan-out context — which shares this connection's send master key — then
+        // forwarding it here as well would drive two SRTP index counters over one key+SSRC, repeating the
+        // AES-CM keystream / AES-GCM nonce. That is a catastrophic key-reuse bug, so it is refused loudly
+        // rather than swallowed by the total-never-throws contract below (which only covers transient send
+        // failures). The claim also records this SSRC as forward-owned, so a later bridge of it throws too.
+        ClaimSendSsrcForForward(sender.Ssrc);
+
         lock (_sendLock)
         {
             if (_srtp is null)
@@ -284,6 +304,60 @@ public sealed partial class PeerConnection
                 return false;
             }
         }
+    }
+
+    /// <summary>
+    /// Registers <paramref name="ssrc"/> as owned by a bridged broadcast fan-out context on this connection
+    /// (<c>broadcast-scale.md</c> §4 one-owner rule), enforcing SRTP nonce safety: a bridged
+    /// <see cref="Srtp.SrtpEncryptContext"/> from <see cref="CreateSendKeyedSrtpContext"/> shares this
+    /// connection's send master key, so once an SSRC is fanned out through the bridge it must never also be
+    /// driven by <see cref="TryForwardRtp"/> (two index counters over one key+SSRC repeat the AES-CM
+    /// keystream / AES-GCM nonce). After this call, <see cref="TryForwardRtp"/> on the same SSRC throws, and
+    /// so does a second registration of it. <c>ViewerBroadcastBridge</c> calls this for you when it builds a
+    /// fan-out subscriber; call it directly only if you drive the send-keyed context yourself.
+    /// </summary>
+    /// <param name="ssrc">The outbound broadcast SSRC the bridged fan-out will encrypt under the shared send key.</param>
+    /// <exception cref="InvalidOperationException">
+    /// The SSRC is already owned by another send path on this connection — either it has been forwarded via
+    /// <see cref="TryForwardRtp"/>, or it is already registered to a bridged fan-out. Reusing it would repeat
+    /// the SRTP keystream/nonce, so the collision is refused.
+    /// </exception>
+    public void RegisterBridgedFanoutSsrc(uint ssrc)
+    {
+        if (!_ssrcSendPathOwners.TryAdd(ssrc, SsrcSendPathOwner.BridgedFanout))
+        {
+            var existing = _ssrcSendPathOwners.GetValueOrDefault(ssrc, SsrcSendPathOwner.BridgedFanout);
+            throw new InvalidOperationException(
+                $"SSRC 0x{ssrc:x8} cannot be bridged onto the broadcast fan-out: it is already owned by "
+                + $"'{existing}' on this connection. Two SRTP contexts sharing this connection's send key over "
+                + "one SSRC would repeat the AES-CM keystream and AES-GCM nonce (broadcast-scale.md §4). A "
+                + "bridged SSRC is a permanent, single-owner claim for the connection's lifetime.");
+        }
+    }
+
+    // Records a send SSRC as owned by the ordinary TryForwardRtp path, and throws if a bridged fan-out
+    // already owns it. Idempotent for the forward path (the one connection send context keeps advancing a
+    // single index space), so it is safe to call on every forwarded packet.
+    private void ClaimSendSsrcForForward(uint ssrc)
+    {
+        var owner = _ssrcSendPathOwners.GetOrAdd(ssrc, SsrcSendPathOwner.ConnectionForward);
+        if (owner == SsrcSendPathOwner.BridgedFanout)
+        {
+            throw new InvalidOperationException(
+                $"SSRC 0x{ssrc:x8} cannot be forwarded via TryForwardRtp: it is already bridged onto the "
+                + "broadcast fan-out, which encrypts it under a sibling context sharing this connection's send "
+                + "key. Forwarding it here too would drive two SRTP index counters over one key+SSRC, repeating "
+                + "the AES-CM keystream and AES-GCM nonce (broadcast-scale.md §4). Drive the viewer's media "
+                + "exclusively through the fan-out once it is bridged.");
+        }
+    }
+
+    // Which send path owns a given outbound SSRC's SRTP index space, so the other path can be refused before
+    // it reuses the shared send key's nonce space over that SSRC (broadcast-scale.md §4).
+    private enum SsrcSendPathOwner
+    {
+        ConnectionForward,
+        BridgedFanout,
     }
 
     /// <summary>

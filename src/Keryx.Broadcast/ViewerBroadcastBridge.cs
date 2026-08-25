@@ -29,6 +29,15 @@ namespace Keryx.Broadcast;
 /// does not conflict. The returned subscriber owns its encrypt context and disposes it on
 /// <see cref="BroadcastSubscriber.Dispose"/>.
 /// </para>
+/// <para>
+/// <b>The one-owner rule is enforced, not merely documented.</b> Building a subscriber registers the
+/// broadcast SSRC on the connection (<see cref="PeerConnection.RegisterBridgedFanoutSsrc"/>): a subsequent
+/// <see cref="PeerConnection.TryForwardRtp"/> on that SSRC then <b>throws</b>, and so does a second bridge
+/// of the same SSRC. The claim is a permanent single-owner latch for the connection's lifetime — a fresh
+/// context on that fixed send key + SSRC would restart at SRTP index 0 and collide with what already went
+/// out — so a bridged SSRC can never be forwarded or re-bridged, closing the nonce-reuse hole by
+/// construction rather than by convention.
+/// </para>
 /// </remarks>
 public static class ViewerBroadcastBridge
 {
@@ -69,14 +78,32 @@ public static class ViewerBroadcastBridge
         // Mint a fresh encrypt context keyed to this viewer's DTLS-derived send direction. Throws if SRTP is
         // not negotiated yet. Owned by the subscriber from here on; dispose it if wiring the subscriber fails.
         var srtp = session.Connection.CreateSendKeyedSrtpContext();
+        BroadcastSubscriber subscriber;
         try
         {
-            return new BroadcastSubscriber(forwarder, srtp, destination, maxIngestPacketSize);
+            subscriber = new BroadcastSubscriber(forwarder, srtp, destination, maxIngestPacketSize);
         }
         catch
         {
             srtp.Dispose();
             throw;
         }
+
+        // Claim the broadcast SSRC for the fan-out path as the last step, so nothing is registered if the
+        // steps above threw (letting a legitimate retry re-bridge). This ENFORCES the one-owner rule
+        // (broadcast-scale.md §4): the connection now refuses to also TryForwardRtp this SSRC, and refuses a
+        // second bridge of it — either would drive two SRTP index counters over the one shared send key and
+        // SSRC, repeating the AES-CM keystream / AES-GCM nonce. On collision, tear the subscriber back down.
+        try
+        {
+            session.Connection.RegisterBridgedFanoutSsrc(forwarder.OutboundSsrc);
+        }
+        catch
+        {
+            subscriber.Dispose();
+            throw;
+        }
+
+        return subscriber;
     }
 }

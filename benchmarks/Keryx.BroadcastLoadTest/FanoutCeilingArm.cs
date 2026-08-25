@@ -79,6 +79,56 @@ internal static class FanoutCeilingArm
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Arm P — socket-pool scaling sweep: hold the viewer count fixed and ramp the socket pool 1/2/4/8,
+    // showing the fan-out send spreading across cores as more shards are added (broadcast-scale.md §2/§4).
+    // ---------------------------------------------------------------------------------------------
+    public static async Task RunPoolSweepAsync(
+        MediaProfile profile,
+        int viewerCount,
+        int[] poolSizes,
+        TimeSpan duration,
+        int workers,
+        int recvBufferBytes)
+    {
+        Header($"Arm P: socket-pool scaling sweep — PER-VIEWER path, {viewerCount:N0} viewers",
+            "The SAME fan-out (real BroadcastFanout, N per-viewer encrypts, real batched sendmmsg) driven",
+            "through a BroadcastEndpoint bound to a POOL of sockets (SO_REUSEPORT, one advertised port). Each",
+            "shard owns a socket + send worker, so N shards flush N sendmmsg batches in parallel per ingest",
+            "packet. Watch delivered pkt/s rise and the send stop being one-thread-bound as the pool grows.");
+
+        Console.WriteLine("   req.pool | eff.pool |   passes/s |  delivered pkt/s |    egress |  drop% |  CPU cores | decode");
+        Console.WriteLine("   ---------+----------+------------+------------------+-----------+--------+------------+-------");
+        foreach (var pool in poolSizes)
+        {
+            var result = await RunLevelAsync(profile, viewerCount, duration, recvBufferBytes,
+                (sinks, keys) => new PerViewerEngine(sinks, keys, workers), sharedKey: false, socketPoolSize: pool);
+            if (result is null)
+            {
+                Console.WriteLine($"   {pool,8} | (could not bind {viewerCount:N0} sinks on this host — fd limit; raise ulimit -n / run in Docker)");
+                break;
+            }
+
+            var gbps = result.DeliveredPps * profile.VideoPacketBytes * 8 / 1e9;
+            var dropPct = result.Requested > 0 ? 100.0 * (result.Requested - result.Delivered) / result.Requested : 0;
+            var decode = result.DecryptFailures == 0 && result.ForeignSsrc == 0 && result.Decrypted > 0
+                ? "OK"
+                : $"FAIL(df={result.DecryptFailures},fs={result.ForeignSsrc})";
+            Console.WriteLine(
+                $"   {pool,8} | {result.EffectivePoolSize,8} | {result.PassesPerSec,10:N0} | {result.DeliveredPps,16:N0} | "
+                + $"{gbps,6:F2} Gb | {dropPct,5:F1}% | {result.Delta.CpuCores,10:F1} | {decode}");
+        }
+
+        if (!OperatingSystem.IsLinux())
+        {
+            Console.WriteLine();
+            Console.WriteLine("   NOTE: SO_REUSEPORT is Linux-only; off Linux the effective pool stays 1 (single-socket");
+            Console.WriteLine("   fallback) so every row measures the same one socket. Run in Docker/Linux to see it scale.");
+        }
+
+        Console.WriteLine();
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // One (N viewers) level: build sinks + engine (with aligned keys), run flat out, collect metrics.
     // ---------------------------------------------------------------------------------------------
     private static async Task<LevelResult?> RunLevelAsync(
@@ -87,9 +137,14 @@ internal static class FanoutCeilingArm
         TimeSpan duration,
         int recvBufferBytes,
         Func<IReadOnlyList<LoopbackSink>, SrtpSessionKeys[], IFanoutEngine> buildEngine,
-        bool sharedKey)
+        bool sharedKey,
+        int socketPoolSize = 1)
     {
-        await using var endpoint = new BroadcastEndpoint(new BroadcastEndpointOptions { MaxViewers = 1 });
+        await using var endpoint = new BroadcastEndpoint(new BroadcastEndpointOptions
+        {
+            MaxViewers = 1,
+            SocketPoolSize = socketPoolSize,
+        });
 
         List<LoopbackSink> sinks = new(viewerCount);
         IFanoutEngine? engine = null;
@@ -190,7 +245,8 @@ internal static class FanoutCeilingArm
                 received,
                 decrypted,
                 decryptFail,
-                foreign);
+                foreign,
+                endpoint.SocketPoolSize);
         }
         finally
         {
@@ -264,7 +320,8 @@ internal static class FanoutCeilingArm
         long Received,
         long Decrypted,
         long DecryptFailures,
-        long ForeignSsrc);
+        long ForeignSsrc,
+        int EffectivePoolSize);
 
     // ---------------------------------------------------------------------------------------------
     // Fan-out engines: the per-pass work under measurement, behind one interface so the level runner is
