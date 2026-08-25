@@ -101,4 +101,60 @@ public class RembFeedbackGeneratorTests
         generator.TryBuildFeedback(0xAAAA_AAAA, out var remb).Should().BeTrue();
         remb!.Ssrcs.Should().BeEquivalentTo(new uint[] { 10, 20, 30 });
     }
+
+    // Adversarial: a peer authenticated to the SRTP context can stamp a fresh SSRC on every packet it
+    // sends. Every such packet reaches the REMB path (it runs before route resolution), so an uncapped
+    // generator would retain one entry per invented SSRC — unbounded memory, a wrapped 8-bit Num-SSRC
+    // count once past 255, and a REMB that no longer fits the RTCP MTU buffer, throwing on the receive loop
+    // that builds it. The retained set must stay bounded however many sources the peer invents.
+    [Fact]
+    public void A_flood_of_invented_ssrcs_cannot_grow_the_reported_ssrc_set_without_bound()
+    {
+        var generator = new RembFeedbackGenerator(Interval, Options);
+
+        long arrival = 5_000_000;
+        const int floodSize = 5_000;
+        for (var i = 0; i < floodSize; i++)
+        {
+            // A distinct, well-formed SSRC on every packet — the withheld-source flood.
+            var ssrc = 0x4000_0000u + (uint)i;
+            generator.OnPacketReceived(AbsoluteSendTimeExtension.FromMicroseconds(arrival - 5_000_000), arrival, PacketSize, ssrc);
+            arrival += 5_000;
+        }
+
+        generator.TryBuildFeedback(0xAAAA_AAAA, out var remb).Should().BeTrue();
+
+        // The set the REMB names is capped at the 8-bit wire limit, not grown to one entry per invented SSRC.
+        remb!.Ssrcs.Count.Should().Be(RembFeedbackGenerator.MaxTrackedSsrcs);
+
+        // The emitted packet fits a single 1500-byte RTCP datagram (the buffer PeerConnection serialises
+        // into), so building it never overflows — the count byte also holds the SSRC count without wrapping.
+        var wire = remb.ToByteArray();
+        wire.Length.Should().BeLessThanOrEqualTo(1500);
+        RtcpReceiverEstimatedMaxBitrate.TryParse(wire, out var parsed).Should().BeTrue();
+        parsed!.Ssrcs.Count.Should().Be(RembFeedbackGenerator.MaxTrackedSsrcs);
+    }
+
+    // Sources past the cap still drive the estimator (only their naming in the feedback is dropped), so the
+    // bitrate the flood reports is a real, clamped estimate rather than a degenerate value.
+    [Fact]
+    public void A_flood_still_reports_a_sane_clamped_bitrate()
+    {
+        var generator = new RembFeedbackGenerator(Interval, Options);
+
+        long send = 0;
+        long arrival = 5_000_000;
+        for (var i = 0; i < 1_000; i++)
+        {
+            var ssrc = 0x5000_0000u + (uint)i;
+            generator.OnPacketReceived(AbsoluteSendTimeExtension.FromMicroseconds(send), arrival, PacketSize, ssrc);
+            send += 5_000;
+            arrival += 5_000;
+        }
+
+        generator.HasObservedTraffic.Should().BeTrue();
+        generator.TryBuildFeedback(0xAAAA_AAAA, out var remb).Should().BeTrue();
+        remb!.BitrateBitsPerSecond.Should().BeInRange(
+            (ulong)Options.MinBitrateBitsPerSecond, (ulong)Options.MaxBitrateBitsPerSecond);
+    }
 }
