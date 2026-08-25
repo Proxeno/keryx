@@ -42,6 +42,12 @@ public sealed class SctpAssociation : IDisposable
     // cannot be side-stepped with a flood of near-empty chunks.
     private const int MinChunkBufferCharge = 256;
 
+    // RFC 6525 §5.1 keeps at most one incoming reset request outstanding at a time, so a peer that
+    // behaves keeps _deferredIncomingResets tiny. A hostile peer can send an unbounded run of
+    // distinct request sequences whose Sender's Last Assigned TSN we will never reach, each of which
+    // would otherwise be parked forever. Cap the deferred list so that flood cannot pin memory.
+    private const int MaxDeferredIncomingResets = 16;
+
     private readonly object _lock = new();
     private readonly IDatagramTransport _lower;
     private readonly SctpAssociationConfig _config;
@@ -90,6 +96,7 @@ public sealed class SctpAssociation : IDisposable
     private uint _peerTag;
     private uint _localInitialTsn;
     private uint _nextTsn;
+    private uint _highestTransmittedTsn;
     private uint _peerCumulativeAck;
     private uint _advancedPeerAckPoint;
     private uint _cumulativeTsnReceived;
@@ -162,6 +169,7 @@ public sealed class SctpAssociation : IDisposable
         _localTag = RandomTag();
         _localInitialTsn = RandomTag();
         _nextTsn = _localInitialTsn;
+        _highestTransmittedTsn = unchecked(_localInitialTsn - 1);
         _reconfigNextSeq = _localInitialTsn;
         _peerCumulativeAck = unchecked(_localInitialTsn - 1);
         _advancedPeerAckPoint = _peerCumulativeAck;
@@ -267,6 +275,18 @@ public sealed class SctpAssociation : IDisposable
             lock (_lock)
             {
                 return _receiveBufferBytes + _reorderBufferBytes;
+            }
+        }
+    }
+
+    /// <summary>Number of deferred incoming RFC 6525 reset requests currently parked. Test observability only.</summary>
+    internal int DeferredIncomingResetCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _deferredIncomingResets.Count;
             }
         }
     }
@@ -1764,11 +1784,15 @@ public sealed class SctpAssociation : IDisposable
         // TSN has been received, so the reset stays in order with the stream's data.
         if (Serial.Gt(request.SendersLastAssignedTsn, _cumulativeTsnReceived))
         {
-            if (!_deferredIncomingResets.Any(r => r.RequestSequence == request.RequestSequence))
+            if (!_deferredIncomingResets.Any(r => r.RequestSequence == request.RequestSequence)
+                && _deferredIncomingResets.Count < MaxDeferredIncomingResets)
             {
                 _deferredIncomingResets.Add(request);
             }
 
+            // Answer In-Progress whether or not we stored the request: a legitimate peer keeps only
+            // one reset outstanding and retransmits, so a genuine deferral is retried and parked once
+            // the flood-induced backlog drains, while a hostile flood is bounded to the cap above.
             responses.Add(new SctpReconfigResponse(request.RequestSequence, SctpReconfigResult.InProgress));
             return;
         }
@@ -1924,18 +1948,32 @@ public sealed class SctpAssociation : IDisposable
 
         if (Serial.Gt(forward.NewCumulativeTsn, _cumulativeTsnReceived))
         {
-            for (var t = unchecked(_cumulativeTsnReceived + 1); Serial.Lte(t, forward.NewCumulativeTsn); t = unchecked(t + 1))
+            // Evict only the TSNs actually buffered in the skipped range rather than walking every
+            // value between the old and new cumulative TSN. NewCumulativeTsn is attacker-controlled
+            // and, in serial arithmetic, may sit almost 2^31 beyond ours; a dense per-TSN loop would
+            // spin for billions of iterations under the association lock, stalling the whole
+            // endpoint. The buffered sets are already bounded by the receive-buffer hard cap, so
+            // draining by key is O(buffered) and identical in effect.
+            var oldCumulative = _cumulativeTsnReceived;
+            var newCumulative = forward.NewCumulativeTsn;
+            bool Skipped(uint tsn) => Serial.Gt(tsn, oldCumulative) && Serial.Lte(tsn, newCumulative);
+
+            _received.RemoveWhere(Skipped);
+
+            foreach (var tsn in _fragments.Keys.Where(Skipped).ToList())
             {
-                _received.Remove(t);
-                if (_fragments.Remove(t, out var removed))
+                if (_fragments.Remove(tsn, out var removed))
                 {
                     _receiveBufferBytes -= removed.Payload.Length;
                 }
-
-                DropIDataFragmentByTsn(t);
             }
 
-            _cumulativeTsnReceived = forward.NewCumulativeTsn;
+            foreach (var tsn in _iDataTsnIndex.Keys.Where(Skipped).ToList())
+            {
+                DropIDataFragmentByTsn(tsn);
+            }
+
+            _cumulativeTsnReceived = newCumulative;
             AdvanceCumulativeReceive();
         }
 
@@ -2143,6 +2181,11 @@ public sealed class SctpAssociation : IDisposable
                 chunk.LastSentMs = now;
                 chunk.InFlight = true;
                 _flightSize += chunk.WireSize;
+                if (Serial.Gt(chunk.Tsn, _highestTransmittedTsn))
+                {
+                    _highestTransmittedTsn = chunk.Tsn;
+                }
+
                 if (!_rttProbeActive)
                 {
                     _rttProbeActive = true;
@@ -2351,15 +2394,38 @@ public sealed class SctpAssociation : IDisposable
             return;
         }
 
+        // A SACK must not acknowledge a TSN this endpoint has not yet transmitted (RFC 9260 §6.2.1).
+        // Accepting a cumulative ack beyond the highest TSN we put on the wire would let a peer
+        // advance _peerCumulativeAck past our send queue and silently flush DATA — including
+        // still-queued, never-transmitted chunks — from _out. Discard such a SACK outright.
+        if (Serial.Gt(sack.CumulativeTsnAck, _highestTransmittedTsn))
+        {
+            _log.Log(
+                KeryxLogLevel.Warning,
+                $"Discarding SACK acknowledging un-sent TSN {sack.CumulativeTsnAck} (highest transmitted {_highestTransmittedTsn}).");
+            return;
+        }
+
         var flightBefore = _flightSize;
         var advanced = Serial.Gt(sack.CumulativeTsnAck, _peerCumulativeAck);
         _peerCumulativeAck = sack.CumulativeTsnAck;
         var ackedBytes = AckUpTo(sack.CumulativeTsnAck);
 
+        // A gap ack block reports TSNs above the cumulative ack, so any offset beyond the highest
+        // TSN we transmitted names data that cannot be outstanding. Clamp each block to that range
+        // (and skip a block whose bounds are inverted) so a peer cannot force up to 65535 wasted
+        // FindChunk scans per gap block with an arbitrary, out-of-range End.
+        var maxOffset = unchecked(_highestTransmittedTsn - sack.CumulativeTsnAck);
         var highestGapAck = sack.CumulativeTsnAck;
         foreach (var block in sack.GapAckBlocks)
         {
-            for (uint offset = block.Start; offset <= block.End; offset++)
+            if (block.End < block.Start)
+            {
+                continue;
+            }
+
+            var end = Math.Min((uint)block.End, maxOffset);
+            for (uint offset = block.Start; offset <= end; offset++)
             {
                 var tsn = unchecked(sack.CumulativeTsnAck + offset);
                 ackedBytes += AckChunk(tsn);
