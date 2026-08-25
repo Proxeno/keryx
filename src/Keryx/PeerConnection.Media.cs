@@ -4,6 +4,7 @@ using Keryx.Dtls;
 using Keryx.Ice;
 using Keryx.Rtp;
 using Keryx.Rtp.CongestionControl;
+using Keryx.Rtp.Fec;
 using Keryx.Rtp.Packetization;
 using Keryx.Rtp.Rtcp;
 using Keryx.Rtp.Simulcast;
@@ -33,7 +34,32 @@ public sealed partial class PeerConnection
     // is decapsulated. Distinct from _rxPlain (which still holds the RTX packet being read) so the two
     // never overlap, and touched only from the single ICE receive loop that drives HandleRtp.
     private readonly byte[] _rtxRecovered = new byte[2048];
+
+    // Scratch buffer a FEC-recovered media packet is drained into before it is re-delivered through the
+    // ordinary receive path, distinct from _rxPlain and _rtxRecovered for the same non-overlap reason.
+    // Touched only from the single ICE receive loop that drives HandleRtp.
+    private readonly byte[] _fecRecovered = new byte[2048];
     private readonly byte[] _rtcpTx = new byte[1500];
+
+    // FEC receive state (RFC 5109 ULPFEC over RFC 2198 RED / RFC 8627 FlexFEC). The payload types are
+    // published from the negotiation path when the negotiated video m-section kept the FEC codecs and the
+    // matching config flag is set; thereafter they are read only from the single ICE receive loop that
+    // drives HandleRtp. A null type disables the corresponding intake, so the default-off path never even
+    // parses for FEC. The per-media-SSRC receivers are built lazily as media/FEC packets arrive and are
+    // bounded by MaxReceiveSources, exactly like the reception-statistics and jitter-buffer tables.
+    private byte? _receiveRedPayloadType;
+    private byte? _receiveUlpfecPayloadType;
+    private byte? _receiveFlexFecPayloadType;
+    private readonly Dictionary<uint, UlpFecReceiver> _ulpfecReceivers = [];
+    private readonly Dictionary<uint, FlexFecReceiver> _flexFecReceivers = [];
+    private long _fecPacketsRecovered;
+
+    /// <summary>
+    /// How many media packets one FEC repair packet protects. A repair packet recovers a single loss per
+    /// group, so smaller groups repair a higher loss rate at more overhead. Kept below the ULPFEC short
+    /// mask width (16) so one repair packet always spans a whole group, and well below the FlexFEC mask.
+    /// </summary>
+    internal const int FecProtectionGroupSize = 10;
 
     /// <summary>The <c>a=extmap</c> id offered for the transport-wide congestion-control extension.</summary>
     private const int TransportCcExtensionId = 3;
@@ -982,6 +1008,8 @@ public sealed partial class PeerConnection
                             + $"{history.Capacity}-packet / {history.Retention.TotalMilliseconds:F0} ms send history.");
                     }
 
+                    var fec = BuildFecEmitter(sender, negotiated, datagram, profile.RtpOverhead);
+
                     sender.Track = new TrackSender(
                         this,
                         negotiated.Mid,
@@ -992,7 +1020,8 @@ public sealed partial class PeerConnection
                         profile.RtpOverhead,
                         transportCcId,
                         absSendTimeId,
-                        rtx);
+                        rtx,
+                        fec);
                 }
                 else if (transceiver.Kind == MediaKind.Audio)
                 {
@@ -1009,6 +1038,44 @@ public sealed partial class PeerConnection
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Builds the FEC emitter for a sending video track from what the answer settled on: a FlexFEC (RFC
+    /// 8627) emitter on the sender's dedicated FlexFEC SSRC when FlexFEC was kept, else an RFC 5109 ULPFEC
+    /// emitter (RED-wrapped, RFC 2198) on a private repair SSRC when red/ulpfec were kept. FlexFEC wins.
+    /// Returns null — the default-off path — when neither scheme was negotiated. The generators are sized
+    /// for a whole datagram's worth of protected octets so no media packet is ever refused.
+    /// </summary>
+    private FecEmitter? BuildFecEmitter(RtpSender sender, NegotiatedTrack negotiated, int datagram, int srtpOverhead)
+    {
+        if (_config.EnableFlexFec
+            && negotiated.FlexFecPayloadType is { } flexFecPayloadType
+            && sender.FlexFecSsrcRaw != 0)
+        {
+            var generator = new FlexFecGenerator(sender.Ssrc, datagram);
+            var fecStream = new RtpStreamSender(sender.FlexFecSsrcRaw, flexFecPayloadType, negotiated.ClockRate, logger: _logger);
+            _logger.Log(
+                KeryxLogLevel.Info,
+                $"FlexFEC enabled: pt {flexFecPayloadType}, ssrc 0x{sender.FlexFecSsrcRaw:x8}, "
+                + $"protecting media ssrc 0x{sender.Ssrc:x8} in groups of {FecProtectionGroupSize}.");
+            return FecEmitter.ForFlexFec(generator, fecStream, FecProtectionGroupSize, srtpOverhead, SendRtp, _logger);
+        }
+
+        if (_config.EnableUlpfec
+            && negotiated.RedPayloadType is { } redPayloadType
+            && negotiated.UlpfecPayloadType is { } ulpfecPayloadType)
+        {
+            var generator = new UlpFecGenerator(datagram);
+            var fecStream = new RtpStreamSender(NewSsrc(), redPayloadType, negotiated.ClockRate, logger: _logger);
+            _logger.Log(
+                KeryxLogLevel.Info,
+                $"ULPFEC enabled: red pt {redPayloadType}, ulpfec pt {ulpfecPayloadType}, ssrc 0x{fecStream.Ssrc:x8}, "
+                + $"protecting media ssrc 0x{sender.Ssrc:x8} in groups of {FecProtectionGroupSize}.");
+            return FecEmitter.ForUlpfec(generator, ulpfecPayloadType, fecStream, FecProtectionGroupSize, srtpOverhead, SendRtp, _logger);
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1160,7 +1227,21 @@ public sealed partial class PeerConnection
             return;
         }
 
+        // FEC repair packets (RFC 5109 ULPFEC over RED, or RFC 8627 FlexFEC) are demuxed by their
+        // negotiated payload type before media delivery: they carry no application media, so they feed the
+        // FEC receiver and are never surfaced to the handler. A recovered media packet is delivered through
+        // the ordinary inbound path below, exactly like an RTX recovery.
+        if (TryHandleInboundFec(in packet, routes))
+        {
+            return;
+        }
+
         DeliverInboundMedia(route, packet, routes);
+
+        // Feed the just-delivered media packet to its FEC receiver as a recovery survivor. Its arrival can
+        // complete a group whose repair packet came earlier, recovering an as-yet-missing packet; deliver
+        // any such recovery through the same inbound path. No-op unless a FEC scheme was negotiated.
+        FeedFecSurvivor(route, plaintext, routes);
     }
 
     /// <summary>
@@ -1259,6 +1340,151 @@ public sealed partial class PeerConnection
 
         DeliverInboundMedia(mediaRoute, recovered, routes);
     }
+
+    /// <summary>
+    /// Intercepts an inbound FEC repair packet by its negotiated payload type: RFC 5109 ULPFEC carried in
+    /// an RFC 2198 RED payload (RED payload type), or an RFC 8627 FlexFEC repair packet (flexfec payload
+    /// type). The repair is fed to the media stream's FEC receiver and any packet it recovers is delivered
+    /// through the ordinary inbound path. Returns <see langword="true"/> when the packet was a FEC packet
+    /// (recoverable or not) and must not be delivered as media; <see langword="false"/> for ordinary media.
+    /// A no-op returning false unless a FEC scheme was negotiated for the receive path.
+    /// </summary>
+    private bool TryHandleInboundFec(in RtpPacket packet, RouteTable routes)
+    {
+        var payloadType = packet.Header.PayloadType;
+
+        if (_receiveFlexFecPayloadType is { } flexFecPt && payloadType == flexFecPt)
+        {
+            // RFC 8627: the repair packet names the protected media SSRC in its own header, so the
+            // receiver is keyed by that SSRC — the same SSRC the protected media packets carry.
+            if (FlexFecPacket.TryParse(packet.Payload, out var header)
+                && GetOrCreateFlexFecReceiver(header.ProtectedSsrc) is { } receiver)
+            {
+                receiver.OnFecPacket(packet.Payload);
+                DrainFlexFecRecovered(receiver, header.ProtectedSsrc, routes);
+            }
+
+            return true;
+        }
+
+        if (_receiveRedPayloadType is { } redPt && payloadType == redPt)
+        {
+            // RFC 2198: unwrap the RED primary block. A ulpfec block is the RFC 5109 FEC payload; anything
+            // else on the RED payload type is not FEC this side asked for and is dropped. ULPFEC packets
+            // carry no media SSRC, so they attribute to the video stream this receiver is decoding.
+            if (RedPacket.TryReadPrimary(packet.Payload, out var innerPayloadType, out var innerData)
+                && _receiveUlpfecPayloadType is { } ulpfecPt
+                && innerPayloadType == ulpfecPt
+                && FirstTransceiver(MediaKind.Video)?.Receiver.RemoteSsrc is { } mediaSsrc
+                && GetOrCreateUlpFecReceiver(mediaSsrc) is { } receiver)
+            {
+                receiver.OnFecPacket(innerData);
+                DrainUlpFecRecovered(receiver, mediaSsrc, routes);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Feeds one just-delivered media packet to its FEC receiver as a recovery survivor, then delivers any
+    /// packet the arrival lets the receiver rebuild. No-op unless a FEC scheme was negotiated and the
+    /// packet is video media. The recovered packet reaches the same inbound path an RTX recovery does.
+    /// </summary>
+    private void FeedFecSurvivor(RtpRoute route, ReadOnlySpan<byte> mediaPacket, RouteTable routes)
+    {
+        if (route.Kind != MediaKind.Video)
+        {
+            return;
+        }
+
+        var ssrc = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(mediaPacket[8..]);
+
+        if (_receiveFlexFecPayloadType is not null && GetOrCreateFlexFecReceiver(ssrc) is { } flexReceiver)
+        {
+            flexReceiver.OnMediaPacket(mediaPacket);
+            DrainFlexFecRecovered(flexReceiver, ssrc, routes);
+        }
+        else if (_receiveRedPayloadType is not null && GetOrCreateUlpFecReceiver(ssrc) is { } ulpReceiver)
+        {
+            ulpReceiver.OnMediaPacket(mediaPacket);
+            DrainUlpFecRecovered(ulpReceiver, ssrc, routes);
+        }
+    }
+
+    private UlpFecReceiver? GetOrCreateUlpFecReceiver(uint mediaSsrc)
+    {
+        if (_ulpfecReceivers.TryGetValue(mediaSsrc, out var receiver))
+        {
+            return receiver;
+        }
+
+        // Bound the number of per-source FEC receivers, exactly like the reception-statistics and
+        // jitter-buffer tables: a peer flooding invented media SSRCs must not pin unbounded memory.
+        if (_ulpfecReceivers.Count >= _config.MaxReceiveSources)
+        {
+            return null;
+        }
+
+        receiver = new UlpFecReceiver(mediaSsrc);
+        _ulpfecReceivers[mediaSsrc] = receiver;
+        return receiver;
+    }
+
+    private FlexFecReceiver? GetOrCreateFlexFecReceiver(uint mediaSsrc)
+    {
+        if (_flexFecReceivers.TryGetValue(mediaSsrc, out var receiver))
+        {
+            return receiver;
+        }
+
+        if (_flexFecReceivers.Count >= _config.MaxReceiveSources)
+        {
+            return null;
+        }
+
+        receiver = new FlexFecReceiver(mediaSsrc);
+        _flexFecReceivers[mediaSsrc] = receiver;
+        return receiver;
+    }
+
+    private void DrainUlpFecRecovered(UlpFecReceiver receiver, uint mediaSsrc, RouteTable routes)
+    {
+        while (receiver.TryDequeueRecovered(_fecRecovered, out var recoveredLength, out _))
+        {
+            DeliverRecoveredFec(_fecRecovered.AsSpan(0, recoveredLength), mediaSsrc, routes);
+        }
+    }
+
+    private void DrainFlexFecRecovered(FlexFecReceiver receiver, uint mediaSsrc, RouteTable routes)
+    {
+        while (receiver.TryDequeueRecovered(_fecRecovered, out var recoveredLength, out _))
+        {
+            DeliverRecoveredFec(_fecRecovered.AsSpan(0, recoveredLength), mediaSsrc, routes);
+        }
+    }
+
+    /// <summary>
+    /// Delivers one FEC-recovered media packet through the ordinary inbound path, resolving its route by
+    /// the recovered media SSRC and payload type (its header extension is not reconstructed for demux, so
+    /// the SSRC-then-payload-type resolution is used, exactly as for an RTX recovery).
+    /// </summary>
+    private void DeliverRecoveredFec(ReadOnlySpan<byte> recoveredPacket, uint mediaSsrc, RouteTable routes)
+    {
+        if (!RtpPacket.TryParse(recoveredPacket, out var recovered))
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _fecPacketsRecovered);
+        var route = routes.Resolve(mediaSsrc, recovered.Header.PayloadType);
+        DeliverInboundMedia(route, recovered, routes);
+    }
+
+    /// <summary>Test-only: media packets rebuilt from FEC and delivered through the inbound path.</summary>
+    internal long FecPacketsRecoveredForTest => Interlocked.Read(ref _fecPacketsRecovered);
 
     /// <summary>
     /// Delivers one received media packet through the receive path: it moves the per-kind remote SSRC
@@ -2181,6 +2407,163 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>
+    /// Protects one sending video stream with forward error correction: it folds each outbound media
+    /// packet into a running protection group and, every <c>groupSize</c> packets, emits one repair
+    /// packet that lets a receiver rebuild any single lost member of the group. Exactly one scheme is
+    /// active — RFC 5109 ULPFEC (RED-wrapped, on a private repair SSRC) or RFC 8627 FlexFEC (on the
+    /// sender's dedicated FlexFEC SSRC) — matching the one the answer kept.
+    /// </summary>
+    /// <remarks>
+    /// Driven only from <see cref="TrackSender.EmitPacket"/> under the connection's send lock, so it does
+    /// no locking of its own and reuses one repair buffer across emissions, exactly like the media and
+    /// RTX buffers. The repair packet is handed to the same paced, SRTP-protected send path as media.
+    /// </remarks>
+    internal sealed class FecEmitter
+    {
+        private readonly UlpFecGenerator? _ulpfec;
+        private readonly FlexFecGenerator? _flexfec;
+        private readonly byte _ulpfecPayloadType;
+        private readonly RtpStreamSender _stream;
+        private readonly int _groupSize;
+        private readonly Action<byte[], int> _send;
+        private readonly IKeryxLogger _logger;
+        private readonly byte[] _payloadScratch;
+        private readonly byte[]? _redScratch;
+        private readonly byte[] _packetBuffer;
+
+        private FecEmitter(
+            UlpFecGenerator? ulpfec,
+            FlexFecGenerator? flexfec,
+            byte ulpfecPayloadType,
+            RtpStreamSender stream,
+            int groupSize,
+            int srtpOverhead,
+            Action<byte[], int> send,
+            IKeryxLogger logger)
+        {
+            _ulpfec = ulpfec;
+            _flexfec = flexfec;
+            _ulpfecPayloadType = ulpfecPayloadType;
+            _stream = stream;
+            _groupSize = groupSize;
+            _send = send;
+            _logger = logger;
+
+            var maxFecPayload = ulpfec?.MaxFecPayloadSize ?? flexfec!.MaxFecPayloadSize;
+            _payloadScratch = new byte[maxFecPayload];
+            _redScratch = ulpfec is null ? null : new byte[RedPacket.PrimaryHeaderLength + maxFecPayload];
+            var redOverhead = ulpfec is null ? 0 : RedPacket.PrimaryHeaderLength;
+            _packetBuffer = new byte[RtpHeader.FixedLength + redOverhead + maxFecPayload + srtpOverhead];
+        }
+
+        /// <summary>Builds an RFC 5109 ULPFEC emitter that RED-wraps each repair packet under <paramref name="ulpfecPayloadType"/>.</summary>
+        internal static FecEmitter ForUlpfec(
+            UlpFecGenerator generator,
+            byte ulpfecPayloadType,
+            RtpStreamSender stream,
+            int groupSize,
+            int srtpOverhead,
+            Action<byte[], int> send,
+            IKeryxLogger logger) =>
+            new(generator, null, ulpfecPayloadType, stream, groupSize, srtpOverhead, send, logger);
+
+        /// <summary>Builds an RFC 8627 FlexFEC emitter that sends each repair packet on its own SSRC.</summary>
+        internal static FecEmitter ForFlexFec(
+            FlexFecGenerator generator,
+            RtpStreamSender stream,
+            int groupSize,
+            int srtpOverhead,
+            Action<byte[], int> send,
+            IKeryxLogger logger) =>
+            new(null, generator, 0, stream, groupSize, srtpOverhead, send, logger);
+
+        /// <summary>
+        /// Folds one just-assembled media packet (header, extensions and payload — the exact plaintext the
+        /// receiver will feed its FEC receiver) into the current group. Must be called before SRTP
+        /// encrypts the media buffer in place. Returns <see langword="true"/> when the group is now full,
+        /// so the caller emits the repair packet with <see cref="EmitPending"/> after the media packet
+        /// itself reaches the send path.
+        /// </summary>
+        internal bool AddMediaPacket(ReadOnlySpan<byte> mediaPacket, uint timestamp)
+        {
+            if (!TryAdd(mediaPacket))
+            {
+                // The packet fell outside the current group's window (a wrap, a gap, or a duplicate slot):
+                // close the group that is already full of earlier, already-sent packets, then open a fresh
+                // one with this packet.
+                EmitPending(timestamp);
+                TryAdd(mediaPacket);
+            }
+
+            return Count >= _groupSize;
+        }
+
+        /// <summary>
+        /// Produces the current group's repair packet, if any, and hands it to the send path, then resets
+        /// the group. Called under the connection's send lock after the last media packet of the group.
+        /// </summary>
+        internal void EmitPending(uint timestamp)
+        {
+            if (Count == 0)
+            {
+                return;
+            }
+
+            int payloadLength;
+            var produced = _ulpfec is not null
+                ? _ulpfec.TryProduce(_payloadScratch, out payloadLength)
+                : _flexfec!.TryProduce(_payloadScratch, out payloadLength);
+            if (!produced)
+            {
+                Reset();
+                return;
+            }
+
+            int packetLength;
+            try
+            {
+                if (_ulpfec is not null)
+                {
+                    // RFC 2198: wrap the ULPFEC payload as the single primary block of a RED payload under
+                    // the negotiated ulpfec payload type, then send it as an ordinary RTP packet stamped
+                    // with the RED payload type on the private repair SSRC.
+                    var redLength = RedPacket.WritePrimaryOnly(
+                        _ulpfecPayloadType, _payloadScratch.AsSpan(0, payloadLength), _redScratch);
+                    packetLength = _stream.WritePacket(
+                        _redScratch.AsSpan(0, redLength), marker: false, timestamp, _packetBuffer);
+                }
+                else
+                {
+                    packetLength = _stream.WritePacket(
+                        _payloadScratch.AsSpan(0, payloadLength), marker: false, timestamp, _packetBuffer);
+                }
+            }
+            catch (ByteBufferException ex)
+            {
+                // The repair buffer was sized for a whole datagram of protected octets, so this cannot
+                // happen for a well-formed group; drop the repair rather than fault the send path.
+                _logger.Log(KeryxLogLevel.Warning, "Dropping an outbound FEC packet that did not fit its buffer.", ex);
+                Reset();
+                return;
+            }
+
+            _send(_packetBuffer, packetLength);
+            Reset();
+        }
+
+        private bool TryAdd(ReadOnlySpan<byte> mediaPacket) =>
+            _ulpfec?.TryAdd(mediaPacket) ?? _flexfec!.TryAdd(mediaPacket);
+
+        private int Count => _ulpfec?.Count ?? _flexfec!.Count;
+
+        private void Reset()
+        {
+            _ulpfec?.Reset();
+            _flexfec?.Reset();
+        }
+    }
+
+    /// <summary>
     /// One outbound RTP stream: the payloadizer, the sequence/timestamp state, and a single reusable
     /// datagram buffer that the payloadizer fills in place and SRTP encrypts in place. When RFC 4588
     /// retransmission is negotiated it also owns the repair stream and a second buffer for it.
@@ -2195,6 +2578,7 @@ public sealed partial class PeerConnection
         private readonly int _headerReserve;
         private readonly byte? _transportCcExtensionId;
         private readonly byte? _absSendTimeExtensionId;
+        private readonly FecEmitter? _fec;
         private uint _timestamp;
         private long _packets;
         private long _bytes;
@@ -2210,13 +2594,15 @@ public sealed partial class PeerConnection
             int srtpOverhead,
             byte? transportCcExtensionId = null,
             byte? absSendTimeExtensionId = null,
-            RtxRetransmitter? retransmitter = null)
+            RtxRetransmitter? retransmitter = null,
+            FecEmitter? fec = null)
         {
             _owner = owner;
             _payloadizer = payloadizer;
             _maxPayload = maxPayload;
             _transportCcExtensionId = transportCcExtensionId;
             _absSendTimeExtensionId = absSendTimeExtensionId;
+            _fec = fec;
 
             // Reserve the fixed header plus, when negotiated, the one-byte header extension holding the
             // transport-cc sequence number and/or the abs-send-time timestamp, so the payloadizer writes
@@ -2334,8 +2720,11 @@ public sealed partial class PeerConnection
                     _buffer);
             }
 
-            // Capture the plaintext before SRTP encrypts the same buffer in place.
+            // Capture the plaintext before SRTP encrypts the same buffer in place: both the RTX history and
+            // the FEC generator read the packet exactly as it will appear on the wire (the receiver feeds
+            // its FEC receiver the same decrypted bytes), so a recovered packet is byte-identical.
             Retransmitter?.History.Store(Stream.LastSequenceNumber, _buffer.AsSpan(0, packetLength));
+            var fecGroupReady = _fec is not null && _fec.AddMediaPacket(_buffer.AsSpan(0, packetLength), timestamp);
 
             if (stampedTransportCc)
             {
@@ -2345,6 +2734,13 @@ public sealed partial class PeerConnection
             _owner.SendRtp(_buffer, packetLength);
             _packets++;
             _bytes += payload.Length;
+
+            // Emit the group's repair packet only after the media packet it protects has reached the send
+            // path, so a repair never precedes its media on the wire.
+            if (fecGroupReady)
+            {
+                _fec!.EmitPending(timestamp);
+            }
         }
 
         /// <summary>

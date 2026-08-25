@@ -1534,6 +1534,24 @@ public sealed partial class PeerConnection : IAsyncDisposable
         codecs.Add(SdpCodec.FlexFec(flexFecPayloadType, clockRate));
     }
 
+    /// <summary>
+    /// Whether an answer should keep an offered FEC codec by encoding name: the RFC 8627 <c>flexfec-03</c>
+    /// codec when this endpoint enables FlexFEC, or the RFC 5109 <c>red</c>/<c>ulpfec</c> pair when it
+    /// enables ULPFEC and not FlexFEC (the two are alternatives, and FlexFEC wins). Keeping it makes the
+    /// answer symmetric with the offer this endpoint would itself make.
+    /// </summary>
+    private bool KeepsOfferedFecCodec(string encodingName)
+    {
+        if (_config.EnableFlexFec)
+        {
+            return string.Equals(encodingName, SdpCodec.FlexfecEncodingName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return _config.EnableUlpfec
+            && (string.Equals(encodingName, SdpCodec.RedEncodingName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(encodingName, SdpCodec.UlpfecEncodingName, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static int? NextDynamicPayloadType(HashSet<int> used, int? preferred)
     {
         if (preferred is { } candidate && candidate is >= 0 and <= 127 && used.Add(candidate))
@@ -1726,6 +1744,14 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         continue;
                     }
                 }
+                else if (KeepsOfferedFecCodec(rtpMap.EncodingName))
+                {
+                    // Keep the offered FEC codec (RFC 5109 red/ulpfec or RFC 8627 flexfec-03) so the
+                    // answer is symmetric with the offer this side would itself make: an offerer that
+                    // enabled the matching scheme sees its FEC accepted, and this answerer's receive path
+                    // can decode the repair packets. The codec is not among this endpoint's media codecs,
+                    // so it is echoed here rather than resolved through the acceptable-media list.
+                }
                 else if (!acceptable.Any(c => string.Equals(c.EncodingName, rtpMap.EncodingName, StringComparison.OrdinalIgnoreCase)))
                 {
                     continue;
@@ -1770,7 +1796,8 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 var receivePayloadTypes = new List<byte>();
                 foreach (var codec in section.Codecs)
                 {
-                    if (!codec.IsRtx && codec.PayloadType is >= 0 and <= 255)
+                    if (!codec.IsRtx && !codec.IsRed && !codec.IsUlpfec && !codec.IsFlexfec
+                        && codec.PayloadType is >= 0 and <= 255)
                     {
                         receivePayloadTypes.Add((byte)codec.PayloadType);
                     }
@@ -1778,12 +1805,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
                 boundTransceiver.Receiver.PayloadTypes = receivePayloadTypes;
 
-                // Publish the full negotiated media-codec list (rtx entries excluded) in answered order,
-                // with the first as the primary. The sender keeps to the primary for the session.
+                // Publish the full negotiated media-codec list (rtx and FEC entries excluded) in answered
+                // order, with the first as the primary. The sender keeps to the primary for the session.
                 var negotiatedCodecs = new List<NegotiatedCodec>();
                 foreach (var codec in section.Codecs)
                 {
-                    if (codec.IsRtx)
+                    if (codec.IsRtx || codec.IsRed || codec.IsUlpfec || codec.IsFlexfec)
                     {
                         continue;
                     }
@@ -1797,6 +1824,32 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
                 boundTransceiver.NegotiatedCodecs = negotiatedCodecs;
                 boundTransceiver.NegotiatedCodec = negotiatedCodecs.Count > 0 ? negotiatedCodecs[0] : null;
+            }
+
+            // Record the FEC payload types this side will decode on the video receive path from the codecs
+            // the answer kept. FlexFEC wins when both schemes are configured, matching the offer builder.
+            if (string.Equals(section.MediaType, "video", StringComparison.Ordinal) && section.Port != 0)
+            {
+                foreach (var codec in section.Codecs)
+                {
+                    if (codec.PayloadType is < 0 or > 127)
+                    {
+                        continue;
+                    }
+
+                    if (_config.EnableFlexFec && codec.IsFlexfec)
+                    {
+                        _receiveFlexFecPayloadType = (byte)codec.PayloadType;
+                    }
+                    else if (_config.EnableUlpfec && !_config.EnableFlexFec && codec.IsRed)
+                    {
+                        _receiveRedPayloadType = (byte)codec.PayloadType;
+                    }
+                    else if (_config.EnableUlpfec && !_config.EnableFlexFec && codec.IsUlpfec)
+                    {
+                        _receiveUlpfecPayloadType = (byte)codec.PayloadType;
+                    }
+                }
             }
 
             if (_config.EnableSimulcast
@@ -1841,6 +1894,31 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         }
                     }
 
+                    // Resolve the FEC codecs the answer kept for this sending video track, so the send path
+                    // protects it with the negotiated scheme. FlexFEC wins when both were kept.
+                    byte? redPayloadType = null;
+                    byte? ulpfecPayloadType = null;
+                    byte? flexFecPayloadType = null;
+                    if (kind == MediaKind.Video)
+                    {
+                        var flexfec = section.Codecs.FirstOrDefault(c => c.IsFlexfec);
+                        if (_config.EnableFlexFec && flexfec is not null && flexfec.PayloadType is >= 0 and <= 127)
+                        {
+                            flexFecPayloadType = (byte)flexfec.PayloadType;
+                        }
+                        else if (_config.EnableUlpfec)
+                        {
+                            var red = section.Codecs.FirstOrDefault(c => c.IsRed);
+                            var ulpfec = section.Codecs.FirstOrDefault(c => c.IsUlpfec);
+                            if (red is not null && ulpfec is not null
+                                && red.PayloadType is >= 0 and <= 127 && ulpfec.PayloadType is >= 0 and <= 127)
+                            {
+                                redPayloadType = (byte)red.PayloadType;
+                                ulpfecPayloadType = (byte)ulpfec.PayloadType;
+                            }
+                        }
+                    }
+
                     var sendSsrc = sender.Ssrc;
                     section.TrackId = sender.TrackId;
                     section.Ssrcs.Add(sendSsrc);
@@ -1852,12 +1930,25 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         section.Ssrcs.Add(sender.RtxSsrcRaw);
                     }
 
+                    if (flexFecPayloadType is not null && sender.FlexFecSsrcRaw != 0)
+                    {
+                        // RFC 8627 §5.1.2: FEC-FR binds the media source to the FlexFEC repair source. The
+                        // FlexFEC engine PR deferred emitting this in the answer; wiring it here keeps a
+                        // sending answerer symmetric with the offer it would itself make. Both sources
+                        // publish the same cname, which the builder writes.
+                        section.SsrcGroups.Add(new SsrcGroup(SsrcGroup.FecFrSemantics, [sendSsrc, sender.FlexFecSsrcRaw]));
+                        section.Ssrcs.Add(sender.FlexFecSsrcRaw);
+                    }
+
                     sender.Negotiated = new NegotiatedTrack(
                         mid,
                         (byte)primary.PayloadType,
                         (uint)primary.ClockRate,
                         primary.EncodingName,
-                        rtxPayloadType);
+                        rtxPayloadType,
+                        redPayloadType,
+                        ulpfecPayloadType,
+                        flexFecPayloadType);
 
                     if (_config.EnableTransportWideCc && answerSendTransportCcId is null)
                     {
@@ -2316,6 +2407,36 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 }
             }
 
+            // Resolve the FEC codecs the answer kept (RFC 5109 red/ulpfec or RFC 8627 flexfec-03). Their
+            // payload types wire the outbound FEC generator (when this side sends) and drive the receive
+            // path's FEC intake (when this side receives). FlexFEC wins when the answer kept both.
+            byte? redPayloadType = null;
+            byte? ulpfecPayloadType = null;
+            byte? flexFecPayloadType = null;
+            if (kind == MediaKind.Video)
+            {
+                var flexfec = media.FindCodec(SdpCodec.FlexfecEncodingName);
+                if (_config.EnableFlexFec && flexfec is not null && flexfec.PayloadType is >= 0 and <= 127)
+                {
+                    flexFecPayloadType = (byte)flexfec.PayloadType;
+                }
+                else if (_config.EnableUlpfec)
+                {
+                    var red = media.FindCodec(SdpCodec.RedEncodingName);
+                    var ulpfec = media.FindCodec(SdpCodec.UlpfecEncodingName);
+                    if (red is not null && ulpfec is not null
+                        && red.PayloadType is >= 0 and <= 127 && ulpfec.PayloadType is >= 0 and <= 127)
+                    {
+                        redPayloadType = (byte)red.PayloadType;
+                        ulpfecPayloadType = (byte)ulpfec.PayloadType;
+                    }
+                }
+
+                _receiveRedPayloadType = redPayloadType;
+                _receiveUlpfecPayloadType = ulpfecPayloadType;
+                _receiveFlexFecPayloadType = flexFecPayloadType;
+            }
+
             // Wire the send track only when the offerer's negotiated direction actually sends. A recvonly
             // transceiver (added via AddTransceiver to ingest media as the offerer) never builds a sender,
             // so CreateTrackSenders leaves it receive-only.
@@ -2327,7 +2448,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         (byte)chosen.PayloadType,
                         (uint)chosen.ClockRate,
                         chosen.EncodingName,
-                        rtxPayloadType)
+                        rtxPayloadType,
+                        redPayloadType,
+                        ulpfecPayloadType,
+                        flexFecPayloadType)
                     : new NegotiatedTrack(
                         media.Mid ?? _config.AudioMid,
                         (byte)chosen.PayloadType,
@@ -2471,14 +2595,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// codec's rtpmap name (for example <c>H264</c>, <c>VP8</c> or <c>opus</c>), which selects the
     /// outbound packetizer so the payload matches the payload type on the wire.
     /// <paramref name="RtxPayloadType"/> is null when the answerer dropped the RFC 4588 repair codec,
-    /// which disables retransmission for the track.
+    /// which disables retransmission for the track. The FEC payload types are null unless the peer kept
+    /// the matching FEC codec and the corresponding config flag is set: <paramref name="RedPayloadType"/>
+    /// and <paramref name="UlpfecPayloadType"/> together enable RFC 5109 ULPFEC (RED-wrapped),
+    /// <paramref name="FlexFecPayloadType"/> enables RFC 8627 FlexFEC. FlexFEC wins when both are kept.
     /// </summary>
     internal sealed record NegotiatedTrack(
         string Mid,
         byte PayloadType,
         uint ClockRate,
         string EncodingName,
-        byte? RtxPayloadType = null);
+        byte? RtxPayloadType = null,
+        byte? RedPayloadType = null,
+        byte? UlpfecPayloadType = null,
+        byte? FlexFecPayloadType = null);
 
     private sealed class DtlsLowerTransport(PeerConnection owner) : IDatagramTransport
     {
