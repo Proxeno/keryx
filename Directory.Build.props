@@ -11,8 +11,11 @@
     <IsPackable>false</IsPackable>
     <PackageId>Proxeno.$(MSBuildProjectName)</PackageId>
     <!-- Default package version. The pack workflow overrides this with the git tag at release time
-         (see .github/workflows/pack.yml). 0.3.3 adds TURN relay over TCP and TLS (RFC 5766), wired
-         into ICE relay gathering as an additive, non-breaking option on top of 0.3.2. -->
-    <VersionPrefix>0.3.3</VersionPrefix>
+         (see .github/workflows/pack.yml). 0.4.0 completes the generic-WebRTC-platform work: signaling
+         state machine + renegotiation + rollback, W3C getStats, codec breadth (VP8/VP9/AV1 +
+         multi-codec send), RED/ULPFEC/FlexFEC, simulcast forward-RTX, ICE restart + true trickle +
+         TCP candidates + host STUN, DTLS server cookie, and an SCTP slow-start throughput fix. All
+         additive on top of 0.3.x. -->
+    <VersionPrefix>0.4.0</VersionPrefix>
   </PropertyGroup>
 </Project>
