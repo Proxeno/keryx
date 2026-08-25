@@ -143,6 +143,15 @@ public readonly record struct MediaTrackStats(
 /// inbound arrival recorder, when <see cref="PeerConnectionConfig.EnableReceiverTransportCcFeedback"/>
 /// is set and the extension was negotiated; zero otherwise.
 /// </param>
+/// <param name="RembsReceived">
+/// Receiver Estimated Maximum Bitrate (REMB) feedback packets received from the peer and fed to the
+/// send-side congestion controller.
+/// </param>
+/// <param name="RembsSent">
+/// REMB feedback packets this endpoint returned to the sender from its receive-side abs-send-time
+/// bandwidth estimator, when <see cref="PeerConnectionConfig.EnableReceiverRemb"/> is set and the
+/// abs-send-time extension was negotiated; zero otherwise.
+/// </param>
 public readonly record struct FeedbackStats(
     long PictureLossIndications,
     long FullIntraRequests,
@@ -150,7 +159,9 @@ public readonly record struct FeedbackStats(
     long TransportCcFeedbacks,
     long ReceiverReports,
     long NacksSent = 0,
-    long TransportCcFeedbacksSent = 0);
+    long TransportCcFeedbacksSent = 0,
+    long RembsReceived = 0,
+    long RembsSent = 0);
 
 /// <summary>Point-in-time counters for one transceiver (session-model.md §2.2).</summary>
 /// <param name="Mid">The transceiver's negotiated <c>a=mid</c>, or null before one is assigned.</param>

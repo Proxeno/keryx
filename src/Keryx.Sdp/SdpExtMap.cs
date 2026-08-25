@@ -20,13 +20,29 @@ public sealed record SdpExtMap(int Id, string Uri, MediaDirection? Direction = n
     public const string TransportWideCcUri =
         "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
 
+    /// <summary>
+    /// URI of the absolute send time header extension
+    /// (<c>http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time</c>), which carries the sender's
+    /// 6.18 fixed-point transmit timestamp so the receiver can run a delay-gradient estimator and return
+    /// REMB.
+    /// </summary>
+    public const string AbsoluteSendTimeUri = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+
     /// <summary>Creates the <c>a=extmap</c> for the transport-wide congestion-control extension.</summary>
     /// <param name="id">The header-extension identifier to negotiate; 1–14 for the one-byte form.</param>
     /// <returns>An extmap mapping <paramref name="id"/> to <see cref="TransportWideCcUri"/>.</returns>
     public static SdpExtMap TransportWideCc(int id) => new(id, TransportWideCcUri);
 
+    /// <summary>Creates the <c>a=extmap</c> for the absolute send time extension.</summary>
+    /// <param name="id">The header-extension identifier to negotiate; 1–14 for the one-byte form.</param>
+    /// <returns>An extmap mapping <paramref name="id"/> to <see cref="AbsoluteSendTimeUri"/>.</returns>
+    public static SdpExtMap AbsoluteSendTime(int id) => new(id, AbsoluteSendTimeUri);
+
     /// <summary>True when this mapping is the transport-wide congestion-control extension.</summary>
     public bool IsTransportWideCc => string.Equals(Uri, TransportWideCcUri, StringComparison.Ordinal);
+
+    /// <summary>True when this mapping is the absolute send time extension.</summary>
+    public bool IsAbsoluteSendTime => string.Equals(Uri, AbsoluteSendTimeUri, StringComparison.Ordinal);
 
     /// <summary>Parses an <c>a=extmap</c> attribute value.</summary>
     /// <param name="value">The attribute value, without the <c>a=extmap:</c> prefix.</param>

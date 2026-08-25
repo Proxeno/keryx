@@ -38,6 +38,9 @@ public sealed partial class PeerConnection
     /// <summary>The <c>a=extmap</c> id offered for the transport-wide congestion-control extension.</summary>
     private const int TransportCcExtensionId = 3;
 
+    /// <summary>The <c>a=extmap</c> id offered for the absolute send time extension.</summary>
+    private const int AbsSendTimeExtensionId = 2;
+
     // Stable per-kind forwarder handles, wired to the send track through the owner's locked forward
     // path. Created once in the constructor so GetForwarder is total and allocation-free; they return
     // false until the corresponding send track is negotiated.
@@ -86,6 +89,16 @@ public sealed partial class PeerConnection
     private byte _receiverTransportCcExtensionId;
     private long _receiverTransportCcFeedbacksSent;
 
+    // Receive-side REMB: a per-connection abs-send-time bandwidth estimator that periodically emits an
+    // RtcpReceiverEstimatedMaxBitrate. Built in CreateTrackSenders only when the abs-send-time extension
+    // was negotiated and PeerConnectionConfig.EnableReceiverRemb is set; published there (volatile) and
+    // thereafter touched only from the single ICE receive loop that drives HandleRtp. The parsing id it
+    // reads is written before the volatile publish, so the acquiring read makes it visible. Null disables.
+    private volatile RembFeedbackGenerator? _receiverRemb;
+    private byte _receiverAbsSendTimeExtensionId;
+    private long _rembsSent;
+    private long _rembsReceived;
+
     private Timer? _rtcpTimer;
     private int _firSequence;
 
@@ -94,10 +107,19 @@ public sealed partial class PeerConnection
     private byte? _sendTransportCcExtensionId;
     private ushort _transportWideSequenceNumber;
 
+    // The abs-send-time extmap id this side stamps on outbound media, set whenever the extension is
+    // negotiated for a sending direction — null on a receive-only answerer, which never stamps. Read only
+    // from the send path under _sendLock.
+    private byte? _sendAbsSendTimeExtensionId;
+
     // The negotiated transport-wide-cc extmap id, set whenever the extension is negotiated regardless of
     // media direction — unlike _sendTransportCcExtensionId, which a receive-only answerer leaves null
     // because it never stamps. This is the id the receive path reads to parse inbound sequence numbers.
     private byte? _negotiatedTransportCcExtensionId;
+
+    // The negotiated abs-send-time extmap id, set whenever the extension is negotiated regardless of media
+    // direction. This is the id the receive path reads to parse inbound abs-send-time for the REMB estimator.
+    private byte? _negotiatedAbsSendTimeExtensionId;
 
     // The pacing queue that smooths outbound RTP toward the congestion controller's target, or null
     // when congestion control is disabled — in which case the send path stays immediate. Built in
@@ -847,6 +869,20 @@ public sealed partial class PeerConnection
                 KeryxLogLevel.Info,
                 $"Receiver transport-cc feedback enabled on extmap {extensionId}.");
         }
+
+        // Once the abs-send-time extension is negotiated and REMB is opted into, run the receive-side
+        // delay-gradient estimator over inbound abs-send-time and return REMB to the sender's congestion
+        // controller. Publish the generator last (volatile) so the receive loop sees the parsing id above it.
+        if (_negotiatedAbsSendTimeExtensionId is { } absSendTimeId && _config.EnableReceiverRemb)
+        {
+            _receiverAbsSendTimeExtensionId = absSendTimeId;
+            _receiverRemb = new RembFeedbackGenerator(
+                RembFeedbackGenerator.DefaultFeedbackInterval,
+                _config.CongestionControl);
+            _logger.Log(
+                KeryxLogLevel.Info,
+                $"Receiver REMB generation enabled on abs-send-time extmap {absSendTimeId}.");
+        }
     }
 
     /// <summary>
@@ -886,10 +922,13 @@ public sealed partial class PeerConnection
     private void BuildNegotiatedTrackSenders(IDatagramTransport transport, SrtpProfile profile)
     {
         var transportCcId = _sendTransportCcExtensionId;
+        var absSendTimeId = _sendAbsSendTimeExtensionId;
 
-        // When the TWCC extension is negotiated every packet carries the one-byte header extension, so
-        // its fixed overhead comes out of the payload budget and out of the send-history slab size.
-        var extensionReserve = transportCcId is null ? 0 : TransportCcExtension.OneByteHeaderOverhead;
+        // When the TWCC and/or abs-send-time extensions are negotiated every packet carries the one-byte
+        // header extension, so its fixed overhead comes out of the payload budget and out of the
+        // send-history slab size. RTX repairs stamp only transport-cc, so reserving both here is a safe
+        // over-reservation for the repair slab.
+        var extensionReserve = TrackSender.HeaderExtensionOverhead(transportCcId, absSendTimeId);
 
         var datagram = Math.Min(_config.Mtu, transport.MaxDatagramSize);
         var maxPayload = datagram - RtpHeader.FixedLength - extensionReserve - profile.RtpOverhead;
@@ -952,6 +991,7 @@ public sealed partial class PeerConnection
                         videoMaxPayload,
                         profile.RtpOverhead,
                         transportCcId,
+                        absSendTimeId,
                         rtx);
                 }
                 else if (transceiver.Kind == MediaKind.Audio)
@@ -964,7 +1004,8 @@ public sealed partial class PeerConnection
                         new OpusPacketizer(),
                         maxPayload,
                         profile.RtpOverhead,
-                        transportCcId);
+                        transportCcId,
+                        absSendTimeId);
                 }
             }
         }
@@ -1063,6 +1104,10 @@ public sealed partial class PeerConnection
         // branch, since the sender stamps the extension on media and repair packets alike and the
         // transport-wide sequence space spans both — then emit feedback when the cadence is due.
         RecordTransportCcArrival(in packet);
+
+        // Record the abs-send-time off the same raw wire packet and, when REMB is enabled, drive the
+        // receive-side estimator, emitting REMB back to the sender on the feedback cadence.
+        RecordAbsSendTimeArrival(in packet);
 
         // Demux mid-first (RFC 8843 §9.2): the MID header extension names the m-section when the peer
         // stamped one, else the SSRC learned from the remote SDP, else the payload type — the last of
@@ -1624,6 +1669,7 @@ public sealed partial class PeerConnection
                 break;
 
             case RtcpReceiverEstimatedMaxBitrate remb:
+                Interlocked.Increment(ref _rembsReceived);
                 _congestionController?.OnReceiverEstimatedMaxBitrate(remb);
                 break;
 
@@ -2036,6 +2082,35 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>
+    /// Records one inbound packet's abs-send-time and arrival time against the receive-side REMB estimator,
+    /// then emits an RtcpReceiverEstimatedMaxBitrate back to the sender when the feedback cadence is due.
+    /// No-op unless the extension was negotiated and REMB generation is enabled. Runs on the single ICE
+    /// receive loop, so the generator needs no locking; the flush itself sends under the send lock through
+    /// <see cref="SendRtcpCompound"/>.
+    /// </summary>
+    private void RecordAbsSendTimeArrival(in RtpPacket packet)
+    {
+        var generator = _receiverRemb;
+        if (generator is null
+            || !AbsoluteSendTimeExtension.TryRead(packet.Header, _receiverAbsSendTimeExtensionId, out var absSendTime))
+        {
+            return;
+        }
+
+        var now = MonotonicMicroseconds();
+        var sizeBytes = RtpHeader.FixedLength + packet.Payload.Length + packet.PaddingLength;
+        generator.OnPacketReceived(absSendTime, now, sizeBytes, packet.Header.Ssrc);
+
+        if (generator.ShouldBuildFeedback(now)
+            && generator.TryBuildFeedback(_rtcpSenderSsrc, out var remb)
+            && remb is not null
+            && SendRtcpCompound([remb]))
+        {
+            Interlocked.Increment(ref _rembsSent);
+        }
+    }
+
+    /// <summary>
     /// Records that an outbound RTP packet carrying <paramref name="transportSequenceNumber"/> left the
     /// send path, so returning transport-cc feedback can be paired with its send time. Called under
     /// <see cref="_sendLock"/> at the point the sequence number is drawn.
@@ -2072,6 +2147,7 @@ public sealed partial class PeerConnection
         private readonly int _maxPayload;
         private readonly int _headerReserve;
         private readonly byte? _transportCcExtensionId;
+        private readonly byte? _absSendTimeExtensionId;
         private uint _timestamp;
         private long _packets;
         private long _bytes;
@@ -2086,17 +2162,19 @@ public sealed partial class PeerConnection
             int maxPayload,
             int srtpOverhead,
             byte? transportCcExtensionId = null,
+            byte? absSendTimeExtensionId = null,
             RtxRetransmitter? retransmitter = null)
         {
             _owner = owner;
             _payloadizer = payloadizer;
             _maxPayload = maxPayload;
             _transportCcExtensionId = transportCcExtensionId;
+            _absSendTimeExtensionId = absSendTimeExtensionId;
 
-            // Reserve the fixed header plus, when TWCC is negotiated, the one-byte header extension, so the
-            // payloadizer writes exactly where the assembled header ends and the packet copy is a self-copy.
-            _headerReserve = RtpHeader.FixedLength
-                + (transportCcExtensionId is null ? 0 : TransportCcExtension.OneByteHeaderOverhead);
+            // Reserve the fixed header plus, when negotiated, the one-byte header extension holding the
+            // transport-cc sequence number and/or the abs-send-time timestamp, so the payloadizer writes
+            // exactly where the assembled header ends and the packet copy stays a self-copy.
+            _headerReserve = RtpHeader.FixedLength + HeaderExtensionOverhead(transportCcExtensionId, absSendTimeExtensionId);
             _buffer = new byte[_headerReserve + maxPayload + srtpOverhead];
             _rtxBuffer = retransmitter is null
                 ? null
@@ -2164,30 +2242,55 @@ public sealed partial class PeerConnection
         {
             int packetLength;
             ushort transportSequenceNumber = 0;
-            var stamped = false;
-            if (_transportCcExtensionId is { } extensionId)
+            var stampedTransportCc = false;
+
+            if (_transportCcExtensionId is null && _absSendTimeExtensionId is null)
             {
-                transportSequenceNumber = _owner.NextTransportWideSequenceNumber();
-                stamped = true;
-                Span<byte> extensionBody = stackalloc byte[TransportCcExtension.OneByteBodyLength];
-                TransportCcExtension.WriteOneByteBody(extensionBody, extensionId, transportSequenceNumber);
+                packetLength = Stream.WritePacket(payload, marker, timestamp, _buffer);
+            }
+            else
+            {
+                // Build one RFC 8285 §4.2 one-byte-header extension body carrying whichever of the
+                // transport-cc sequence number and abs-send-time timestamp are negotiated. Transport-cc is
+                // appended first so a transport-cc-only body is byte-identical to the prior single-element
+                // encoding and the golden send-path bytes are unchanged.
+                Span<byte> extensionBuffer = stackalloc byte[TransportCcExtension.OneByteBodyLength
+                    + AbsoluteSendTimeExtension.OneByteBodyLength];
+                var writer = new RtpOneByteExtensionWriter(extensionBuffer);
+
+                if (_transportCcExtensionId is { } ccId)
+                {
+                    transportSequenceNumber = _owner.NextTransportWideSequenceNumber();
+                    stampedTransportCc = true;
+                    Span<byte> seq = stackalloc byte[2];
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(seq, transportSequenceNumber);
+                    writer.TryAppend(ccId, seq);
+                }
+
+                if (_absSendTimeExtensionId is { } absId)
+                {
+                    var absSendTime = AbsoluteSendTimeExtension.FromMicroseconds(_owner.MonotonicMicroseconds());
+                    Span<byte> stamp = stackalloc byte[AbsoluteSendTimeExtension.TimestampLength];
+                    stamp[0] = (byte)(absSendTime >> 16);
+                    stamp[1] = (byte)(absSendTime >> 8);
+                    stamp[2] = (byte)absSendTime;
+                    writer.TryAppend(absId, stamp);
+                }
+
+                writer.Finish();
                 packetLength = Stream.WritePacket(
                     payload,
                     marker,
                     timestamp,
                     RtpHeaderExtension.OneByteProfile,
-                    extensionBody,
+                    writer.Written,
                     _buffer);
-            }
-            else
-            {
-                packetLength = Stream.WritePacket(payload, marker, timestamp, _buffer);
             }
 
             // Capture the plaintext before SRTP encrypts the same buffer in place.
             Retransmitter?.History.Store(Stream.LastSequenceNumber, _buffer.AsSpan(0, packetLength));
 
-            if (stamped)
+            if (stampedTransportCc)
             {
                 _owner.OnTransportRtpSent(transportSequenceNumber, packetLength);
             }
@@ -2195,6 +2298,26 @@ public sealed partial class PeerConnection
             _owner.SendRtp(_buffer, packetLength);
             _packets++;
             _bytes += payload.Length;
+        }
+
+        /// <summary>
+        /// The bytes an RFC 8285 one-byte-header extension adds to the RTP header for the given negotiated
+        /// elements: the four-byte profile/word-count prefix plus the concatenated element bodies padded to
+        /// a four-byte boundary. Zero when neither extension is negotiated.
+        /// </summary>
+        internal static int HeaderExtensionOverhead(byte? transportCcExtensionId, byte? absSendTimeExtensionId)
+        {
+            // Each element is a one-octet id|len header plus its body: two octets for the transport-cc
+            // sequence number, three for the abs-send-time timestamp.
+            var body = (transportCcExtensionId is null ? 0 : 1 + 2)
+                + (absSendTimeExtensionId is null ? 0 : 1 + AbsoluteSendTimeExtension.TimestampLength);
+            if (body == 0)
+            {
+                return 0;
+            }
+
+            var padded = (body + 3) & ~3;
+            return 4 + padded;
         }
 
         internal int SendFrame(ReadOnlySpan<byte> frame, uint timestamp)
