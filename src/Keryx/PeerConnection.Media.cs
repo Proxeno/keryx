@@ -1433,7 +1433,7 @@ public sealed partial class PeerConnection
                     return;
                 }
 
-                stats = new InboundSourceStats(route.Kind);
+                stats = new InboundSourceStats(route.Kind, route.ClockRate);
                 _receiveStats[ssrc] = stats;
             }
 
@@ -1493,9 +1493,12 @@ public sealed partial class PeerConnection
 
     /// <summary>One inbound source's RFC 3550 reception statistics, tagged with the media kind it was
     /// demultiplexed to so the periodic report can group its block with that kind's sender report.</summary>
-    private sealed class InboundSourceStats(MediaKind kind)
+    private sealed class InboundSourceStats(MediaKind kind, uint clockRate)
     {
         internal MediaKind Kind { get; } = kind;
+
+        /// <summary>The route's RTP clock rate, retained so a stats report can express jitter in seconds.</summary>
+        internal uint ClockRate { get; } = clockRate;
 
         internal ReceptionStatistics Statistics { get; } = new();
 
