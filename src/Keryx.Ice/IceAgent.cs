@@ -1135,12 +1135,14 @@ public sealed class IceAgent : IDisposable
                 HandleCheckResponse(message, from, viaRelay);
                 break;
             case StunClass.Indication:
-                lock (_lock)
-                {
-                    // A peer keepalive indication refreshes consent on the pair carrying media.
-                    _selectedValidAt = Environment.TickCount64;
-                }
-
+                // RFC 7675 section 5.1: consent to keep sending is refreshed only by a validated
+                // STUN Binding *response* to a request this agent sent - never by an inbound STUN
+                // Binding indication. A keepalive indication (RFC 8445 section 11) carries no
+                // MESSAGE-INTEGRITY and its source is unverified, so treating it as consent let an
+                // off-path attacker keep a dead selected pair alive indefinitely, defeating the
+                // consent-freshness safeguard that stops the agent flooding an address the real peer
+                // has abandoned. It is ignored here; the agent's own keepalive checks (TickLocked)
+                // maintain genuine consent by eliciting authenticated responses.
                 break;
             default:
                 break;
