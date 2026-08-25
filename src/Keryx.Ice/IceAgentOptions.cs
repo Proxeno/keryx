@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using Keryx.Core;
 using Keryx.Stun;
@@ -59,10 +60,23 @@ public sealed class IceAgentOptions
     public string? LocalPassword { get; set; }
 
     /// <summary>
-    /// STUN servers to query for a server-reflexive candidate. Queried in order over the agent's
-    /// own socket; failures are logged and skipped.
+    /// STUN servers to query for a server-reflexive candidate, as already-resolved transport
+    /// addresses. Queried in order over the agent's own socket; failures are logged and skipped. To
+    /// configure a STUN server by host name (resolved via DNS when gathering starts), add a
+    /// <see cref="StunServerOptions"/> to <see cref="StunServerHosts"/> instead - both lists are
+    /// queried, this one first.
     /// </summary>
     public IList<IPEndPoint> StunServers { get; } = [];
+
+    /// <summary>
+    /// STUN servers to query for a server-reflexive candidate, addressed by host name and port and
+    /// resolved via DNS when gathering starts. This mirrors <see cref="TurnServers"/>, which already
+    /// accepts a host name: an entry whose <see cref="StunServerOptions.EndPoint"/> is set is used
+    /// as-is, otherwise its <see cref="StunServerOptions.Host"/>/<see cref="StunServerOptions.Port"/>
+    /// are resolved (IPv4 preferred). Queried after <see cref="StunServers"/>; failures - including a
+    /// host that does not resolve - are logged and skipped.
+    /// </summary>
+    public IList<StunServerOptions> StunServerHosts { get; } = [];
 
     /// <summary>
     /// TURN servers to allocate a relayed candidate on. A default (UDP) entry is allocated over the
@@ -166,6 +180,18 @@ public sealed class IceAgentOptions
     /// </summary>
     public bool RelayOnly { get; set; }
 
+    /// <summary>
+    /// Whether to also gather passive TCP host candidates (RFC 6544): a <see cref="TcpListener"/> is
+    /// bound alongside the UDP socket and advertised as <c>a=candidate ... tcp ... tcptype passive</c>,
+    /// connectivity checks and the datagram transport run over an accepted (or dialed) TCP connection
+    /// using RFC 6544's two-byte length framing, so a session can traverse a TCP pair when UDP is
+    /// blocked. Off by default, which keeps gathering UDP-only and every existing golden and interop
+    /// exchange byte-identical. Only passive candidates are advertised; the agent still dials a remote
+    /// <c>tcptype passive</c> candidate (acting as the active side), so two Keryx agents connect over
+    /// TCP. Advertising this agent's own <c>active</c>/<c>so</c> candidates is deferred.
+    /// </summary>
+    public bool GatherTcpCandidates { get; set; }
+
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }
 
@@ -217,6 +243,11 @@ public sealed class IceAgentOptions
         if (MinPort > 0 && MaxPort < MinPort)
         {
             throw new ArgumentException("MaxPort must be greater than or equal to MinPort.", nameof(MaxPort));
+        }
+
+        foreach (var stunServer in StunServerHosts)
+        {
+            stunServer.Validate();
         }
 
         foreach (var turnServer in TurnServers)
