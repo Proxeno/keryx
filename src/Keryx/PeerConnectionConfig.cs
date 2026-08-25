@@ -163,6 +163,29 @@ public sealed class PeerConnectionConfig
     public bool EnableUlpfec { get; set; }
 
     /// <summary>
+    /// Offer proactive forward error correction for video using FlexFEC (RFC 8627 / flexfec-03): a
+    /// <c>flexfec-03</c> repair codec per video codec, carried on its own SSRC and bound to the media
+    /// stream through <c>a=ssrc-group:FEC-FR</c>, so a receiver can rebuild an isolated lost media
+    /// packet from the survivors of its protection group without a retransmission round trip. Off by
+    /// default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// FlexFEC and ULPFEC (<see cref="EnableUlpfec"/>) are alternatives — a session picks one. When both
+    /// flags are set FlexFEC wins and the ULPFEC (<c>red</c>/<c>ulpfec</c>) codecs are not offered.
+    /// </para>
+    /// <para>
+    /// Off by default, and opt-in for the same reason ULPFEC is: enabling it changes the wire shape — an
+    /// extra <c>a=rtpmap:… flexfec-03/</c> entry, its payload type in the video <c>m=</c> line, and a
+    /// <c>a=ssrc-group:FEC-FR</c> line binding the media SSRC to the FlexFEC repair SSRC — so with the
+    /// flag off the default golden SDP stays byte-identical. Like ULPFEC, it spends steady uplink on
+    /// repair packets whether or not loss occurs. Audio is deliberately excluded: Opus repairs isolated
+    /// loss with its own in-band FEC.
+    /// </para>
+    /// </remarks>
+    public bool EnableFlexFec { get; set; }
+
+    /// <summary>
     /// Offer the transport-wide congestion-control header extension
     /// (<c>draft-holmer-rmcat-transport-wide-cc-extensions-01</c>) via <c>a=extmap</c> and, once the
     /// answer keeps it, stamp a monotonically increasing transport-wide sequence number on every
@@ -275,6 +298,12 @@ public sealed class PeerConnectionConfig
     /// set. Null picks the lowest unused dynamic payload type, which is what browsers do.
     /// </summary>
     public int? UlpfecPayloadType { get; set; }
+
+    /// <summary>
+    /// Payload type to advertise for the RFC 8627 (flexfec-03) <c>flexfec-03</c> codec when
+    /// <see cref="EnableFlexFec"/> is set. Null picks the lowest unused dynamic payload type.
+    /// </summary>
+    public int? FlexFecPayloadType { get; set; }
 
     /// <summary>
     /// Retention limits for the ring of recently sent video packets a NACK is served from. The

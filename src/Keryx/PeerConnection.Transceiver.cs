@@ -154,7 +154,8 @@ public sealed partial class PeerConnection
                 kind,
                 NewSsrc(),
                 kind == MediaKind.Video ? NewSsrc() : 0,
-                NewIdentifier(kind == MediaKind.Video ? "video" : "audio"));
+                NewIdentifier(kind == MediaKind.Video ? "video" : "audio"),
+                _config.EnableFlexFec && kind == MediaKind.Video ? NewSsrc() : 0);
 
             transceiver = new RtpTransceiver(kind, direction, sender, new RtpReceiver(), init?.Mid)
             {
@@ -220,7 +221,8 @@ public sealed partial class PeerConnection
                 MediaKind.Video,
                 NewSsrc(),
                 NewSsrc(),
-                _config.VideoTrackId ?? NewIdentifier("video"));
+                _config.VideoTrackId ?? NewIdentifier("video"),
+                _config.EnableFlexFec ? NewSsrc() : 0);
             AddTransceiverInternal(
                 new RtpTransceiver(MediaKind.Video, MediaDirection.SendOnly, sender, new RtpReceiver(), _config.VideoMid)
                 {
@@ -381,7 +383,8 @@ public sealed partial class PeerConnection
                 kind,
                 NewSsrc(),
                 kind == MediaKind.Video ? NewSsrc() : 0,
-                NewIdentifier(kind == MediaKind.Video ? "video" : "audio"));
+                NewIdentifier(kind == MediaKind.Video ? "video" : "audio"),
+                _config.EnableFlexFec && kind == MediaKind.Video ? NewSsrc() : 0);
             bound = new RtpTransceiver(kind, MediaDirection.RecvOnly, sender, new RtpReceiver(), mid);
             AddTransceiverInternal(bound);
             created = true;

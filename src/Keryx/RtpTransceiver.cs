@@ -136,12 +136,13 @@ public sealed class RtpSender : IRtpForwarder
 {
     private readonly PeerConnection _owner;
 
-    internal RtpSender(PeerConnection owner, MediaKind kind, uint ssrc, uint rtxSsrc, string trackId)
+    internal RtpSender(PeerConnection owner, MediaKind kind, uint ssrc, uint rtxSsrc, string trackId, uint flexFecSsrc = 0)
     {
         _owner = owner;
         Kind = kind;
         Ssrc = ssrc;
         RtxSsrcRaw = rtxSsrc;
+        FlexFecSsrcRaw = flexFecSsrc;
         TrackId = trackId;
     }
 
@@ -170,6 +171,16 @@ public sealed class RtpSender : IRtpForwarder
 
     /// <summary>The raw repair SSRC (0 when none), for the internal SDP/RTX wiring.</summary>
     internal uint RtxSsrcRaw { get; }
+
+    /// <summary>
+    /// The RFC 8627 FlexFEC repair SSRC this sender owns, allocated only when
+    /// <see cref="PeerConnectionConfig.EnableFlexFec"/> is set (0 otherwise). Published as the second
+    /// member of <c>a=ssrc-group:FEC-FR</c> so the peer can bind the FlexFEC stream to the media stream.
+    /// </summary>
+    public uint? FlexFecSsrc => FlexFecSsrcRaw == 0 ? null : FlexFecSsrcRaw;
+
+    /// <summary>The raw FlexFEC repair SSRC (0 when none), for the internal SDP/FlexFEC wiring.</summary>
+    internal uint FlexFecSsrcRaw { get; }
 
     /// <summary>The msid track id this sender publishes.</summary>
     internal string TrackId { get; }

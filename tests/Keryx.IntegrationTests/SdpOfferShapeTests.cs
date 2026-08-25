@@ -283,6 +283,79 @@ public sealed class SdpOfferShapeTests
         offer.Should().Contain("a=rtpmap:113 ulpfec/90000");
     }
 
+    [Fact]
+    public async Task FlexFecIsAbsentByDefault()
+    {
+        await using var peer = new PeerConnection(TestSupport.NewConfig());
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // The default golden offer must stay byte-identical: flexfec-03 and its FEC-FR group only appear
+        // when EnableFlexFec is set.
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97");
+        offer.Should().NotContain("flexfec-03/90000");
+        offer.Should().NotContain("a=ssrc-group:FEC-FR");
+        peer.VideoFlexFecSsrc.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task EnablingFlexFecOffersTheCodecAndTheFecFrSsrcGroup()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableFlexFec = true;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // H.264 (96) and rtx (97) keep their slots; flexfec-03 takes the next free dynamic PT.
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97 98");
+        offer.Should().Contain("a=rtpmap:98 flexfec-03/90000");
+
+        // RFC 8627 §5.1.2: FEC-FR binds the media SSRC to the FlexFEC repair SSRC, which is published
+        // with its own cname a=ssrc line just like the RTX repair source.
+        peer.VideoFlexFecSsrc.Should().NotBe(0);
+        offer.Should().Contain($"a=ssrc-group:FEC-FR {peer.VideoSsrc} {peer.VideoFlexFecSsrc}");
+        offer.Should().Contain($"a=ssrc:{peer.VideoFlexFecSsrc} cname:{peer.Cname}");
+
+        // ULPFEC's red/ulpfec entries are the alternative and are not offered.
+        offer.Should().NotContain("ulpfec/90000");
+        offer.Should().NotContain("red/90000");
+
+        // It parses and survives a round-trip through the SDP model the peer will meet on the far side.
+        var parsed = SessionDescription.Parse(offer);
+        var video = parsed.MediaDescriptions.Single(m => m.Media == "video");
+        video.Formats.Should().Contain(["96", "97", "98"]);
+    }
+
+    [Fact]
+    public async Task FlexFecWinsWhenBothFecSchemesAreEnabled()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableFlexFec = true;
+        config.EnableUlpfec = true;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // FlexFEC and ULPFEC are alternatives; FlexFEC is chosen and the red/ulpfec pair is suppressed.
+        offer.Should().Contain("flexfec-03/90000");
+        offer.Should().NotContain("ulpfec/90000");
+        offer.Should().NotContain("red/90000");
+        offer.Should().Contain("a=ssrc-group:FEC-FR");
+    }
+
+    [Fact]
+    public async Task TheFlexFecPayloadTypeCanBePinned()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableFlexFec = true;
+        config.FlexFecPayloadType = 115;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        offer.Should().Contain("a=rtpmap:115 flexfec-03/90000");
+    }
+
     private static CancellationToken TestTimeout() =>
         new CancellationTokenSource(TimeSpan.FromSeconds(20)).Token;
 }
