@@ -140,6 +140,36 @@ public sealed class SdpCodec
                 RtcpFeedback.TransportCc);
     }
 
+    /// <summary>
+    /// VP8 at 90 kHz with <c>nack</c>, <c>nack pli</c>, <c>ccm fir</c>, <c>goog-remb</c> and
+    /// <c>transport-cc</c> feedback, in Chrome's order. VP8 has no fmtp parameters in common use.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Bare <c>nack</c> promises retransmission, which Keryx serves over RTX (RFC 4588). Offer this
+    /// codec together with a matching <see cref="Rtx"/> entry — a <c>PeerConnection</c> does that
+    /// automatically — or clear <see cref="Feedback"/> of <see cref="RtcpFeedback.Nack"/> if the
+    /// m-section will carry no repair stream.
+    /// </para>
+    /// <para>
+    /// This makes VP8 a codec that can be offered and answered like any other entry in
+    /// <c>PeerConnectionConfig.VideoCodecs</c> — the SDP negotiation layer is codec agnostic, per the
+    /// class remarks above. Actually sending VP8 also requires routing the negotiated payload type to
+    /// <c>Keryx.Rtp.Packetization.Vp8Packetizer</c>, which today's single-codec sending path does not
+    /// yet do.
+    /// </para>
+    /// </remarks>
+    /// <param name="payloadType">Payload type.</param>
+    /// <returns>The codec entry.</returns>
+    public static SdpCodec Vp8(int payloadType = 96) =>
+        new SdpCodec(payloadType, "VP8", 90000)
+            .WithFeedback(
+                RtcpFeedback.Nack,
+                RtcpFeedback.NackPli,
+                RtcpFeedback.CcmFir,
+                RtcpFeedback.GoogRemb,
+                RtcpFeedback.TransportCc);
+
     /// <summary>An RTX repair codec bound to <paramref name="associatedPayloadType"/> via <c>apt</c>.</summary>
     /// <param name="payloadType">Payload type of the RTX stream.</param>
     /// <param name="associatedPayloadType">Payload type being repaired.</param>
