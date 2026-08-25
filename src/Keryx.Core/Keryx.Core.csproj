@@ -1,5 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <Description>Keryx core primitives: binary readers/writers, transport and logging abstractions shared by every Keryx layer.</Description>
+    <!-- BatchedDatagramSender marshals the mmsghdr/iovec/sockaddr arrays for the Linux sendmmsg(2)
+         fan-out fast path in unmanaged memory. This is the one narrow native-syscall exception the
+         baseline allows; AllowUnsafeBlocks only permits the pointer marshalling, it does not force
+         it, and the sendmmsg P/Invoke is gated to Linux at runtime. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Keryx.Core.Tests" />
+  </ItemGroup>
 </Project>
