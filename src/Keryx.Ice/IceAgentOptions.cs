@@ -37,6 +37,54 @@ public static class IceCredentials
     }
 }
 
+/// <summary>
+/// Hands one outbound ICE datagram to the transport that owns the socket, tagged with the remote
+/// it must reach. Used only in <see cref="IceAgent"/> endpoint-session mode
+/// (<see cref="IceExternalTransportOptions"/>), where the agent does not own a socket: the owner
+/// routes the datagram out of the shared socket. Must not throw on the hot path.
+/// </summary>
+/// <param name="datagram">The datagram to send. Valid only for the duration of the call; copy it to retain it.</param>
+/// <param name="destination">The remote transport address the datagram is bound for.</param>
+public delegate void IceExternalSendHandler(ReadOnlySpan<byte> datagram, IPEndPoint destination);
+
+/// <summary>
+/// Runs an <see cref="IceAgent"/> over a caller-provided datagram seam instead of a self-owned,
+/// self-bound UDP socket — the server-side "endpoint-session" shape of <c>broadcast-scale.md</c> §2.
+/// The agent binds nothing and runs no receive loop: the owner (a <c>BroadcastEndpoint</c>) demuxes
+/// inbound datagrams to the agent by 5-tuple and pushes them in through
+/// <see cref="IceAgent.InjectDatagram"/>, and every outbound datagram is handed back to the owner
+/// through <see cref="Send"/> to leave the shared socket. All ICE connectivity-check machinery
+/// (STUN validation, peer-reflexive discovery, nomination, keepalives) is unchanged; only the file
+/// descriptor the bytes cross is different.
+/// </summary>
+public sealed class IceExternalTransportOptions
+{
+    /// <summary>Creates the endpoint-session seam.</summary>
+    /// <param name="send">The owner's send path; routes an outbound datagram to the shared socket.</param>
+    /// <param name="localEndPoints">
+    /// The transport addresses the shared socket is reachable at, advertised verbatim as ICE host
+    /// candidates so the viewer sends its checks to the shared port. Must be non-empty.
+    /// </param>
+    public IceExternalTransportOptions(IceExternalSendHandler send, IReadOnlyList<IPEndPoint> localEndPoints)
+    {
+        ArgumentNullException.ThrowIfNull(send);
+        ArgumentNullException.ThrowIfNull(localEndPoints);
+        if (localEndPoints.Count == 0)
+        {
+            throw new ArgumentException("At least one local endpoint must be advertised.", nameof(localEndPoints));
+        }
+
+        Send = send;
+        LocalEndPoints = localEndPoints;
+    }
+
+    /// <summary>The owner's send path.</summary>
+    public IceExternalSendHandler Send { get; }
+
+    /// <summary>The shared socket's transport addresses, advertised as host candidates.</summary>
+    public IReadOnlyList<IPEndPoint> LocalEndPoints { get; }
+}
+
 /// <summary>Configuration for an <see cref="IceAgent"/>.</summary>
 public sealed class IceAgentOptions
 {
@@ -58,6 +106,14 @@ public sealed class IceAgentOptions
 
     /// <summary>The local password; generated when null.</summary>
     public string? LocalPassword { get; set; }
+
+    /// <summary>
+    /// When set, the agent runs in endpoint-session mode over this caller-provided seam instead of
+    /// binding and owning its own UDP socket (<c>broadcast-scale.md</c> §2). Null keeps the ordinary
+    /// self-owned-socket path. Incompatible with STUN/TURN gathering and ICE-TCP, which own their own
+    /// sockets; <see cref="Validate"/> rejects those combinations.
+    /// </summary>
+    public IceExternalTransportOptions? ExternalTransport { get; set; }
 
     /// <summary>
     /// STUN servers to query for a server-reflexive candidate, as already-resolved transport
@@ -256,6 +312,18 @@ public sealed class IceAgentOptions
         if (MinPort > 0 && MaxPort < MinPort)
         {
             throw new ArgumentException("MaxPort must be greater than or equal to MinPort.", nameof(MaxPort));
+        }
+
+        if (ExternalTransport is not null)
+        {
+            // Endpoint-session mode has no socket of its own to gather reflexive/relayed candidates
+            // on or to accept TCP connections; those paths are structurally incompatible with it.
+            if (StunServers.Count > 0 || StunServerHosts.Count > 0 || TurnServers.Count > 0 || GatherTcpCandidates)
+            {
+                throw new ArgumentException(
+                    "ExternalTransport (endpoint-session mode) cannot be combined with STUN/TURN gathering or ICE-TCP.",
+                    nameof(ExternalTransport));
+            }
         }
 
         foreach (var stunServer in StunServerHosts)

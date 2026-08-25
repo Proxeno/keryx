@@ -1,6 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="../../src/Keryx/Keryx.csproj" />
+    <ProjectReference Include="../../src/Keryx.Broadcast/Keryx.Broadcast.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="assets/**" CopyToOutputDirectory="PreserveNewest" LinkBase="assets" />

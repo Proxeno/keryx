@@ -81,6 +81,10 @@ public sealed class IceAgent : IDisposable
     private readonly IceAgentOptions _options;
     private readonly IKeryxLogger _logger;
     private readonly IceTransport _transport;
+
+    // Non-null only in endpoint-session mode (broadcast-scale.md §2): the agent owns no socket and
+    // instead sends through this seam and receives datagrams the owner pushes in via InjectDatagram.
+    private readonly IceExternalTransportOptions? _externalTransport;
     private readonly ConcurrentQueue<Action> _events = new();
     private readonly List<IceCandidate> _localCandidates = [];
     private readonly List<IceCandidate> _remoteCandidates = [];
@@ -142,8 +146,15 @@ public sealed class IceAgent : IDisposable
         _localKey = StunCredentials.ShortTermKey(LocalPassword);
         _mdnsResolver = _options.ResolveMdnsCandidates ? (_options.MdnsResolver ?? MulticastMdnsResolver.Shared) : null;
         _mdnsResolutionSlots = new SemaphoreSlim(_options.MaxConcurrentMdnsResolutions, _options.MaxConcurrentMdnsResolutions);
+        _externalTransport = _options.ExternalTransport;
         _transport = new IceTransport(this);
     }
+
+    /// <summary>
+    /// True when the agent runs in endpoint-session mode over a caller-provided datagram seam
+    /// (<see cref="IceExternalTransportOptions"/>) rather than owning its own bound UDP socket.
+    /// </summary>
+    public bool IsEndpointSession => _externalTransport is not null;
 
     /// <summary>Raised for each local candidate as it is gathered, so it can be trickled to the peer.</summary>
     public event EventHandler<IceCandidate>? OnLocalCandidate;
@@ -320,6 +331,12 @@ public sealed class IceAgent : IDisposable
 
         DrainEvents();
 
+        if (_externalTransport is not null)
+        {
+            StartEndpointSession(_externalTransport);
+            return;
+        }
+
         var socket = CreateSocket();
         try
         {
@@ -394,6 +411,72 @@ public sealed class IceAgent : IDisposable
         _events.Enqueue(() => OnGatheringComplete?.Invoke(this, EventArgs.Empty));
         DrainEvents();
         _logger.Log(KeryxLogLevel.Info, $"ICE gathering complete on {socket.LocalEndPoint} with {LocalCandidates.Count} candidate(s).");
+    }
+
+    /// <summary>
+    /// Brings up the agent in endpoint-session mode (<see cref="IceExternalTransportOptions"/>): no
+    /// socket is bound and no receive loop runs. Host candidates are advertised for the shared
+    /// socket's endpoints, the check loop starts, and inbound datagrams arrive via
+    /// <see cref="InjectDatagram"/>. STUN/TURN gathering is skipped — endpoint-session mode is the
+    /// ICE-lite server shape, one host candidate at a fixed advertised port.
+    /// </summary>
+    private void StartEndpointSession(IceExternalTransportOptions external)
+    {
+        _checkLoop = Task.Run(() => CheckLoopAsync(_cts.Token), CancellationToken.None);
+
+        var endpoints = external.LocalEndPoints;
+        for (var i = 0; i < endpoints.Count; i++)
+        {
+            var endpoint = endpoints[i];
+
+            // The first advertised endpoint gets the highest local preference, mirroring how the
+            // self-owned path ranks multiple interface addresses.
+            var localPreference = Math.Max(0, IcePriority.MaxLocalPreference - i);
+            var candidate = new IceCandidate(
+                Foundation(IceCandidateType.Host, endpoint.Address, null),
+                component: 1,
+                IceCandidate.UdpTransport,
+                IcePriority.Compute(IceCandidateType.Host, localPreference),
+                endpoint.Address,
+                endpoint.Port,
+                IceCandidateType.Host)
+            {
+                LocalPreference = localPreference,
+            };
+
+            AddLocalCandidate(candidate);
+        }
+
+        _events.Enqueue(() => OnGatheringComplete?.Invoke(this, EventArgs.Empty));
+        DrainEvents();
+        _logger.Log(
+            KeryxLogLevel.Info,
+            $"ICE endpoint-session ready over a shared socket with {LocalCandidates.Count} advertised candidate(s).");
+    }
+
+    /// <summary>
+    /// Pushes one inbound datagram, demultiplexed to this agent by its owner (a broadcast endpoint's
+    /// 5-tuple demux), into the agent's processing path — the endpoint-session counterpart of the
+    /// self-owned receive loop. STUN is validated and answered here; everything else is surfaced on
+    /// <see cref="Transport"/> for DTLS/SRTP. Only valid in endpoint-session mode.
+    /// </summary>
+    /// <param name="datagram">The received datagram; valid only for the duration of the call.</param>
+    /// <param name="from">The remote transport address the datagram arrived from.</param>
+    public void InjectDatagram(ReadOnlySpan<byte> datagram, IPEndPoint from)
+    {
+        if (_externalTransport is null)
+        {
+            throw new InvalidOperationException("InjectDatagram is only valid for an endpoint-session-mode agent.");
+        }
+
+        ArgumentNullException.ThrowIfNull(from);
+        if (datagram.Length == 0)
+        {
+            return;
+        }
+
+        ProcessInboundDatagram(datagram, Normalize(from));
+        DrainEvents();
     }
 
     /// <summary>Supplies the peer's <c>a=ice-ufrag</c> and <c>a=ice-pwd</c>. Checks cannot start until this is called.</summary>
@@ -840,7 +923,8 @@ public sealed class IceAgent : IDisposable
             pair = _selected ?? BestUsablePairLocked();
         }
 
-        if (socket is null || pair is null)
+        // In endpoint-session mode there is no _socket; readiness is having a usable pair to send on.
+        if ((socket is null && _externalTransport is null) || pair is null)
         {
             throw new InvalidOperationException("No candidate pair has succeeded yet; the ICE transport is not usable.");
         }
@@ -1599,22 +1683,32 @@ public sealed class IceAgent : IDisposable
                 continue;
             }
 
-            if (StunMessage.LooksLikeStun(datagram))
-            {
-                HandleStun(datagram, from, viaRelay: null, viaTcp: null);
-            }
-            else if (IsAcceptableInboundSource(from))
-            {
-                // RFC 7983 demultiplexing: everything that is not STUN belongs to the layer above
-                // and must be surfaced immediately, even before nomination completes.
-                _transport.Raise(datagram);
-            }
-            else
-            {
-                _logger.Log(KeryxLogLevel.Warning, $"Dropping non-STUN datagram from {from}: not the selected pair's remote endpoint.");
-            }
+            ProcessInboundDatagram(datagram, from);
 
             DrainEvents();
+        }
+    }
+
+    /// <summary>
+    /// The RFC 7983 first-byte demultiplex shared by the self-owned receive loop and endpoint-session
+    /// <see cref="InjectDatagram"/>: STUN is validated and answered; everything else is surfaced on
+    /// <see cref="Transport"/> for DTLS/SRTP. TURN unwrapping happens before this, in the receive loop.
+    /// </summary>
+    private void ProcessInboundDatagram(ReadOnlySpan<byte> datagram, IPEndPoint from)
+    {
+        if (StunMessage.LooksLikeStun(datagram))
+        {
+            HandleStun(datagram, from, viaRelay: null, viaTcp: null);
+        }
+        else if (IsAcceptableInboundSource(from))
+        {
+            // RFC 7983 demultiplexing: everything that is not STUN belongs to the layer above
+            // and must be surfaced immediately, even before nomination completes.
+            _transport.Raise(datagram);
+        }
+        else
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Dropping non-STUN datagram from {from}: not the selected pair's remote endpoint.");
         }
     }
 
@@ -1940,7 +2034,8 @@ public sealed class IceAgent : IDisposable
 
     private void TickLocked(List<(byte[] Datagram, IceCandidatePair Pair)> pending)
     {
-        if (_state is IceAgentState.Closed or IceAgentState.Failed || _socket is null)
+        // In endpoint-session mode there is no _socket; the send seam carries checks instead.
+        if (_state is IceAgentState.Closed or IceAgentState.Failed || (_socket is null && _externalTransport is null))
         {
             return;
         }
@@ -2555,6 +2650,16 @@ public sealed class IceAgent : IDisposable
 
     private void SendRaw(ReadOnlySpan<byte> datagram, IPEndPoint destination)
     {
+        // Endpoint-session mode owns no socket: every datagram leaves through the owner's shared
+        // socket via the send seam. This is the single choke point for direct (non-relay, non-TCP)
+        // sends, so routing it here covers checks, keepalives, and DTLS/SRTP media alike — and is
+        // where broadcast-scale.md §3's batched sender will later replace the per-datagram send.
+        if (_externalTransport is { } external)
+        {
+            external.Send(datagram, destination);
+            return;
+        }
+
         Socket? socket;
         lock (_lock)
         {

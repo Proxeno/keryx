@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Keryx.Broadcast: shared-socket broadcast fan-out transport for the Keryx WebRTC stack. A BroadcastEndpoint serves many viewers over one UDP socket, demuxing inbound datagrams to per-viewer sessions by 5-tuple with STUN first-contact binding, so per-ingest-packet fan-out can batch on a single socket.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../Keryx.Stun/Keryx.Stun.csproj" />
+    <ProjectReference Include="../Keryx.Ice/Keryx.Ice.csproj" />
+    <ProjectReference Include="../Keryx/Keryx.csproj" />
+  </ItemGroup>
+</Project>
