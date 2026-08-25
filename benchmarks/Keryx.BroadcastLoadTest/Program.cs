@@ -36,8 +36,14 @@ using Keryx.Broadcast;
 //   docker run --rm --ulimit nofile=1048576:1048576 -v "$PWD":/work -w /work keryx-loadtest \
 //       dotnet run --project benchmarks/Keryx.BroadcastLoadTest -c Release -- --arms A,B,C
 //
-// Usage: dotnet run -c Release [--arms A,B,C] [--profile 720p|480p] [--duration <s>]
+// Arm P sweeps the BroadcastEndpoint socket pool (SO_REUSEPORT shards) 1/2/4/8 at a fixed viewer count,
+// showing the fan-out send spreading across cores:
+//   docker run ... keryx-loadtest dotnet run --project benchmarks/Keryx.BroadcastLoadTest -c Release -- \
+//       --arms P --pool-sizes 1,2,4,8 --pool-viewers 2000
+//
+// Usage: dotnet run -c Release [--arms A,B,C,P] [--profile 720p|480p] [--duration <s>]
 //                              [--pc-viewers 50,100,250] [--viewers 500,1000,2000,4000]
+//                              [--pool-sizes 1,2,4,8] [--pool-viewers <n>]
 //                              [--workers <n>] [--recv-buffer-kb <kb>]
 // =====================================================================================================
 
@@ -46,6 +52,8 @@ var profile = MediaProfile.Resolve(ArgString(args, "--profile", "720p"));
 var duration = TimeSpan.FromSeconds(ArgValue(args, "--duration", 5));
 var pcViewerLevels = ArgIntList(args, "--pc-viewers", [50, 100, 250]);
 var viewerLevels = ArgIntList(args, "--viewers", [500, 1000, 2000, 4000]);
+var poolSizes = ArgIntList(args, "--pool-sizes", [1, 2, 4, 8]);
+var poolViewers = (int)ArgValue(args, "--pool-viewers", 2000);
 var workers = (int)ArgValue(args, "--workers", Environment.ProcessorCount);
 var recvBufferBytes = (int)ArgValue(args, "--recv-buffer-kb", 256) * 1024;
 var cores = Environment.ProcessorCount;
@@ -82,6 +90,11 @@ if (arms.Contains("B", StringComparer.OrdinalIgnoreCase))
 if (arms.Contains("C", StringComparer.OrdinalIgnoreCase))
 {
     await FanoutCeilingArm.RunSharedKeyAsync(profile, viewerLevels, duration, recvBufferBytes);
+}
+
+if (arms.Contains("P", StringComparer.OrdinalIgnoreCase))
+{
+    await FanoutCeilingArm.RunPoolSweepAsync(profile, poolViewers, poolSizes, duration, workers, recvBufferBytes);
 }
 
 PrintHonesty(cores, nativeBatch);

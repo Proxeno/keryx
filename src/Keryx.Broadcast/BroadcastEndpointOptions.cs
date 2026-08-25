@@ -30,6 +30,22 @@ public sealed class BroadcastEndpointOptions
     public int MaxViewers { get; set; } = 1024;
 
     /// <summary>
+    /// The number of UDP sockets the endpoint shards its fan-out across (<c>broadcast-scale.md</c> §2/§4).
+    /// The default of 1 is exactly today's single-socket behaviour. A larger pool spreads the fan-out send
+    /// syscalls — the measured bottleneck — across that many cores: each shard owns its own socket, receive
+    /// loop and batched sender, and each viewer's egress is pinned to one shard, so N shards drive N
+    /// <c>sendmmsg</c> flushes in parallel per ingest packet.
+    /// </summary>
+    /// <remarks>
+    /// The pool is bound to a <b>single advertised port</b> via Linux <c>SO_REUSEPORT</c> (all shard sockets
+    /// share the port; the kernel 5-tuple-hashes inbound datagrams across them). Where <c>SO_REUSEPORT</c> is
+    /// unavailable — macOS, Windows, or a kernel that rejects it — the endpoint <b>falls back to a single
+    /// socket</b> regardless of this value (correctness holds everywhere; the multi-core scaling win is
+    /// Linux-only). The effective pool size is observable on <see cref="BroadcastEndpoint.SocketPoolSize"/>.
+    /// </remarks>
+    public int SocketPoolSize { get; set; } = 1;
+
+    /// <summary>
     /// The shared socket's send-buffer size in bytes (<c>SO_SNDBUF</c>), or null (the default) to leave the
     /// OS default in force. This is the primary lever against <see cref="BroadcastEndpoint.DroppedDatagrams"/>:
     /// a fan-out flushes many datagrams per <c>sendmmsg</c>, and when the send buffer fills the batch's tail
@@ -48,6 +64,7 @@ public sealed class BroadcastEndpointOptions
     {
         ArgumentNullException.ThrowIfNull(BindEndPoint);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxViewers, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(SocketPoolSize, 1);
         if (SendBufferSize is { } sendBuffer)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(sendBuffer, 1);

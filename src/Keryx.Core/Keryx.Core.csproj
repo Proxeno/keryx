@@ -9,5 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Keryx.Core.Tests" />
+    <InternalsVisibleTo Include="Keryx.Broadcast" />
   </ItemGroup>
 </Project>
