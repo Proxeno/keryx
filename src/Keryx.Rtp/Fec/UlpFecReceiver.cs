@@ -31,8 +31,18 @@ public readonly record struct UlpFecStats(long MediaPacketsObserved, long FecPac
 /// </remarks>
 public sealed class UlpFecReceiver
 {
+    /// <summary>
+    /// Default cap on FEC packets held pending an as-yet-incomplete recovery. A FEC packet whose group is
+    /// missing two or more media packets is retained in case a survivor still arrives and drops the count
+    /// to one; without a bound, a stream of such unrecoverable FEC packets would grow this list without
+    /// limit, the FEC analogue of the bounded SCTP reassembly and RTP source tables. When the cap is
+    /// reached the oldest pending FEC packet is discarded, matching the media ring's eviction policy.
+    /// </summary>
+    public const int DefaultMaxPendingFec = 128;
+
     private readonly uint _mediaSsrc;
     private readonly int _capacity;
+    private readonly int _maxPendingFec;
     private readonly Dictionary<ushort, byte[]> _media = new();
     private readonly Queue<ushort> _mediaOrder = new();
     private readonly List<byte[]> _pendingFec = new();
@@ -45,12 +55,18 @@ public sealed class UlpFecReceiver
     /// <summary>Creates a receiver for one media stream.</summary>
     /// <param name="mediaSsrc">SSRC stamped on recovered packets; the FEC packet does not carry it.</param>
     /// <param name="capacity">How many recent media packets to retain as recovery survivors. Must be positive.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is not positive.</exception>
-    public UlpFecReceiver(uint mediaSsrc, int capacity = 64)
+    /// <param name="maxPendingFec">
+    /// How many not-yet-resolvable FEC packets to retain before evicting the oldest. Must be positive;
+    /// defaults to <see cref="DefaultMaxPendingFec"/>.
+    /// </param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> or <paramref name="maxPendingFec"/> is not positive.</exception>
+    public UlpFecReceiver(uint mediaSsrc, int capacity = 64, int maxPendingFec = DefaultMaxPendingFec)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPendingFec);
         _mediaSsrc = mediaSsrc;
         _capacity = capacity;
+        _maxPendingFec = maxPendingFec;
     }
 
     /// <summary>Reads the counters.</summary>
@@ -82,6 +98,14 @@ public sealed class UlpFecReceiver
         if (!UlpFecPacket.TryParse(fecPayload, out _))
         {
             return false;
+        }
+
+        // Bound the pending list before appending: a group missing two or more packets is retained in
+        // case a survivor still arrives, but a flood of unrecoverable FEC packets must not grow memory
+        // without limit. Evict the oldest, matching the media ring's FIFO eviction.
+        if (_pendingFec.Count >= _maxPendingFec)
+        {
+            _pendingFec.RemoveAt(0);
         }
 
         _pendingFec.Add(fecPayload.ToArray());

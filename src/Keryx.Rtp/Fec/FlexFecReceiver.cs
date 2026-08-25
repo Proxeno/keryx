@@ -38,8 +38,18 @@ public readonly record struct FlexFecStats(long MediaPacketsObserved, long FecPa
 /// </remarks>
 public sealed class FlexFecReceiver
 {
+    /// <summary>
+    /// Default cap on FEC packets held pending an as-yet-incomplete recovery. A repair packet whose group
+    /// is missing two or more media packets is retained in case a survivor still arrives and drops the
+    /// count to one; without a bound, a stream of such unrecoverable repair packets would grow this list
+    /// without limit, the FEC analogue of the bounded SCTP reassembly and RTP source tables. When the cap
+    /// is reached the oldest pending repair packet is discarded, matching the media ring's eviction policy.
+    /// </summary>
+    public const int DefaultMaxPendingFec = 128;
+
     private readonly uint _mediaSsrc;
     private readonly int _capacity;
+    private readonly int _maxPendingFec;
     private readonly Dictionary<ushort, byte[]> _media = new();
     private readonly Queue<ushort> _mediaOrder = new();
     private readonly List<byte[]> _pendingFec = new();
@@ -52,12 +62,18 @@ public sealed class FlexFecReceiver
     /// <summary>Creates a receiver for one media stream.</summary>
     /// <param name="mediaSsrc">SSRC of the protected media stream; stamped on recovered packets and matched against each FEC packet's protected SSRC.</param>
     /// <param name="capacity">How many recent media packets to retain as recovery survivors. Must be positive.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is not positive.</exception>
-    public FlexFecReceiver(uint mediaSsrc, int capacity = 64)
+    /// <param name="maxPendingFec">
+    /// How many not-yet-resolvable repair packets to retain before evicting the oldest. Must be positive;
+    /// defaults to <see cref="DefaultMaxPendingFec"/>.
+    /// </param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> or <paramref name="maxPendingFec"/> is not positive.</exception>
+    public FlexFecReceiver(uint mediaSsrc, int capacity = 64, int maxPendingFec = DefaultMaxPendingFec)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPendingFec);
         _mediaSsrc = mediaSsrc;
         _capacity = capacity;
+        _maxPendingFec = maxPendingFec;
     }
 
     /// <summary>Reads the counters.</summary>
@@ -89,6 +105,14 @@ public sealed class FlexFecReceiver
         if (!FlexFecPacket.TryParse(fecPayload, out var header) || header.ProtectedSsrc != _mediaSsrc)
         {
             return false;
+        }
+
+        // Bound the pending list before appending: a group missing two or more packets is retained in
+        // case a survivor still arrives, but a flood of unrecoverable repair packets must not grow memory
+        // without limit. Evict the oldest, matching the media ring's FIFO eviction.
+        if (_pendingFec.Count >= _maxPendingFec)
+        {
+            _pendingFec.RemoveAt(0);
         }
 
         _pendingFec.Add(fecPayload.ToArray());
