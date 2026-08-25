@@ -186,6 +186,9 @@ public sealed class IceRelayTests
         peer.Media[0].Should().Equal(payload);
 
         // Measured, not assumed: the TURN server counted the datagram going out of the allocation.
+        // RelayedToPeer is incremented right after the socket send, so it can lag the peer's own
+        // receive by a scheduling hair - wait for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, relayedToPeerBefore + 1)).Should().BeTrue();
         server.RelayedToPeer.Should().BeGreaterThan(relayedToPeerBefore);
         server.ChannelDataFromClient.Should().BeGreaterThan(0);
     }
@@ -232,6 +235,7 @@ public sealed class IceRelayTests
             received[0].Should().Equal(dtlsRecord);
         }
 
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToClient, 1)).Should().BeTrue();
         server.RelayedToClient.Should().BeGreaterThan(0);
     }
 

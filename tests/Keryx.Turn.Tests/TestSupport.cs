@@ -31,6 +31,21 @@ internal static class TestTimeout
 
         return condition();
     }
+
+    /// <summary>
+    /// Polls <paramref name="count"/> until it reaches at least <paramref name="expected"/> or the
+    /// timeout elapses.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TestTurnServer"/>'s relayed-datagram counters (<see cref="TestTurnServer.RelayedToPeer"/>,
+    /// <see cref="TestTurnServer.RelayedToClient"/>) are incremented after the socket send they count
+    /// completes, not before - a test that awaits delivery on the receiving side and then immediately
+    /// asserts the count on the sending side races that increment becoming visible. Waiting here for
+    /// the count itself, rather than assuming it already landed once delivery was observed, removes
+    /// that race without weakening what is asserted: the caller still asserts the exact final count.
+    /// </remarks>
+    public static Task<bool> WaitForCountAsync(Func<int> count, int expected, int timeoutMilliseconds = 5000) =>
+        WaitForAsync(() => count() >= expected, timeoutMilliseconds);
 }
 
 /// <summary>

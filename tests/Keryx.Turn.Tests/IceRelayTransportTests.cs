@@ -91,6 +91,11 @@ public sealed class IceRelayTransportTests
 
         (await TestTimeout.WaitForAsync(() => peer.Media.Count > 0)).Should().BeTrue();
         peer.Media[0].Should().Equal(payload);
+
+        // The peer's receive only proves the socket send happened; RelayedToPeer is incremented
+        // right after that send, so it can lag the peer's own receive by a scheduling hair. Wait
+        // for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, relayedToPeerBefore + 1)).Should().BeTrue();
         server.RelayedToPeer.Should().BeGreaterThan(relayedToPeerBefore);
         server.ChannelDataFromClient.Should().BeGreaterThan(0);
 
@@ -119,6 +124,7 @@ public sealed class IceRelayTransportTests
             received[0].Should().Equal(inbound);
         }
 
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToClient, 1)).Should().BeTrue();
         server.RelayedToClient.Should().BeGreaterThan(0);
     }
 

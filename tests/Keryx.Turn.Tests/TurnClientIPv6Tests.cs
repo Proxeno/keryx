@@ -134,6 +134,11 @@ public sealed class TurnClientIPv6Tests
         // relayed transport address the server owns, which is itself IPv6.
         from.Should().Be(relayed);
         from.AddressFamily.Should().Be(AddressFamily.InterNetworkV6);
+
+        // The peer observing the datagram only proves the socket send happened; the server's
+        // counter is incremented right after that send, so it can lag the peer's own receive by a
+        // scheduling hair. Wait for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, 1)).Should().BeTrue();
         server.RelayedToPeer.Should().Be(1);
 
         byte[] reply = [1, 1, 2, 3, 5, 8, 13];
@@ -143,6 +148,7 @@ public sealed class TurnClientIPv6Tests
         var received = harness.Received.Single();
         received.Data.Should().Equal(reply);
         received.Peer.Should().Be(peer.EndPoint);
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToClient, 1)).Should().BeTrue();
         server.RelayedToClient.Should().Be(1);
     }
 }

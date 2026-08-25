@@ -222,6 +222,11 @@ public sealed class TurnClientTests
         // relayed transport address the server owns, not from the client's socket.
         from.Should().Be(relayed);
         from.Should().NotBe(harness.LocalEndPoint);
+
+        // The peer's receive only proves the socket send happened; the server's counter is
+        // incremented right after that send, so it can lag the peer's own receive by a scheduling
+        // hair. Wait for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, 1)).Should().BeTrue();
         server.RelayedToPeer.Should().Be(1);
     }
 
@@ -242,6 +247,11 @@ public sealed class TurnClientTests
         var received = harness.Received.Single();
         received.Data.Should().Equal(payload);
         received.Peer.Should().Be(peer.EndPoint);
+
+        // The client's receive only proves the socket send happened; the server's counter is
+        // incremented right after that send, so it can lag the client's own receive by a
+        // scheduling hair. Wait for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToClient, 1)).Should().BeTrue();
         server.RelayedToClient.Should().Be(1);
     }
 
@@ -279,6 +289,11 @@ public sealed class TurnClientTests
         harness.Client.SendTo([1], peer.EndPoint);
         await first;
         server.ChannelDataFromClient.Should().Be(0);
+
+        // The peer's receive only proves the socket send happened; RelayedToPeer is incremented
+        // right after that send, so it can lag the peer's own receive by a scheduling hair. Wait
+        // for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, 1)).Should().BeTrue();
         server.RelayedToPeer.Should().Be(1);
 
         await harness.Client.BindChannelAsync(peer.EndPoint, TestTimeout.Token);
@@ -290,6 +305,7 @@ public sealed class TurnClientTests
         // RFC 8656 section 12: once a channel exists the payload rides a four-byte ChannelData
         // header instead of a 36-byte Send indication.
         server.ChannelDataFromClient.Should().Be(1);
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, 2)).Should().BeTrue();
         server.RelayedToPeer.Should().Be(2);
     }
 
