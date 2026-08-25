@@ -104,6 +104,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private SctpAssociation? _sctp;
     private SrtpContext? _srtp;
     private Task? _driver;
+
+    // Trickle mode only (PeerConnectionConfig.TrickleIceCandidates): the background task gathering ICE
+    // candidates while the already-returned offer/answer trickles them out. Null in the default blocking
+    // mode, where gathering is awaited inline. Awaited on close so gathering unwinds before _cts is
+    // disposed. Guarded by _lock.
+    private Task? _gatherTask;
     private SessionDescription? _localDescription;
     private SessionDescription? _remoteDescription;
     private SdpFingerprint? _remoteFingerprint;
@@ -416,6 +422,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// configured media kind plus the SCTP data channel section, <c>a=setup:actpass</c>, rtcp-mux, and
     /// every gathered <c>a=candidate</c> line followed by <c>a=end-of-candidates</c>.
     /// </summary>
+    /// <remarks>
+    /// When <see cref="PeerConnectionConfig.TrickleIceCandidates"/> is set (RFC 8838) this returns before
+    /// gathering completes, carrying only the candidates gathered synchronously (possibly none) and
+    /// <em>without</em> <c>a=end-of-candidates</c>; the rest are trickled through
+    /// <see cref="OnLocalIceCandidate"/> and <see cref="OnIceGatheringComplete"/> marks the end of the set.
+    /// </remarks>
     /// <param name="cancellationToken">Cancels gathering.</param>
     /// <returns>The offer, ready to hand to signalling.</returns>
     /// <exception cref="InvalidOperationException">An offer has already been created, or a remote offer is pending.</exception>
@@ -484,7 +496,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
         {
             // A plain renegotiation reuses the existing ICE transport, credentials and gathered candidates
             // (session-model.md §4.2), so gather only the first time.
-            await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
+            if (_config.TrickleIceCandidates)
+            {
+                // Trickle (RFC 8838): begin gathering but do not block the offer on it. Whatever was
+                // gathered synchronously is attached below (possibly nothing); the rest arrive through
+                // OnLocalIceCandidate and the offer omits a=end-of-candidates until OnIceGatheringComplete.
+                StartTrickleGathering(ice, cancellationToken);
+            }
+            else
+            {
+                await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
 
         var session = BuildOffer(ice);
@@ -509,7 +531,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
     /// <summary>
     /// Produces an answer to the offer applied by <see cref="SetRemoteDescriptionAsync"/>, gathering
-    /// ICE candidates first, and then starts the connection driver.
+    /// ICE candidates first, and then starts the connection driver. When
+    /// <see cref="PeerConnectionConfig.TrickleIceCandidates"/> is set (RFC 8838) the answer returns before
+    /// gathering completes — see the remarks on <see cref="CreateOfferAsync(CancellationToken)"/> — and the
+    /// driver runs connectivity checks as both local candidates gather and remote candidates trickle in.
     /// </summary>
     /// <param name="cancellationToken">Cancels gathering.</param>
     /// <returns>The answer, ready to hand to signalling.</returns>
@@ -553,7 +578,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         if (ice.State == IceAgentState.New)
         {
-            await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
+            if (_config.TrickleIceCandidates)
+            {
+                // Trickle (RFC 8838): begin gathering but do not block the answer on it. See the matching
+                // branch in CreateOfferAsync. The driver starts below and runs connectivity checks as both
+                // local candidates gather and remote candidates trickle in through AddIceCandidate.
+                StartTrickleGathering(ice, cancellationToken);
+            }
+            else
+            {
+                await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
+            }
         }
 
         var session = BuildAnswer(offer, ice);
@@ -865,10 +900,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
         _logger.Log(KeryxLogLevel.Info, "Closing the peer connection.");
 
         Task? driver;
+        Task? gather;
         List<PendingChannel> pending;
         lock (_lock)
         {
             driver = _driver;
+            gather = _gatherTask;
             pending = [.. _pendingChannels];
             _pendingChannels.Clear();
         }
@@ -910,6 +947,25 @@ public sealed partial class PeerConnection : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.Log(KeryxLogLevel.Debug, "The connection driver ended with an error.", ex);
+            }
+        }
+
+        if (gather is not null)
+        {
+            // Cancelled through the linked token by the _cts.CancelAsync() above; let it unwind before
+            // _cts is disposed. StartTrickleGathering already swallowed cancellation and disposal, so a
+            // fault here would be unexpected — log and continue closing regardless.
+            try
+            {
+                await gather.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+            {
+                _logger.Log(KeryxLogLevel.Debug, "Background ICE gathering did not stop promptly; continuing to close.");
+            }
+            catch (Exception ex)
+            {
+                _logger.Log(KeryxLogLevel.Debug, "Background ICE gathering ended with an error.", ex);
             }
         }
 
@@ -1122,6 +1178,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private void AttachLocalCandidates(SessionDescription session, IceAgent ice)
     {
         var candidates = ice.LocalCandidates;
+
+        // Trickle mode emits the description before gathering completes, so per JSEP / RFC 8838 it must
+        // not assert end-of-candidates yet: the remaining candidates are trickled through
+        // OnLocalIceCandidate and the terminal OnIceGatheringComplete lets the consumer signal
+        // end-of-candidates. In the default blocking mode gathering is finished, so the description is
+        // complete and asserts end-of-candidates exactly as before (golden SDP byte-identical).
+        var complete = !_config.TrickleIceCandidates;
         foreach (var media in session.MediaDescriptions)
         {
             foreach (var candidate in candidates)
@@ -1129,7 +1192,46 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 media.AddCandidate(candidate.ToValueString());
             }
 
-            media.EndOfCandidates = true;
+            media.EndOfCandidates = complete;
+        }
+    }
+
+    /// <summary>
+    /// Starts ICE gathering on a background task (trickle mode), so <see cref="CreateOfferAsync(CancellationToken)"/>
+    /// and <see cref="CreateAnswerAsync"/> can return before it completes. Each gathered candidate still
+    /// fires <see cref="OnLocalIceCandidate"/> and <see cref="OnIceGatheringComplete"/> fires once
+    /// gathering finishes, wired in <see cref="EnsureIceLocked"/> exactly as in the blocking path.
+    /// </summary>
+    private void StartTrickleGathering(IceAgent ice, CancellationToken cancellationToken)
+    {
+        // Link the caller's token with the connection's own, so closing the connection cancels any
+        // in-flight STUN/TURN gathering even when the caller passed CancellationToken.None.
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+        var task = Task.Run(
+            async () =>
+            {
+                try
+                {
+                    await ice.StartGatheringAsync(linked.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+                {
+                    // The connection was closed while gathering; nothing left to report.
+                }
+                catch (Exception ex)
+                {
+                    _logger.Log(KeryxLogLevel.Error, "Background ICE gathering failed.", ex);
+                }
+                finally
+                {
+                    linked.Dispose();
+                }
+            },
+            CancellationToken.None);
+
+        lock (_lock)
+        {
+            _gatherTask = task;
         }
     }
 
