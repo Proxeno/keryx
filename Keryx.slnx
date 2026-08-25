@@ -11,6 +11,10 @@
     <Project Path="src/Keryx.Turn/Keryx.Turn.csproj" />
     <Project Path="src/Keryx/Keryx.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Keryx.Benchmarks/Keryx.Benchmarks.csproj" />
+    <Project Path="benchmarks/Keryx.ScaleHarness/Keryx.ScaleHarness.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Keryx.Core.Tests/Keryx.Core.Tests.csproj" />
     <Project Path="tests/Keryx.Dtls.Tests/Keryx.Dtls.Tests.csproj" />
