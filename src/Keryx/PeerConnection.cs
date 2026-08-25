@@ -1162,7 +1162,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
             codecs.Add(CloneCodec(codec));
         }
 
-        if (!enableRtx || codecs.Count == 0)
+        if (codecs.Count == 0)
         {
             return codecs;
         }
@@ -1178,33 +1178,73 @@ public sealed partial class PeerConnection : IAsyncDisposable
             used.Add(codec.PayloadType);
         }
 
-        var repairs = new List<SdpCodec>(codecs.Count);
-        foreach (var codec in codecs)
+        if (enableRtx)
         {
-            if (codec.IsRtx)
+            var repairs = new List<SdpCodec>(codecs.Count);
+            foreach (var codec in codecs)
             {
-                continue;
+                if (codec.IsRtx)
+                {
+                    continue;
+                }
+
+                var preferred = repairs.Count == 0 ? _config.RtxPayloadType : null;
+                if (NextDynamicPayloadType(used, preferred) is not { } rtxPayloadType)
+                {
+                    _logger.Log(
+                        KeryxLogLevel.Warning,
+                        "No dynamic payload type is free for an rtx codec; retransmission is not offered.");
+                    repairs.Clear();
+                    break;
+                }
+
+                if (!codec.Feedback.Contains(RtcpFeedback.Nack))
+                {
+                    codec.Feedback.Insert(0, RtcpFeedback.Nack);
+                }
+
+                repairs.Add(SdpCodec.Rtx(rtxPayloadType, codec.PayloadType, codec.ClockRate));
             }
 
-            var preferred = repairs.Count == 0 ? _config.RtxPayloadType : null;
-            if (NextDynamicPayloadType(used, preferred) is not { } rtxPayloadType)
-            {
-                _logger.Log(
-                    KeryxLogLevel.Warning,
-                    "No dynamic payload type is free for an rtx codec; retransmission is not offered.");
-                return codecs;
-            }
-
-            if (!codec.Feedback.Contains(RtcpFeedback.Nack))
-            {
-                codec.Feedback.Insert(0, RtcpFeedback.Nack);
-            }
-
-            repairs.Add(SdpCodec.Rtx(rtxPayloadType, codec.PayloadType, codec.ClockRate));
+            codecs.AddRange(repairs);
         }
 
-        codecs.AddRange(repairs);
+        if (_config.EnableUlpfec)
+        {
+            AppendUlpfecCodecs(codecs, used);
+        }
+
         return codecs;
+    }
+
+    /// <summary>
+    /// Appends one RFC 2198 <c>red</c> codec and one RFC 5109 <c>ulpfec</c> codec to the video codec
+    /// list, drawing their payload types from the still-free dynamic range. RED and ULPFEC are offered
+    /// once per m-section, after the media and rtx entries, mirroring how browsers advertise them.
+    /// </summary>
+    private void AppendUlpfecCodecs(List<SdpCodec> codecs, HashSet<int> used)
+    {
+        var clockRate = 90000;
+        foreach (var codec in codecs)
+        {
+            if (!codec.IsRtx && !codec.IsRed && !codec.IsUlpfec)
+            {
+                clockRate = codec.ClockRate;
+                break;
+            }
+        }
+
+        if (NextDynamicPayloadType(used, _config.RedPayloadType) is not { } redPayloadType
+            || NextDynamicPayloadType(used, _config.UlpfecPayloadType) is not { } ulpfecPayloadType)
+        {
+            _logger.Log(
+                KeryxLogLevel.Warning,
+                "No dynamic payload type is free for the red/ulpfec codecs; FEC is not offered.");
+            return;
+        }
+
+        codecs.Add(SdpCodec.Red(redPayloadType, clockRate));
+        codecs.Add(SdpCodec.Ulpfec(ulpfecPayloadType, clockRate));
     }
 
     private static int? NextDynamicPayloadType(HashSet<int> used, int? preferred)

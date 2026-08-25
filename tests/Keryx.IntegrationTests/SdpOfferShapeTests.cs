@@ -218,6 +218,71 @@ public sealed class SdpOfferShapeTests
         h264.Feedback.Should().HaveCount(feedbackBefore);
     }
 
+    [Fact]
+    public async Task UlpfecCodecsAreAbsentByDefault()
+    {
+        await using var peer = new PeerConnection(TestSupport.NewConfig());
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // The default golden offer must stay byte-identical: red/ulpfec only appear when EnableUlpfec is set.
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97");
+        offer.Should().NotContain("red/90000");
+        offer.Should().NotContain("ulpfec/90000");
+    }
+
+    [Fact]
+    public async Task EnablingUlpfecOffersRedAndUlpfecCodecs()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableUlpfec = true;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // H.264 (96) and rtx (97) keep their slots; red and ulpfec take the next two free dynamic PTs,
+        // after the media and repair entries, exactly as browsers order them.
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99");
+        offer.Should().Contain("a=rtpmap:98 red/90000");
+        offer.Should().Contain("a=rtpmap:99 ulpfec/90000");
+
+        // They parse and survive a round-trip through the SDP model the peer will meet on the far side.
+        var parsed = SessionDescription.Parse(offer);
+        var video = parsed.MediaDescriptions.Single(m => m.Media == "video");
+        video.Formats.Should().Contain(["96", "97", "98", "99"]);
+    }
+
+    [Fact]
+    public async Task UlpfecStillOffersRedAndUlpfecWithRetransmissionOff()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableUlpfec = true;
+        config.EnableRetransmission = false;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        // No rtx entry, so red/ulpfec take the first two free dynamic PTs after H.264.
+        offer.Should().Contain("m=video 9 UDP/TLS/RTP/SAVPF 96 97 98");
+        offer.Should().NotContain("rtx/90000");
+        offer.Should().Contain("a=rtpmap:97 red/90000");
+        offer.Should().Contain("a=rtpmap:98 ulpfec/90000");
+    }
+
+    [Fact]
+    public async Task TheUlpfecPayloadTypesCanBePinned()
+    {
+        var config = TestSupport.NewConfig();
+        config.EnableUlpfec = true;
+        config.RedPayloadType = 112;
+        config.UlpfecPayloadType = 113;
+
+        await using var peer = new PeerConnection(config);
+        var offer = await peer.CreateOfferAsync(TestTimeout());
+
+        offer.Should().Contain("a=rtpmap:112 red/90000");
+        offer.Should().Contain("a=rtpmap:113 ulpfec/90000");
+    }
+
     private static CancellationToken TestTimeout() =>
         new CancellationTokenSource(TimeSpan.FromSeconds(20)).Token;
 }
