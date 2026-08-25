@@ -171,6 +171,23 @@ public class SdpOfferBuilderTests
     }
 
     [Fact]
+    public void Build_BundleGroupExcludesRejectedSections_ReAnchoringTheTag()
+    {
+        // A rejected (port-0) m-section must not appear in the BUNDLE group (RFC 8843 §6, §8.3), and in
+        // particular must never be the tag. Reject the first (audio) section: the group re-anchors onto
+        // the first surviving section (video, mid 1) rather than pointing a peer's transport at the dead
+        // m-line, and the rejected section keeps its aligned m-line slot.
+        var builder = ProxenoOffer();
+        builder.Media[0].Port = 0;
+
+        var sdp = builder.Build();
+
+        sdp.GetBundleGroup().Should().Equal("1", "2");
+        sdp.MediaDescriptions.Should().HaveCount(3, "a rejected section keeps its m-line slot for alignment");
+        sdp.MediaDescriptions[0].Mid.Should().Be("0");
+    }
+
+    [Fact]
     public void Build_BundleDisabledEmitsNoGroup()
     {
         var builder = ProxenoOffer();
