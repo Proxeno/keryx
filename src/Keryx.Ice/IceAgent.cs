@@ -1423,6 +1423,19 @@ public sealed class IceAgent : IDisposable
     /// </summary>
     private void RegisterTcpConnection(Socket socket, IPEndPoint remote, bool dialed)
     {
+        // The passive listener accepts before any ICE check has validated the peer, and connecting
+        // needs no ICE credentials, so cap how many connections may be held at once. Beyond the cap a
+        // freshly accepted (or dialed) connection is dropped rather than tracked, bounding the sockets,
+        // receive tasks and reassembly buffers an off-path flood can pin. The count check races the
+        // TryAdd below under concurrent accepts, but the cap is a coarse ceiling and a small overshoot
+        // is harmless.
+        if (_tcpConnections.Count >= _options.MaxTcpConnections)
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Refusing ICE-TCP connection from {remote}: connection cap ({_options.MaxTcpConnections}) reached.");
+            socket.Dispose();
+            return;
+        }
+
         var connection = new IceTcpConnection(socket, remote, _logger, _cts.Token);
         if (!_tcpConnections.TryAdd(remote, connection))
         {

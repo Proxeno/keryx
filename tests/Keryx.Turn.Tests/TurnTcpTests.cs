@@ -97,6 +97,68 @@ public sealed class TurnTcpTests
     }
 
     [Fact]
+    public void TryMeasure_WithAHugeDeclaredStunLengthAndTooFewBytes_WaitsWithoutThrowingOrOverReading()
+    {
+        // A STUN header claiming the maximum 0xFFFF body, with only the 20-byte header present. The
+        // measurer must report "not yet" - never throw, never read past the buffer, never yield a
+        // frame the bytes for have not arrived - so a peer sending a huge length prefix and then
+        // stalling only ever pins the bytes actually delivered, not a frame's worth of memory it
+        // never sends.
+        Span<byte> header = stackalloc byte[StunMessage.HeaderLength];
+        header.Clear();
+        header[2] = 0xFF;
+        header[3] = 0xFF;
+
+        TurnStreamReassembler.TryMeasure(header, out var consumed, out var yield).Should().BeFalse();
+        consumed.Should().Be(0);
+        yield.Should().Be(0);
+    }
+
+    [Fact]
+    public void TryMeasure_WithAHugeDeclaredChannelDataLengthAndTooFewBytes_Waits()
+    {
+        // ChannelData (0x4001) claiming a 0xFFFF payload, header only. Same invariant: wait, do not
+        // over-read, do not throw.
+        Span<byte> header = stackalloc byte[TurnChannelData.HeaderLength];
+        header.Clear();
+        header[0] = 0x40;
+        header[1] = 0x01;
+        header[2] = 0xFF;
+        header[3] = 0xFF;
+
+        TurnStreamReassembler.TryMeasure(header, out var consumed, out var yield).Should().BeFalse();
+        consumed.Should().Be(0);
+        yield.Should().Be(0);
+    }
+
+    [Fact]
+    public void Reassembler_DrippingAMaximalPartialFrameOneByteAtATime_NeverYieldsUntilComplete()
+    {
+        // A maximal STUN message dripped byte by byte: the reassembler holds the partial frame and
+        // yields exactly once, when the last byte lands - a slow-loris partial-frame stream cannot
+        // make it yield early or spin, and the buffer it holds is bounded by the 16-bit length.
+        var stun = new StunMessage(StunClass.Request, StunMethod.Binding)
+            .Add(new StunUsernameAttribute(new string('u', 500)))
+            .Encode();
+
+        var reassembler = new TurnStreamReassembler();
+        var yields = 0;
+        for (var i = 0; i < stun.Length; i++)
+        {
+            reassembler.Append(stun.AsSpan(i, 1));
+            var completeSoFar = i == stun.Length - 1;
+            reassembler.TryReadMessage(out var message).Should().Be(completeSoFar);
+            if (completeSoFar)
+            {
+                message.ToArray().Should().Equal(stun);
+                yields++;
+            }
+        }
+
+        yields.Should().Be(1);
+    }
+
+    [Fact]
     public async Task Tcp_AllocatesAndRelaysADatagramRoundTripThroughTheConnection()
     {
         using var server = new TestTurnServer(transport: TurnClientTransport.Tcp);
