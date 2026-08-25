@@ -81,7 +81,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
     private SdpFingerprint? _remoteFingerprint;
     private DtlsRole _dtlsRole = DtlsRole.Server;
     private int? _remoteSctpPort;
-    private bool _isOfferer;
+
+    // The JSEP signaling state (RFC 8829 §3.2, session-model.md §4.1), replacing the historical
+    // _isOfferer bool + null checks. Guarded by _lock. The offerer walks Stable -> HaveLocalOffer ->
+    // Stable; the answerer walks Stable -> HaveRemoteOffer -> Stable.
+    private SignalingState _signalingState = SignalingState.Stable;
+
+    // The JSEP [[NegotiationNeeded]] internal slot (session-model.md §4.1). Set true when
+    // OnNegotiationNeeded has been raised for the current pending change set and not yet cleared by a
+    // local description apply; coalesces multiple AddTransceiver calls into a single event.
+    private bool _negotiationNeeded;
+
     private int _closed;
     private PeerConnectionState _state = PeerConnectionState.New;
 
@@ -338,20 +348,25 @@ public sealed partial class PeerConnection : IAsyncDisposable
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
-            if (_localDescription is not null)
+
+            // An offer is only valid from Stable (RFC 8829 §3.2). HaveRemoteOffer means a remote offer is
+            // pending — the caller must answer it; HaveLocalOffer means an offer is already outstanding.
+            switch (_signalingState)
             {
-                throw new InvalidOperationException("This connection has already produced a local description.");
+                case SignalingState.HaveRemoteOffer:
+                    throw new InvalidOperationException(
+                        "A remote offer was applied; call CreateAnswerAsync instead of CreateOfferAsync.");
+                case SignalingState.HaveLocalOffer:
+                    throw new InvalidOperationException("This connection has already produced a local description.");
+                default:
+                    break;
             }
 
-            if (_remoteDescription is not null)
-            {
-                throw new InvalidOperationException(
-                    "A remote offer was applied; call CreateAnswerAsync instead of CreateOfferAsync.");
-            }
-
-            _isOfferer = true;
+            _signalingState = SignalingState.HaveLocalOffer;
             ice = EnsureIceLocked(IceRole.Controlling);
         }
+
+        RaiseSignalingStateChanged(SignalingState.HaveLocalOffer);
 
         await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
 
@@ -361,6 +376,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
         lock (_lock)
         {
             _localDescription = session;
+
+            // The offer now reflects the current transceiver set: clear any pending negotiation-needed
+            // intent so the machine does not re-raise OnNegotiationNeeded for changes already in flight.
+            MarkLocalDescriptionAppliedLocked();
         }
 
         var sdp = session.ToSdpString();
@@ -393,13 +412,22 @@ public sealed partial class PeerConnection : IAsyncDisposable
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
-            offer = _remoteDescription
-                    ?? throw new InvalidOperationException("No remote offer has been applied.");
-            if (_isOfferer)
+
+            // An answer is only valid from HaveRemoteOffer (RFC 8829 §3.2): HaveLocalOffer means this side
+            // is the offerer and must apply the remote answer, Stable means nothing was offered to answer.
+            switch (_signalingState)
             {
-                throw new InvalidOperationException("This connection is the offerer.");
+                case SignalingState.HaveLocalOffer:
+                    throw new InvalidOperationException(
+                        "This connection has a pending local offer; apply the remote answer instead of answering.");
+                case SignalingState.HaveRemoteOffer:
+                    break;
+                default:
+                    throw new InvalidOperationException("No remote offer has been applied.");
             }
 
+            offer = _remoteDescription
+                    ?? throw new InvalidOperationException("No remote offer has been applied.");
             ice = EnsureIceLocked(IceRole.Controlled);
         }
 
@@ -414,11 +442,19 @@ public sealed partial class PeerConnection : IAsyncDisposable
         lock (_lock)
         {
             _localDescription = session;
+
+            // Applying the local answer completes the exchange: back to Stable, and any transceivers this
+            // answer covered are no longer pending negotiation.
+            _signalingState = SignalingState.Stable;
+            MarkLocalDescriptionAppliedLocked();
         }
+
+        RaiseSignalingStateChanged(SignalingState.Stable);
 
         var sdp = session.ToSdpString();
         _logger.Log(KeryxLogLevel.Info, "Created answer; starting the connection driver.");
         StartDriver();
+        UpdateNegotiationNeeded();
         return sdp;
     }
 
@@ -433,21 +469,59 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <param name="cancellationToken">Reserved; applying a description does no I/O.</param>
     /// <returns>A completed task once the description has been applied.</returns>
     /// <exception cref="SdpException">The description could not be parsed, or the answer violates JSEP alignment.</exception>
+    /// <exception cref="InvalidOperationException">The description is not valid in the current signaling state.</exception>
     public Task SetRemoteDescriptionAsync(string sdp, SdpType type, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(sdp);
         cancellationToken.ThrowIfCancellationRequested();
         ObjectDisposedException.ThrowIf(_closed != 0, this);
 
+        // Validate the transition up front (RFC 8829 §3.2) so an out-of-order description is rejected before
+        // any of it is applied. An answer is only valid while a local offer is pending; a remote offer is
+        // only valid from Stable (glare and repeat offers need rollback/renegotiation, which land later).
+        lock (_lock)
+        {
+            if (type == SdpType.Answer)
+            {
+                if (_signalingState != SignalingState.HaveLocalOffer)
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot apply an answer in the {_signalingState} state; an answer is only valid while a local offer is pending.");
+                }
+            }
+            else if (_signalingState != SignalingState.Stable)
+            {
+                throw new InvalidOperationException(
+                    _signalingState == SignalingState.HaveLocalOffer
+                        ? "Cannot apply a remote offer while a local offer is pending (glare); rollback is not supported yet."
+                        : "A remote offer is already pending; repeat offers (renegotiation) are not supported yet.");
+            }
+        }
+
         var description = SessionDescription.Parse(sdp, _logger);
         if (type == SdpType.Answer)
         {
             ApplyAnswer(description);
+
+            lock (_lock)
+            {
+                _signalingState = SignalingState.Stable;
+            }
+
+            RaiseSignalingStateChanged(SignalingState.Stable);
             StartDriver();
+            UpdateNegotiationNeeded();
         }
         else
         {
             ApplyRemoteOffer(description);
+
+            lock (_lock)
+            {
+                _signalingState = SignalingState.HaveRemoteOffer;
+            }
+
+            RaiseSignalingStateChanged(SignalingState.HaveRemoteOffer);
         }
 
         return Task.CompletedTask;
@@ -681,6 +755,19 @@ public sealed partial class PeerConnection : IAsyncDisposable
         }
 
         SetState(PeerConnectionState.Closed);
+
+        bool signalingChanged;
+        lock (_lock)
+        {
+            signalingChanged = _signalingState != SignalingState.Closed;
+            _signalingState = SignalingState.Closed;
+        }
+
+        if (signalingChanged)
+        {
+            RaiseSignalingStateChanged(SignalingState.Closed);
+        }
+
         _cts.Dispose();
     }
 
@@ -1305,7 +1392,6 @@ public sealed partial class PeerConnection : IAsyncDisposable
         IceAgent ice;
         lock (_lock)
         {
-            _isOfferer = false;
             _remoteDescription = offer;
             ice = EnsureIceLocked(IceRole.Controlled);
         }

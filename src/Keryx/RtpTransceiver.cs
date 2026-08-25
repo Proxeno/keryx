@@ -74,6 +74,16 @@ public sealed class RtpTransceiver
     /// the complement-of-offered default (session-model.md §3.2).
     /// </summary>
     internal bool PreserveDirectionOnBind { get; init; }
+
+    /// <summary>
+    /// Whether this transceiver was added by the application and has not yet been folded into a local
+    /// description — the JSEP negotiation-needed signal (session-model.md §4.1). Set when
+    /// <see cref="PeerConnection.AddTransceiver"/> / <see cref="PeerConnection.AddTrack"/> create it,
+    /// cleared when the next offer or answer that covers it is applied. The internally built legacy
+    /// transceivers and offer-bound auto-created ones leave it false: the former are driven through the
+    /// existing single-shot flow, the latter are answered in the same exchange.
+    /// </summary>
+    internal bool NegotiationPending { get; set; }
 }
 
 /// <summary>

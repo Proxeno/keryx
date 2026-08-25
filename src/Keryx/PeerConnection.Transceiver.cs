@@ -110,6 +110,7 @@ public sealed partial class PeerConnection
                 nameof(init));
         }
 
+        RtpTransceiver transceiver;
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
@@ -146,7 +147,7 @@ public sealed partial class PeerConnection
                 kind == MediaKind.Video ? NewSsrc() : 0,
                 NewIdentifier(kind == MediaKind.Video ? "video" : "audio"));
 
-            var transceiver = new RtpTransceiver(kind, direction, sender, new RtpReceiver(), init?.Mid)
+            transceiver = new RtpTransceiver(kind, direction, sender, new RtpReceiver(), init?.Mid)
             {
                 // An application-added transceiver keeps its explicit direction when it binds to a remote
                 // offer's m-line (session-model.md §3.2); only the internally built legacy transceivers and
@@ -154,12 +155,20 @@ public sealed partial class PeerConnection
                 PreserveDirectionOnBind = true,
                 OfferCodecs = init is { Codecs.Count: > 0 } ? [.. init.Codecs] : [],
                 EnableRetransmissionOnOffer = kind == MediaKind.Video && (init?.EnableRetransmission ?? _config.EnableRetransmission),
+
+                // An application-added track needs to be negotiated; this arms the JSEP negotiation-needed
+                // check below. Legacy and auto-created transceivers leave this false (session-model.md §4.1).
+                NegotiationPending = true,
             };
 
             AddTransceiverInternal(transceiver);
             _transceiverApiUsed = true;
-            return transceiver;
         }
+
+        // Raise OnNegotiationNeeded outside the lock: the new track means the current descriptions no
+        // longer reflect the transceiver set (session-model.md §4.1). Coalesced across a burst of adds.
+        UpdateNegotiationNeeded();
+        return transceiver;
     }
 
     /// <summary>

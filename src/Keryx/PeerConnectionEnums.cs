@@ -24,6 +24,28 @@ public enum PeerConnectionState
     Closed,
 }
 
+/// <summary>
+/// The JSEP signaling state of a <see cref="PeerConnection"/> (RFC 8829 §3.2), mirroring
+/// <c>RTCSignalingState</c>. Keryx produces and applies descriptions through
+/// <see cref="PeerConnection.CreateOfferAsync"/> / <see cref="PeerConnection.CreateAnswerAsync"/> /
+/// <see cref="PeerConnection.SetRemoteDescriptionAsync"/>; each moves the machine between these states.
+/// There is deliberately no public <c>SetLocalDescription</c> (session-model.md §4.1).
+/// </summary>
+public enum SignalingState
+{
+    /// <summary>No offer/answer exchange is in progress; the last one (if any) completed.</summary>
+    Stable,
+
+    /// <summary>A local offer has been created and applied, awaiting the remote answer.</summary>
+    HaveLocalOffer,
+
+    /// <summary>A remote offer has been applied, awaiting the local answer.</summary>
+    HaveRemoteOffer,
+
+    /// <summary>The connection has been closed. Terminal.</summary>
+    Closed,
+}
+
 /// <summary>Which half of the JSEP offer/answer exchange a session description is.</summary>
 public enum SdpType
 {
