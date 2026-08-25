@@ -59,6 +59,14 @@ public sealed class SctpAssociation : IDisposable
     private readonly List<Action> _events = new();
     private readonly List<SctpChunk> _controlQueue = new();
     private readonly List<OutgoingChunk> _out = new();
+
+    // TSN -> outstanding chunk index maintained alongside _out. Cumulative-ack, gap-ack and
+    // fast-retransmit processing resolve a chunk by TSN in O(1) instead of scanning _out, so a peer
+    // that grows a large send backlog and then floods overlapping in-window gap-ack blocks cannot
+    // force O(blocks x window x _out) work. Every add/remove/clear of _out routes through
+    // AddOutgoing/RemoveOutgoingWhere/ClearOutgoing so the two never drift; OutgoingChunk.Tsn is
+    // init-only, so an entry's key is stable for its lifetime and TSNs in _out are unique.
+    private readonly Dictionary<uint, OutgoingChunk> _outByTsn = new();
     private readonly Dictionary<ushort, ushort> _sendSequence = new();
     private readonly Dictionary<ushort, ReceiveStream> _receiveStreams = new();
     private readonly Dictionary<uint, SctpDataChunk> _fragments = new();
@@ -920,6 +928,16 @@ public sealed class SctpAssociation : IDisposable
 
     private void HandleShutdown(SctpShutdownChunk shutdown)
     {
+        // SHUTDOWN is only meaningful once the association is up (RFC 4960 §8.5.1). A peer that learned
+        // our verification tag from our INIT could otherwise churn us into a shutdown state before the
+        // handshake completes, so ignore it in Closed/CookieWait/CookieEchoed; honour it in Established
+        // and every shutdown state, where moving to (or re-arming) SHUTDOWN ACK SENT is correct.
+        if (_state is SctpAssociationState.Closed or SctpAssociationState.CookieWait
+            or SctpAssociationState.CookieEchoed)
+        {
+            return;
+        }
+
         AckUpTo(shutdown.CumulativeTsnAck);
         _state = SctpAssociationState.ShutdownAckSent;
         _controlQueue.Add(new SctpShutdownAckChunk());
@@ -1944,6 +1962,17 @@ public sealed class SctpAssociation : IDisposable
 
     private void HandleForwardTsn(SctpForwardTsnChunk forward)
     {
+        // FORWARD TSN is a data-path chunk (RFC 3758): honour it only where DATA can still be received
+        // — Established and the shutdown states that keep draining data. In CookieWait/CookieEchoed a
+        // peer that knows our verification tag (learned from our INIT) could otherwise drive receive
+        // cumulative-TSN state churn before the handshake completes, so drop it there, as in Closed and
+        // ShutdownAckSent where no further data is accepted. Mirrors the data-flowing set used by Flush.
+        if (_state is not (SctpAssociationState.Established or SctpAssociationState.ShutdownPending
+            or SctpAssociationState.ShutdownReceived or SctpAssociationState.ShutdownSent))
+        {
+            return;
+        }
+
         _sackPending = true;
 
         if (Serial.Gt(forward.NewCumulativeTsn, _cumulativeTsnReceived))
@@ -2072,7 +2101,7 @@ public sealed class SctpAssociation : IDisposable
             var share = isLast ? remainingBuffered : Math.Min(remainingBuffered, length);
             remainingBuffered -= share;
 
-            _out.Add(new OutgoingChunk
+            AddOutgoing(new OutgoingChunk
             {
                 Tsn = _nextTsn,
                 StreamId = streamId,
@@ -2494,7 +2523,7 @@ public sealed class SctpAssociation : IDisposable
             GrowCongestionWindow(flightBefore, ackedBytes);
         }
 
-        _out.RemoveAll(c => Serial.Lte(c.Tsn, _peerCumulativeAck));
+        RemoveOutgoingWhere(c => Serial.Lte(c.Tsn, _peerCumulativeAck));
         MaybeSendForwardTsn();
 
         // A stream reset queued while its data was still in flight can proceed now that a SACK has
@@ -2574,17 +2603,37 @@ public sealed class SctpAssociation : IDisposable
         return chunk.WireSize;
     }
 
-    private OutgoingChunk? FindChunk(uint tsn)
-    {
-        foreach (var chunk in _out)
-        {
-            if (chunk.Tsn == tsn)
-            {
-                return chunk;
-            }
-        }
+    private OutgoingChunk? FindChunk(uint tsn) =>
+        _outByTsn.TryGetValue(tsn, out var chunk) ? chunk : null;
 
-        return null;
+    /// <summary>Appends a freshly built outgoing chunk to the retransmission queue and its TSN index.</summary>
+    private void AddOutgoing(OutgoingChunk chunk)
+    {
+        _out.Add(chunk);
+        _outByTsn[chunk.Tsn] = chunk;
+    }
+
+    /// <summary>
+    /// Removes every outgoing chunk matching <paramref name="predicate"/> from the queue and the TSN
+    /// index in a single pass, keeping the two consistent.
+    /// </summary>
+    private void RemoveOutgoingWhere(Predicate<OutgoingChunk> predicate) =>
+        _out.RemoveAll(chunk =>
+        {
+            if (!predicate(chunk))
+            {
+                return false;
+            }
+
+            _outByTsn.Remove(chunk.Tsn);
+            return true;
+        });
+
+    /// <summary>Empties the outgoing queue and its TSN index together.</summary>
+    private void ClearOutgoing()
+    {
+        _out.Clear();
+        _outByTsn.Clear();
     }
 
     private void ReleaseBuffered(OutgoingChunk chunk)
@@ -2699,7 +2748,7 @@ public sealed class SctpAssociation : IDisposable
         }
 
         _controlQueue.Add(forward);
-        _out.RemoveAll(c => Serial.Lte(c.Tsn, _advancedPeerAckPoint));
+        RemoveOutgoingWhere(c => Serial.Lte(c.Tsn, _advancedPeerAckPoint));
     }
 
     /// <summary>
@@ -3019,7 +3068,7 @@ public sealed class SctpAssociation : IDisposable
         _pendingInit = null;
         _pendingCookieEcho = null;
         _controlQueue.Clear();
-        _out.Clear();
+        ClearOutgoing();
 
         // Release any out-of-order receive buffering so a teardown (including an abort
         // triggered by that buffer overflowing) does not leave the memory pinned.
