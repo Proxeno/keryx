@@ -65,9 +65,13 @@ public sealed class IceAgentOptions
     public IList<IPEndPoint> StunServers { get; } = [];
 
     /// <summary>
-    /// TURN servers to allocate a relayed candidate on. Each entry is allocated over the agent's
-    /// own socket, so the relayed candidate's base is that socket and RFC 8445 section 5.1.1.2's
-    /// <c>raddr</c>/<c>rport</c> come out right. Failures are logged and skipped.
+    /// TURN servers to allocate a relayed candidate on. A default (UDP) entry is allocated over the
+    /// agent's own socket, so the relayed candidate's base is that socket and RFC 8445 section
+    /// 5.1.1.2's <c>raddr</c>/<c>rport</c> come out right. An entry whose
+    /// <see cref="TurnServerOptions.ClientTransport"/> is <see cref="TurnClientTransport.Tcp"/> or
+    /// <see cref="TurnClientTransport.Tls"/> instead allocates over a dedicated connection to the
+    /// server (RFC 5766 section 2.1), for networks that block UDP; the relayed candidate it produces
+    /// is still a UDP address and pairs like any other. Failures are logged and skipped.
     /// </summary>
     public IList<TurnServerOptions> TurnServers { get; } = [];
 

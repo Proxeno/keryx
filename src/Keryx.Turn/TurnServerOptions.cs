@@ -10,9 +10,10 @@ namespace Keryx.Turn;
 /// </summary>
 /// <remarks>
 /// This is the shape a WebRTC <c>RTCIceServer</c> entry carries: a <c>turn:</c> host and port, a
-/// username, a credential and a transport. Only <see cref="TurnTransportProtocol.Udp"/> is
-/// implemented; TURN over TCP (RFC 6062) and TURN over (D)TLS are rejected at validation rather
-/// than silently downgraded.
+/// username and a credential. The client-to-server leg is UDP by default; set
+/// <see cref="ClientTransport"/> to <see cref="TurnClientTransport.Tcp"/> or
+/// <see cref="TurnClientTransport.Tls"/> to reach the server over a TCP (or TLS-over-TCP)
+/// connection for networks that block UDP (RFC 5766 section 2.1).
 /// </remarks>
 public sealed class TurnServerOptions
 {
@@ -71,10 +72,30 @@ public sealed class TurnServerOptions
     public string Credential { get; set; } = string.Empty;
 
     /// <summary>
-    /// The transport between client and server. Only <see cref="TurnTransportProtocol.Udp"/> is
-    /// implemented.
+    /// The protocol the server relays over to the far peer, carried as REQUESTED-TRANSPORT
+    /// (RFC 8656 section 18.8). Keryx always relays over <see cref="TurnTransportProtocol.Udp"/> -
+    /// the only value validation accepts - so this is independent of <see cref="ClientTransport"/>,
+    /// which chooses how the client reaches the server.
     /// </summary>
     public TurnTransportProtocol Transport { get; set; } = TurnTransportProtocol.Udp;
+
+    /// <summary>
+    /// The transport for the client-to-server leg (RFC 5766 section 2.1). Defaults to
+    /// <see cref="TurnClientTransport.Udp"/>, which allocates over the ICE agent's own socket;
+    /// <see cref="TurnClientTransport.Tcp"/> and <see cref="TurnClientTransport.Tls"/> reach the
+    /// server over a dedicated TCP (or TLS-over-TCP) connection for networks that block UDP.
+    /// Whichever is used, the relayed candidate the server hands back is still a UDP address, so
+    /// its ICE pairing is unchanged.
+    /// </summary>
+    public TurnClientTransport ClientTransport { get; set; } = TurnClientTransport.Udp;
+
+    /// <summary>
+    /// The host name to validate the server's certificate against and send as TLS SNI when
+    /// <see cref="ClientTransport"/> is <see cref="TurnClientTransport.Tls"/>. Defaults to
+    /// <see cref="Host"/>, falling back to the endpoint's IP literal; set it when the allocation is
+    /// made against an <see cref="EndPoint"/> whose certificate names a different host.
+    /// </summary>
+    public string? TlsServerName { get; set; }
 
     /// <summary>
     /// Resolves the server's transport address, performing a DNS lookup when only
@@ -141,6 +162,11 @@ public sealed class TurnServerOptions
                 $"Keryx allocates over UDP only; TURN transport {Transport} is not implemented.");
         }
 
+        if (ClientTransport is not (TurnClientTransport.Udp or TurnClientTransport.Tcp or TurnClientTransport.Tls))
+        {
+            throw new InvalidOperationException($"Unknown TURN client transport {ClientTransport}.");
+        }
+
         if (string.IsNullOrEmpty(Username) || string.IsNullOrEmpty(Credential))
         {
             throw new InvalidOperationException(
@@ -150,5 +176,5 @@ public sealed class TurnServerOptions
 
     /// <summary>A description that never reveals the credential.</summary>
     public override string ToString()
-        => $"turn:{EndPoint?.ToString() ?? $"{Host}:{Port}"}?transport={Transport.ToString().ToLowerInvariant()} (user {Username})";
+        => $"turn:{EndPoint?.ToString() ?? $"{Host}:{Port}"}?transport={ClientTransport.ToString().ToLowerInvariant()} (user {Username})";
 }

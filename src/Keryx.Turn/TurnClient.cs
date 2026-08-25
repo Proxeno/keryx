@@ -69,6 +69,7 @@ public sealed class TurnClient : IDisposable
     private readonly Dictionary<IPEndPoint, TurnChannel> _channels = [];
     private readonly Dictionary<ushort, IPEndPoint> _channelPeers = [];
     private readonly CancellationTokenSource _cts = new();
+    private readonly TurnStreamConnection? _ownedConnection;
 
     private string? _realm;
     private string? _nonce;
@@ -95,6 +96,17 @@ public sealed class TurnClient : IDisposable
         string credential,
         StunDatagramSender sender,
         TurnClientOptions? options = null)
+        : this(server, username, credential, sender, options, ownedConnection: null)
+    {
+    }
+
+    private TurnClient(
+        IPEndPoint server,
+        string username,
+        string credential,
+        StunDatagramSender sender,
+        TurnClientOptions? options,
+        TurnStreamConnection? ownedConnection)
     {
         ArgumentNullException.ThrowIfNull(server);
         ArgumentException.ThrowIfNullOrEmpty(username);
@@ -107,7 +119,66 @@ public sealed class TurnClient : IDisposable
         _options = (options ?? new TurnClientOptions()).Validate();
         _logger = _options.Logger ?? NullLogger.Instance;
         _sender = sender;
+        _ownedConnection = ownedConnection;
         _stun = new StunClient(sender, _options.StunClientOptions, _logger);
+    }
+
+    /// <summary>
+    /// Connects to a TURN server over TCP or TLS (RFC 5766 section 2.1) and returns a client that
+    /// owns and drives that connection: it frames outbound STUN/ChannelData writes and reassembles
+    /// inbound messages from the byte stream, so Allocate, Refresh, CreatePermission, ChannelBind
+    /// and the relayed data path all run over the connection. Unlike the UDP constructor - where an
+    /// ICE agent owns the socket and feeds datagrams in through <see cref="TryHandleDatagram"/> -
+    /// this client owns the connection and disposes it with itself.
+    /// </summary>
+    /// <param name="server">The server's resolved transport address.</param>
+    /// <param name="username">The long-term credential username.</param>
+    /// <param name="credential">The long-term credential password.</param>
+    /// <param name="transport">
+    /// <see cref="TurnClientTransport.Tcp"/> or <see cref="TurnClientTransport.Tls"/>; UDP is
+    /// rejected because it has no connection to establish - use the constructor for that.
+    /// </param>
+    /// <param name="options">Lifetime, refresh and TLS validation settings; defaults if null.</param>
+    /// <param name="tlsServerName">
+    /// The host name to validate the TLS certificate against and send as SNI; defaults to the
+    /// server address. Ignored for <see cref="TurnClientTransport.Tcp"/>.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the connect and, for TLS, the handshake.</param>
+    public static async Task<TurnClient> ConnectAsync(
+        IPEndPoint server,
+        string username,
+        string credential,
+        TurnClientTransport transport,
+        TurnClientOptions? options = null,
+        string? tlsServerName = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(server);
+        ArgumentException.ThrowIfNullOrEmpty(username);
+        ArgumentException.ThrowIfNullOrEmpty(credential);
+        if (transport is not (TurnClientTransport.Tcp or TurnClientTransport.Tls))
+        {
+            throw new ArgumentException(
+                "ConnectAsync establishes a TCP or TLS connection; for UDP construct a TurnClient with a StunDatagramSender.",
+                nameof(transport));
+        }
+
+        var resolved = (options ?? new TurnClientOptions()).Validate();
+        var logger = resolved.Logger ?? NullLogger.Instance;
+        var connection = new TurnStreamConnection(
+            server, transport, tlsServerName, resolved.TlsCertificateValidationCallback, logger);
+        try
+        {
+            await connection.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            var client = new TurnClient(server, username, credential, connection.Send, resolved, connection);
+            connection.StartReceiving(message => client.TryHandleDatagram(message, server));
+            return client;
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Raised for every datagram the server relays in, whether as ChannelData or a Data indication.</summary>
@@ -396,8 +467,10 @@ public sealed class TurnClient : IDisposable
             _sender(request.Encode(key, appendFingerprint: true, useMessageIntegritySha256: algorithm is not null), _server);
             _logger.Log(KeryxLogLevel.Debug, $"TURN allocation on {_server} released (fire and forget).");
         }
-        catch (SocketException ex)
+        catch (Exception ex) when (ex is SocketException or IOException)
         {
+            // The datagram socket or the TCP/TLS stream could not carry the release; the server
+            // will expire the allocation on its own schedule.
             _logger.Log(KeryxLogLevel.Debug, $"Could not send the TURN release to {_server}.", ex);
         }
         catch (ObjectDisposedException)
@@ -697,6 +770,10 @@ public sealed class TurnClient : IDisposable
         {
             // The maintenance loop only ever faults because the client was disposed.
         }
+
+        // A TCP/TLS client owns its connection; the read loop and socket go with it. A UDP client
+        // owns no connection (the ICE agent owns the socket), so this is null there.
+        _ownedConnection?.Dispose();
 
         _cts.Dispose();
         _transactionGate.Dispose();

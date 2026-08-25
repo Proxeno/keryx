@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using Keryx.Core;
@@ -902,12 +903,28 @@ public sealed class IceAgent : IDisposable
             try
             {
                 var endPoint = await server.ResolveAsync(linked.Token).ConfigureAwait(false);
-                var client = new TurnClient(endPoint, server.Username, server.Credential, SendRaw, TurnOptions());
 
-                // Registered before the Allocate goes out, not after: the response comes back on
-                // this same socket, and the receive loop can only route it to the right allocation
-                // if the allocation is already in the list. The candidate is filled in once the
-                // server has told us what the relayed address is.
+                // UDP allocates over the agent's own socket, so the client sends through SendRaw and
+                // is fed inbound datagrams by the receive loop (TryHandleTurn). TCP and TLS
+                // (RFC 5766 section 2.1) instead own a dedicated connection to the server: ConnectAsync
+                // opens it and the client drives its own framing and reassembly, so the relayed data
+                // path never touches the UDP socket - only the relayed candidate it produces does.
+                var client = server.ClientTransport == TurnClientTransport.Udp
+                    ? new TurnClient(endPoint, server.Username, server.Credential, SendRaw, TurnOptions())
+                    : await TurnClient.ConnectAsync(
+                        endPoint,
+                        server.Username,
+                        server.Credential,
+                        server.ClientTransport,
+                        TurnOptions(),
+                        server.TlsServerName ?? server.Host,
+                        linked.Token).ConfigureAwait(false);
+
+                // Registered before the Allocate goes out, not after: for a UDP allocation the
+                // response comes back on the shared socket, and the receive loop can only route it to
+                // the right allocation if the allocation is already in the list. (A TCP/TLS client
+                // routes its own responses through its connection, but the ordering is kept uniform.)
+                // The candidate is filled in once the server has told us what the relayed address is.
                 allocation = new RelayAllocation(client, endPoint);
                 client.OnRelayedData += allocation.Handle;
                 allocation.Received += HandleRelayedDatagram;
@@ -951,8 +968,13 @@ public sealed class IceAgent : IDisposable
                 }
 
                 // RFC 8445 section 5.1.1.2 again: an Allocate response also reveals a
-                // server-reflexive candidate, for free, on the same socket.
-                if (reflexive is not null && reflexive.AddressFamily == relayed.AddressFamily)
+                // server-reflexive candidate, for free, on the same socket - but only for a UDP
+                // allocation. Over TCP/TLS the XOR-MAPPED-ADDRESS is the reflexive of the TURN
+                // control connection, a TCP address on a different port that is no use as a UDP srflx
+                // candidate, so it is not harvested.
+                if (server.ClientTransport == TurnClientTransport.Udp
+                    && reflexive is not null
+                    && reflexive.AddressFamily == relayed.AddressFamily)
                 {
                     AddLocalCandidate(new IceCandidate(
                         Foundation(IceCandidateType.ServerReflexive, baseCandidate.Address, endPoint),
@@ -972,7 +994,7 @@ public sealed class IceAgent : IDisposable
                 AddLocalCandidate(relayCandidate);
                 PermitKnownRemotesOn(allocation);
             }
-            catch (Exception ex) when (ex is StunTimeoutException or StunErrorResponseException or StunFormatException or SocketException or InvalidOperationException or OperationCanceledException)
+            catch (Exception ex) when (ex is StunTimeoutException or StunErrorResponseException or StunFormatException or SocketException or IOException or AuthenticationException or InvalidOperationException or OperationCanceledException)
             {
                 _logger.Log(KeryxLogLevel.Warning, $"TURN server {server} produced no relayed candidate.", ex);
                 if (allocation is not null)

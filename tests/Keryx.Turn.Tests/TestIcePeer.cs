@@ -91,6 +91,14 @@ internal sealed class TestIcePeer : IDisposable
         }
     }
 
+    /// <summary>Sends a datagram from the peer's socket to <paramref name="destination"/>.</summary>
+    /// <remarks>
+    /// Used to push inbound media at a relayed address so a test can watch it come back out of the
+    /// allocation - the mirror of the checks the peer answers.
+    /// </remarks>
+    public void SendMediaTo(ReadOnlySpan<byte> datagram, IPEndPoint destination)
+        => _socket.SendTo(datagram, SocketFlags.None, destination);
+
     public void Dispose()
     {
         _cts.Cancel();
