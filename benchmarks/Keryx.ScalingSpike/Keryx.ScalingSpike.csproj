@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Server GC to reflect a many-core fan-out server, matching Keryx.ScaleHarness. This is a
+         console app, so `dotnet test` never runs it; it stays out of the normal test suite. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <IsPackable>false</IsPackable>
+    <!-- Arm C P/Invokes Linux sendmmsg(2). AllowUnsafeBlocks lets the batch marshalling build the
+         mmsghdr/iovec/sockaddr arrays in unmanaged memory. The declarations compile everywhere;
+         they are only invoked when RuntimeInformation.IsOSPlatform(Linux). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Keryx.Srtp/Keryx.Srtp.csproj" />
+  </ItemGroup>
+</Project>
