@@ -386,6 +386,110 @@ public class AdversarialHandshakeTests
     }
 
     /// <summary>
+    /// The escalated finding: the epoch-0 "discard, don't escalate" guard covered only the fragment
+    /// framing layer, so a fully reassembled but malformed message <em>body</em> still propagated to
+    /// <c>FailLocked</c> and ended the handshake with a fatal <c>decode_error</c> alert. Here a server
+    /// parked mid-handshake receives one epoch-0 Certificate whose <c>certificate_list</c> length
+    /// (0xFFFFFF) overruns its 8-byte body, injected at the exact <c>message_seq</c> the server is
+    /// waiting on. The malformed body must be discarded without killing the transport or consuming that
+    /// <c>message_seq</c>, so the client's genuine Certificate reusing that seq still completes.
+    /// </summary>
+    [Fact]
+    public async Task A_malformed_epoch_zero_certificate_body_is_discarded_without_aborting()
+    {
+        using var serverCertificate = DtlsCertificate.GenerateSelfSigned("server");
+        using var clientCertificate = DtlsCertificate.GenerateSelfSigned("client");
+        var (serverLower, clientLower) = LoopbackDatagramTransport.CreatePair();
+
+        var injected = false;
+
+        // The client's second flight begins with its Certificate. The moment it appears on the wire,
+        // read its message_seq and slip a malformed Certificate carrying that same seq in front of it,
+        // so the server processes the malformed body while it is still the message it is waiting for.
+        clientLower.TransformOutbound = (datagram, _) =>
+        {
+            if (!injected
+                && datagram.Length > DtlsLimits.RecordHeaderLength + DtlsLimits.HandshakeHeaderLength
+                && datagram[0] == (byte)ContentType.Handshake
+                && datagram[DtlsLimits.RecordHeaderLength] == (byte)HandshakeType.Certificate)
+            {
+                injected = true;
+                var seq = (ushort)((datagram[DtlsLimits.RecordHeaderLength + 4] << 8)
+                                   | datagram[DtlsLimits.RecordHeaderLength + 5]);
+
+                // Queued to the server ahead of the genuine flight this call is about to return, so the
+                // malformed body is dispatched while message_seq `seq` is still the expected one.
+                clientLower.Send(MalformedEpochZeroCertificateRecord(seq));
+            }
+
+            return datagram;
+        };
+
+        using var server = new DtlsTransport(serverLower, new DtlsConfig
+        {
+            Role = DtlsRole.Server,
+            Certificate = serverCertificate,
+            ExpectedRemoteFingerprintSha256 = clientCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        using var client = new DtlsTransport(clientLower, new DtlsConfig
+        {
+            Role = DtlsRole.Client,
+            Certificate = clientCertificate,
+            ExpectedRemoteFingerprintSha256 = serverCertificate.Sha256Fingerprint,
+            HandshakeTimeout = TimeSpan.FromSeconds(8),
+            Logger = NullLogger.Instance,
+        });
+
+        var serverTask = server.HandshakeAsync();
+        var clientTask = client.HandshakeAsync();
+
+        await Task.WhenAll(serverTask, clientTask).WaitAsync(Patience);
+
+        injected.Should().BeTrue("the malformed Certificate must have been injected on the wire");
+        server.State.Should().Be(DtlsTransportState.Connected);
+        client.State.Should().Be(DtlsTransportState.Connected);
+
+        clientLower.Dispose();
+        serverLower.Dispose();
+    }
+
+    /// <summary>
+    /// One complete epoch-0 Certificate record at <paramref name="messageSeq"/> whose 8-byte body
+    /// declares a <c>certificate_list</c> of 0xFFFFFF bytes — a U24 length that overruns the record.
+    /// The fragment framing is valid, so it reassembles into a whole message; only the body fails to
+    /// decode, which at epoch 0 must be discarded rather than escalated to a fatal alert.
+    /// </summary>
+    private static byte[] MalformedEpochZeroCertificateRecord(ushort messageSeq)
+    {
+        const int BodyLength = 8;
+        var record = new byte[DtlsLimits.RecordHeaderLength + DtlsLimits.HandshakeHeaderLength + BodyLength];
+        var writer = new ByteWriter(record);
+
+        // Record header: handshake / DTLS 1.2 / epoch 0 / an arbitrary sequence_number.
+        writer.WriteU8((byte)ContentType.Handshake);
+        writer.WriteU16(ProtocolVersions.Dtls12);
+        writer.WriteU16(0);
+        writer.WriteU48(0x424242);
+        writer.WriteU16((ushort)(DtlsLimits.HandshakeHeaderLength + BodyLength));
+
+        // Handshake fragment header: a complete (unfragmented) Certificate of BodyLength bytes.
+        writer.WriteU8((byte)HandshakeType.Certificate);
+        writer.WriteU24(BodyLength);
+        writer.WriteU16(messageSeq);
+        writer.WriteU24(0);
+        writer.WriteU24(BodyLength);
+
+        // Body: certificate_list length = 0xFFFFFF, overrunning the five bytes that follow it.
+        writer.WriteU24(0xFFFFFF);
+        writer.WriteBytes(new byte[BodyLength - 3]);
+
+        return record;
+    }
+
+    /// <summary>
     /// A blank expected fingerprint must not be silently treated as "no pinning". It used to be:
     /// the certificate check short-circuited on <c>IsNullOrWhiteSpace</c> while the two
     /// certificate-required checks tested only for null, so the transport demanded a peer
