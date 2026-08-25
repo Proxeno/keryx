@@ -83,6 +83,16 @@ internal sealed class HandshakeReassembler
     }
 
     /// <summary>
+    /// Drops a fully reassembled message <b>without</b> advancing <see cref="NextReceiveSeq"/>. Used
+    /// when an unauthenticated epoch-0 message body failed to decode: it must be discarded rather than
+    /// escalated (RFC 6347 §4.1.2.7), but its <c>message_seq</c> has to stay the expected one so the
+    /// peer's genuine retransmission of the correct message is still accepted rather than being taken
+    /// for a stale duplicate. Removing the buffered partial also lets the retransmission rebuild the
+    /// message from scratch, even if its length differs from the malformed one.
+    /// </summary>
+    public void Discard(ushort messageSeq) => _pending.Remove(messageSeq);
+
+    /// <summary>
     /// Parses every handshake fragment inside one record body and files them for reassembly.
     /// Returns true when at least one fragment carried data for a message at or after
     /// <see cref="NextReceiveSeq"/>; false means the record was entirely a retransmission of

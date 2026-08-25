@@ -671,14 +671,63 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
 
         while (_reassembler.TryTakeNext(out var message))
         {
-            _reassembler.Consume(message.MessageSeq);
-            HandleHandshakeMessageLocked(message);
+            if (_readEpoch == 0)
+            {
+                // The record carried no authentication behind it. RFC 6347 §4.1.2.7 requires an
+                // invalid one to be discarded, not escalated — and the guard above already does that
+                // for a malformed fragment *header*. A fully reassembled message whose *body* fails to
+                // decode (e.g. a Certificate whose certificate_list length overruns the record) must be
+                // treated the same way: anyone able to put a datagram on the wire could otherwise end a
+                // handshake in progress with one crafted body. The discard must NOT consume the
+                // message_seq or keep any transcript bytes the dispatch appended for it, so the peer's
+                // genuine retransmission of that same message_seq is still accepted and completes.
+                //
+                // A body that decodes cleanly but breaks the protocol (a DTLS 1.0 ClientHello, an
+                // unexpected or duplicate message, a signature that does not verify, ...) is not a
+                // decode failure and stays fatal exactly as before — that is the security check the
+                // handshake relies on, and it is preserved by only catching decode failures here.
+                var transcriptLength = _transcript.Length;
+                try
+                {
+                    HandleHandshakeMessageLocked(message);
+                }
+                catch (Exception ex) when (IsDiscardableEpochZeroDecodeFailure(ex))
+                {
+                    _transcript.SetLength(transcriptLength);
+                    _reassembler.Discard(message.MessageSeq);
+                    _log.Log(
+                        KeryxLogLevel.Warning,
+                        $"Discarding a malformed unauthenticated epoch-0 {message.Type} body (seq {message.MessageSeq}); awaiting a retransmission.");
+                    return;
+                }
+
+                _reassembler.Consume(message.MessageSeq);
+            }
+            else
+            {
+                _reassembler.Consume(message.MessageSeq);
+                HandleHandshakeMessageLocked(message);
+            }
+
             if (_state is DtlsTransportState.Failed or DtlsTransportState.Closed)
             {
                 return;
             }
         }
     }
+
+    /// <summary>
+    /// Distinguishes a message body that could not be decoded — malformed, unauthenticated garbage to
+    /// be discarded at epoch 0 — from a body that decoded but is illegal for the protocol, which stays
+    /// fatal. A <see cref="ByteBufferException"/> is a raw buffer over/underrun while parsing; a
+    /// <see cref="DtlsException"/> carrying <see cref="DtlsAlertDescription.DecodeError"/> is a
+    /// structural malformation the codec rejected. Every other alert (protocol_version,
+    /// unexpected_message, illegal_parameter, decrypt_error, ...) describes a well-formed but
+    /// protocol-illegal message and must not be swallowed.
+    /// </summary>
+    private static bool IsDiscardableEpochZeroDecodeFailure(Exception exception) =>
+        exception is ByteBufferException
+        || exception is DtlsException { Alert: DtlsAlertDescription.DecodeError };
 
     private void HandleHandshakeMessageLocked(HandshakeMessage message)
     {
@@ -812,8 +861,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
-        _sawServerHello = true;
         var hello = HandshakeCodec.ParseServerHello(body);
+        _sawServerHello = true;
         if (hello.Version != ProtocolVersions.Dtls12)
         {
             throw new DtlsException(
@@ -864,8 +913,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
-        _sawServerKeyExchange = true;
         var ske = HandshakeCodec.ParseServerKeyExchange(body);
+        _sawServerKeyExchange = true;
         if (!NamedGroups.IsSupported(ske.NamedCurve) || !LocalNamedGroups().Contains(ske.NamedCurve))
         {
             throw new DtlsException(
@@ -906,8 +955,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
-        _sawCertificateRequest = true;
         var request = HandshakeCodec.ParseCertificateRequest(body);
+        _sawCertificateRequest = true;
         _certificateRequested = true;
         _localSignatureAlgorithm = ChooseLocalSignatureAlgorithm(request.SignatureAlgorithms);
     }
@@ -1091,8 +1140,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             throw new DtlsException("A second ClientKeyExchange arrived.", DtlsAlertDescription.UnexpectedMessage);
         }
 
-        _sawClientKeyExchange = true;
         var point = HandshakeCodec.ParseClientKeyExchange(body);
+        _sawClientKeyExchange = true;
         var preMasterSecret = Ecdhe.DerivePreMasterSecret(_ecdh, point, _negotiatedGroup);
         DeriveKeysLocked(preMasterSecret);
     }
@@ -1114,8 +1163,8 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
                 DtlsAlertDescription.UnexpectedMessage);
         }
 
-        _sawPeerCertificate = true;
         var chain = HandshakeCodec.ParseCertificate(body);
+        _sawPeerCertificate = true;
         if (chain.Count == 0)
         {
             if (_role == DtlsRole.Server && (_config.RequirePeerCertificate || _config.ExpectedRemoteFingerprintSha256 is not null))
@@ -1172,14 +1221,13 @@ public sealed class DtlsTransport : IDatagramTransport, IDisposable
             throw new DtlsException("A second CertificateVerify arrived.", DtlsAlertDescription.UnexpectedMessage);
         }
 
-        _sawCertificateVerify = true;
-
         var certificate = _peerCertificate
                           ?? throw new DtlsException(
                               "CertificateVerify arrived without a peer certificate.",
                               DtlsAlertDescription.UnexpectedMessage);
 
         var (algorithm, signature) = HandshakeCodec.ParseCertificateVerify(body);
+        _sawCertificateVerify = true;
         if (!Ecdhe.Verify(certificate, algorithm, rawTranscript, signature))
         {
             throw new DtlsException(
