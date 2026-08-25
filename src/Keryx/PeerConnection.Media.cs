@@ -1181,14 +1181,73 @@ public sealed partial class PeerConnection
 
     private void HandleRtp(SrtpContext srtp, ReadOnlySpan<byte> datagram)
     {
-        if (datagram.Length > _rxPlain.Length
-            || !srtp.Inbound.TryUnprotectRtp(datagram, _rxPlain, out var length))
+        if (datagram.Length > _rxPlain.Length)
+        {
+            Interlocked.Increment(ref _srtpFailures);
+            return;
+        }
+
+        // Shared-key public-broadcast receive path (spec §5.3): media on an installed broadcast SSRC is
+        // unprotected under the shared key, not this connection's DTLS-derived keys. The SSRC is in the
+        // clear in the RTP header (only the payload is encrypted), so it is read straight off the wire.
+        // Scoping is by SSRC: any SSRC that is not a broadcast SSRC — including any private m-line — falls
+        // through to the DTLS keys, so the shared key can never touch private media.
+        var broadcast = _broadcastReceive;
+        if (broadcast is not null && datagram.Length >= 12)
+        {
+            var ssrc = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(datagram[8..12]);
+            switch (broadcast.TryUnprotectRtp(ssrc, datagram, _rxPlain, out var broadcastLength))
+            {
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.Unprotected:
+                    ProcessDecryptedRtp(_rxPlain.AsSpan(0, broadcastLength));
+                    return;
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.Failed:
+                    // A broadcast SSRC that no installed epoch authenticated: drop it. It must not fall
+                    // through to the DTLS keys — a broadcast stream is never on this connection's own keys.
+                    Interlocked.Increment(ref _srtpFailures);
+                    return;
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.NotBroadcast:
+                default:
+                    break;
+            }
+        }
+
+        if (!srtp.Inbound.TryUnprotectRtp(datagram, _rxPlain, out var length))
         {
             Interlocked.Increment(ref _srtpFailures);
             return;
         }
 
         ProcessDecryptedRtp(_rxPlain.AsSpan(0, length));
+    }
+
+    /// <summary>
+    /// Installs (or rotates to) a shared <b>public-broadcast</b> receive key at runtime (spec §5.1) — the
+    /// live counterpart of <see cref="PeerConnectionConfig.InstallPublicBroadcastReceiveKey"/>, called
+    /// when a viewer receives a rotated key over its data channel. The connection holds the previous
+    /// epoch alongside the new one so media decrypts across the switch. The key applies only to the named
+    /// broadcast SSRC(s); every other SSRC keeps this connection's DTLS-derived keys.
+    /// </summary>
+    /// <param name="export">The shared key exported from the broadcast's <see cref="Broadcast.PublicBroadcastKey"/>.</param>
+    /// <param name="broadcastSsrcs">The broadcast SSRC(s) the key decrypts. Must be non-empty.</param>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="broadcastSsrcs"/> is empty.</exception>
+    /// <exception cref="InvalidOperationException">No broadcast receive key was installed on the config, so
+    /// there is nothing to rotate; install the first epoch through the config.</exception>
+    public void InstallPublicBroadcastReceiveKey(Broadcast.PublicBroadcastKeyExport export, params uint[] broadcastSsrcs)
+    {
+        ArgumentNullException.ThrowIfNull(export);
+        ArgumentNullException.ThrowIfNull(broadcastSsrcs);
+        if (broadcastSsrcs.Length == 0)
+        {
+            throw new ArgumentException("A public-broadcast receive key must be scoped to at least one SSRC.", nameof(broadcastSsrcs));
+        }
+
+        var broadcast = _broadcastReceive
+            ?? throw new InvalidOperationException(
+                "No public-broadcast receive key is installed on this connection; install the first epoch "
+                + "through PeerConnectionConfig.InstallPublicBroadcastReceiveKey before rotating.");
+        broadcast.Install(export, [.. broadcastSsrcs]);
     }
 
     /// <summary>
@@ -1907,8 +1966,7 @@ public sealed partial class PeerConnection
 
     private void HandleRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram)
     {
-        if (datagram.Length > _rxPlain.Length
-            || !srtp.Inbound.TryUnprotectRtcp(datagram, _rxPlain, out var length))
+        if (datagram.Length > _rxPlain.Length || !TryUnprotectRtcp(srtp, datagram, out var length))
         {
             Interlocked.Increment(ref _srtpFailures);
             return;
@@ -1917,6 +1975,38 @@ public sealed partial class PeerConnection
         Interlocked.Increment(ref _rtcpReceived);
         var now = DateTimeOffset.UtcNow;
         var reader = new RtcpCompoundReader(_rxPlain.AsSpan(0, length));
+        DrainRtcpCompound(ref reader, now);
+    }
+
+    // Unprotects one inbound RTCP datagram into _rxPlain, choosing keys by SSRC scope. Returns false when
+    // no context authenticated it (a broadcast-SSRC packet that fails is dropped, never retried on DTLS).
+    private bool TryUnprotectRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram, out int length)
+    {
+        // Shared-key public-broadcast SRTCP (spec §5.5): the shared stream's sender reports ride the
+        // broadcast key, not this connection's DTLS keys. The SRTCP sender SSRC (bytes 4-7) is in the
+        // clear (RFC 3711 §3.4 encrypts only past the 8-octet header), so it routes the same way inbound
+        // RTP does — by SSRC scope. Anything not on a broadcast SSRC (all viewer→SFU RTCP) uses DTLS keys.
+        var broadcast = _broadcastReceive;
+        if (broadcast is not null && datagram.Length >= 8)
+        {
+            var ssrc = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(datagram[4..8]);
+            switch (broadcast.TryUnprotectRtcp(ssrc, datagram, _rxPlain, out length))
+            {
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.Unprotected:
+                    return true;
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.Failed:
+                    return false;
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.NotBroadcast:
+                default:
+                    break;
+            }
+        }
+
+        return srtp.Inbound.TryUnprotectRtcp(datagram, _rxPlain, out length);
+    }
+
+    private void DrainRtcpCompound(ref RtcpCompoundReader reader, DateTimeOffset now)
+    {
         while (reader.MoveNext())
         {
             if (RtcpPacket.TryParse(reader.Current.Packet, out var parsed) && parsed is not null)

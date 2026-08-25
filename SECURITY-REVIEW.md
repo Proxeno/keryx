@@ -135,6 +135,53 @@ against the previous code:
 - Anything the BCL primitives get wrong: their correctness and side-channel resistance are assumed.
 - Compromise of the local private key or the peer's, session resumption/renegotiation attacks (neither is implemented), and DTLS 1.0/1.3.
 
+## Shared-key encrypt-once public-broadcast mode (`broadcast-scale.md` §5)
+
+This mode (`Keryx.Broadcast.SharedKeyBroadcastTier`, `PublicBroadcastKey`) deliberately **replaces the
+per-viewer pairwise SRTP guarantee with a group guarantee** so a public broadcast can be encrypted once
+and fanned out to N viewers as byte-identical ciphertext. It is opt-in, off by default everywhere, and
+gated on owner sign-off of this section. It is **for public content only** and is not interoperable with
+stock browsers (it requires a client whose SRTP layer accepts an injected key — a Keryx client or relay).
+
+**What changes.** Every enrolled viewer receives the *same* SRTP master key. Because SRTP AEAD is
+symmetric, a keyholder can both decrypt and **forge** valid broadcast packets. Confidentiality within the
+viewer set is therefore nil by design (any viewer may read the stream — the product, not a leak; the
+trust model of a public HLS/DASH CDN), and per-viewer media *authentication* degrades from "from the SFU"
+to "from someone holding the broadcast key".
+
+**Defends against / preserves:**
+- The **ingest leg** (broadcaster→SFU) keeps its own DTLS-SRTP keys; the SFU decrypt/re-encrypt boundary
+  is intact. A viewer's key gives nothing upstream.
+- **Isolation from private media.** The key is minted from a CSPRNG (`CreateForPublicContent`), never from
+  any DTLS exporter, and never mixed with one. On the client the shared key is applied **only** to the
+  enumerated broadcast SSRC(s) (`InstallPublicBroadcastReceiveKey` is SSRC-scoped); every other m-line,
+  including any private one on the same transport, keeps its DTLS-derived keys. A broadcast SSRC that
+  fails to authenticate is dropped, never retried against the private keys.
+- **No enrollment of a media-sending viewer.** `SharedKeyBroadcastTier.Enroll` throws for any session
+  with a receiving media m-line (recvonly/sendrecv from the SFU's view, checked on both the desired and
+  the negotiated direction). This is defense-in-depth: an enrolled viewer's *inbound* media always rides
+  its own DTLS-derived keys, and the shared key is only installed on the viewer's *receive* broadcast
+  SSRCs, so participant media structurally cannot ride the shared key — the refusal guards against an
+  application composing a broadcast leg with a media-receiving one on the same session. The guard is
+  point-in-time (post-enrollment renegotiation is the application's responsibility).
+- **No path from a private/1:1/mixed room.** The mode exists only inside the broadcast fan-out component,
+  behind the public-named key type; there is no per-`PeerConnection` "use shared key" switch, and a
+  session may be enrolled in exactly one broadcast's key.
+- **Key transport** rides each viewer's already-DTLS-authenticated data channel (a Keryx-defined
+  `PublicBroadcastKeyMessage`), so it is confidential and authenticated per viewer even though the media
+  key is shared. Epoch rotation mints a fresh key and bounds exposure; viewers hold two epochs across the
+  switch.
+
+**Explicitly does NOT defend against (accepted, by design):**
+- **Keyholder forgery.** Any enrolled viewer (or anyone who obtains the broadcast key) who *also* has the
+  network position to spoof the SFU's 5-tuple to another viewer, within that viewer's replay/ROC window,
+  can inject cryptographically-valid forged media into that viewer's player. This is the stated trade:
+  per-viewer media authentication for scale. Mitigations retained — receivers accept only the established
+  5-tuple, replay windows hold, epoch rotation bounds exposure — but a keyholder forgery is valid and the
+  design does not claim otherwise.
+- **Confidentiality against enrolled viewers.** Non-existent by construction; enrollment is open for
+  public content.
+
 ## Residual risk (for a future external auditor)
 
 1. **No fuzzing.** The parsers (`HandshakeCodec`, `DtlsRecordReader`, `RtpHeaderView`) were reviewed and exercised by targeted adversarial tests, but not fuzzed. A structured fuzzer over the record/handshake/SRTP-packet parsers is the highest-value next step.
