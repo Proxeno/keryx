@@ -21,8 +21,16 @@ namespace Keryx.Srtp;
 /// </remarks>
 public sealed class SrtpDecryptContext : IDisposable
 {
+    /// <summary>
+    /// Default upper bound on the number of distinct SSRCs this context keeps per-stream state for,
+    /// on the RTP and the SRTCP path independently. WebRTC transports carry a handful of SSRCs, so
+    /// 256 is far above any legitimate need while still bounding memory.
+    /// </summary>
+    public const int DefaultMaxReceiveSources = 256;
+
     private readonly ISrtpTransform _transform;
     private readonly IKeryxLogger _logger;
+    private readonly int _maxReceiveSources;
     private readonly Dictionary<uint, SrtpStreamState> _rtpStreams = [];
     private readonly Dictionary<uint, SrtpReplayWindow> _rtcpReplay = [];
     private bool _disposed;
@@ -31,13 +39,25 @@ public sealed class SrtpDecryptContext : IDisposable
     /// <param name="profile">The negotiated protection profile.</param>
     /// <param name="keys">The master key and salt for this direction.</param>
     /// <param name="logger">Optional logger; defaults to <see cref="NullLogger"/>.</param>
+    /// <param name="maxReceiveSources">
+    /// Upper bound on the number of distinct SSRCs the RTP and the SRTCP path each keep per-stream
+    /// replay/rollover state for. Once reached, packets from a not-yet-seen SSRC are dropped rather
+    /// than allocating new state. Defaults to <see cref="DefaultMaxReceiveSources"/>.
+    /// </param>
     /// <exception cref="ArgumentException">The key material does not match the profile.</exception>
-    public SrtpDecryptContext(SrtpProtectionProfile profile, SrtpSessionKeys keys, IKeryxLogger? logger = null)
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxReceiveSources"/> is not positive.</exception>
+    public SrtpDecryptContext(
+        SrtpProtectionProfile profile,
+        SrtpSessionKeys keys,
+        IKeryxLogger? logger = null,
+        int maxReceiveSources = DefaultMaxReceiveSources)
     {
         ArgumentNullException.ThrowIfNull(profile);
         ArgumentNullException.ThrowIfNull(keys);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxReceiveSources);
         Profile = profile;
         _logger = logger ?? NullLogger.Instance;
+        _maxReceiveSources = maxReceiveSources;
         _transform = SrtpTransformFactory.Create(profile, keys);
     }
 
@@ -90,6 +110,18 @@ public sealed class SrtpDecryptContext : IDisposable
         // pin a SrtpStreamState plus a dictionary entry per forged SSRC — 2^32 of them, never
         // evicted, for the price of a 22-byte datagram each.
         var known = _rtpStreams.TryGetValue(ssrc, out var stream);
+
+        // The master key authenticates any SSRC, so an authenticated peer can otherwise stamp a fresh
+        // SSRC on every packet and grow this map without bound. Once the cap is reached, packets from
+        // a not-yet-tracked SSRC are refused rather than evicting an existing stream: eviction would
+        // discard that stream's replay window and rollover counter, and a later packet re-creating it
+        // would restart the replay window from empty, reopening the replay hole this layer exists to
+        // close. Refusing new sources keeps every tracked stream's replay state intact.
+        if (!known && _rtpStreams.Count >= _maxReceiveSources)
+        {
+            Debug($"SRTP: dropping packet from SSRC 0x{ssrc:x8}; already tracking {_maxReceiveSources} sources.");
+            return false;
+        }
 
         // RFC 3711 Section 3.3 processing order: estimate the index, consult the replay list,
         // verify the tag, decrypt, and only then commit ROC / s_l / replay state.
@@ -171,7 +203,16 @@ public sealed class SrtpDecryptContext : IDisposable
         // As on the SRTP path, the replay entry for an unseen SSRC is not created until the packet
         // authenticates. A default window accepts any first index, so the check below behaves
         // identically for a genuine first packet.
-        _rtcpReplay.TryGetValue(ssrc, out var replay);
+        var knownRtcp = _rtcpReplay.TryGetValue(ssrc, out var replay);
+
+        // Bound the SRTCP replay map exactly as the RTP stream map above: refuse new SSRCs past the
+        // cap rather than evict, so no tracked SSRC ever loses its replay window.
+        if (!knownRtcp && _rtcpReplay.Count >= _maxReceiveSources)
+        {
+            Debug($"SRTCP: dropping packet from SSRC 0x{ssrc:x8}; already tracking {_maxReceiveSources} sources.");
+            return false;
+        }
+
         if (!replay.IsAcceptable(index))
         {
             Debug($"SRTCP: dropping replayed packet, SSRC 0x{ssrc:x8} index {index}.");
