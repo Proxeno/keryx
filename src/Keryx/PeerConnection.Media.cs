@@ -987,7 +987,7 @@ public sealed partial class PeerConnection
                         negotiated.Mid,
                         MediaKind.Video,
                         new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
-                        new H264Packetizer(),
+                        CreateVideoPayloadizer(negotiated.EncodingName),
                         videoMaxPayload,
                         profile.RtpOverhead,
                         transportCcId,
@@ -1009,6 +1009,30 @@ public sealed partial class PeerConnection
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Selects the RTP payloadizer for a negotiated video codec by its rtpmap encoding name. The
+    /// negotiation layer only settles on a codec this endpoint configured, so an unrecognised name here
+    /// means a codec was configured whose send path is not yet wired (a future VP9/AV1) — surfaced as a
+    /// clear failure rather than silently mis-packetizing under the wrong payload type.
+    /// </summary>
+    /// <param name="encodingName">The negotiated codec's rtpmap encoding name, for example <c>VP8</c>.</param>
+    /// <returns>A fresh payloadizer for the codec.</returns>
+    private static IRtpPayloadizer CreateVideoPayloadizer(string encodingName)
+    {
+        if (string.Equals(encodingName, "H264", StringComparison.OrdinalIgnoreCase))
+        {
+            return new H264Packetizer();
+        }
+
+        if (string.Equals(encodingName, "VP8", StringComparison.OrdinalIgnoreCase))
+        {
+            return new Vp8Packetizer();
+        }
+
+        throw new InvalidOperationException(
+            $"No send-side packetizer is wired for the negotiated video codec '{encodingName}'.");
     }
 
     private static SrtpProfile MapSrtpProfile(DtlsSrtpProfile profile) => profile switch

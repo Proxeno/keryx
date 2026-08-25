@@ -1450,14 +1450,26 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 }
 
                 boundTransceiver.Receiver.PayloadTypes = receivePayloadTypes;
-                if (section.Codecs.FirstOrDefault(c => !c.IsRtx) is { } primaryCodec)
+
+                // Publish the full negotiated media-codec list (rtx entries excluded) in answered order,
+                // with the first as the primary. The sender keeps to the primary for the session.
+                var negotiatedCodecs = new List<NegotiatedCodec>();
+                foreach (var codec in section.Codecs)
                 {
-                    boundTransceiver.NegotiatedCodec = new NegotiatedCodec(
-                        primaryCodec.PayloadType,
-                        new RtpMap(primaryCodec.PayloadType, primaryCodec.EncodingName, primaryCodec.ClockRate, primaryCodec.Channels),
-                        primaryCodec.Fmtp,
-                        [.. primaryCodec.Feedback]);
+                    if (codec.IsRtx)
+                    {
+                        continue;
+                    }
+
+                    negotiatedCodecs.Add(new NegotiatedCodec(
+                        codec.PayloadType,
+                        new RtpMap(codec.PayloadType, codec.EncodingName, codec.ClockRate, codec.Channels),
+                        codec.Fmtp,
+                        [.. codec.Feedback]));
                 }
+
+                boundTransceiver.NegotiatedCodecs = negotiatedCodecs;
+                boundTransceiver.NegotiatedCodec = negotiatedCodecs.Count > 0 ? negotiatedCodecs[0] : null;
             }
 
             if (_config.EnableSimulcast
@@ -1517,6 +1529,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         mid,
                         (byte)primary.PayloadType,
                         (uint)primary.ClockRate,
+                        primary.EncodingName,
                         rtxPayloadType);
 
                     if (_config.EnableTransportWideCc && answerSendTransportCcId is null)
@@ -1877,6 +1890,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 ? transceiver.OfferCodecs
                 : (kind == MediaKind.Video ? _config.VideoCodecs : _config.AudioCodecs);
             var receivePayloadTypes = new List<byte>();
+            var negotiatedCodecs = new List<NegotiatedCodec>();
             foreach (var codec in media.Codecs)
             {
                 if (codec.PayloadType is < 0 or > 127)
@@ -1893,10 +1907,10 @@ public sealed partial class PeerConnection : IAsyncDisposable
                 routes[(byte)codec.PayloadType] = route;
                 perMid?.TryAdd((byte)codec.PayloadType, route);
                 receivePayloadTypes.Add((byte)codec.PayloadType);
+                negotiatedCodecs.Add(codec);
             }
 
-            var chosen = media.Codecs.FirstOrDefault(c =>
-                configured.Any(x => string.Equals(x.EncodingName, c.EncodingName, StringComparison.OrdinalIgnoreCase)));
+            var chosen = negotiatedCodecs.Count > 0 ? negotiatedCodecs[0] : null;
             if (chosen is null)
             {
                 _logger.Log(KeryxLogLevel.Warning, $"The answer kept no usable codec for m-section '{media.Mid}'.");
@@ -1909,6 +1923,7 @@ public sealed partial class PeerConnection : IAsyncDisposable
             {
                 transceiver.CurrentDirection = media.Direction;
                 transceiver.NegotiatedCodec = chosen;
+                transceiver.NegotiatedCodecs = negotiatedCodecs;
                 transceiver.Receiver.PayloadTypes = receivePayloadTypes;
             }
 
@@ -1954,8 +1969,13 @@ public sealed partial class PeerConnection : IAsyncDisposable
                         media.Mid ?? _config.VideoMid,
                         (byte)chosen.PayloadType,
                         (uint)chosen.ClockRate,
+                        chosen.EncodingName,
                         rtxPayloadType)
-                    : new NegotiatedTrack(media.Mid ?? _config.AudioMid, (byte)chosen.PayloadType, (uint)chosen.ClockRate);
+                    : new NegotiatedTrack(
+                        media.Mid ?? _config.AudioMid,
+                        (byte)chosen.PayloadType,
+                        (uint)chosen.ClockRate,
+                        chosen.EncodingName);
             }
         }
 
@@ -2072,13 +2092,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
         byte AptPayloadType = 0);
 
     /// <summary>
-    /// What the answer settled on for one media kind. <paramref name="RtxPayloadType"/> is null when
-    /// the answerer dropped the RFC 4588 repair codec, which disables retransmission for the track.
+    /// What the answer settled on for one media kind. <paramref name="EncodingName"/> is the negotiated
+    /// codec's rtpmap name (for example <c>H264</c>, <c>VP8</c> or <c>opus</c>), which selects the
+    /// outbound packetizer so the payload matches the payload type on the wire.
+    /// <paramref name="RtxPayloadType"/> is null when the answerer dropped the RFC 4588 repair codec,
+    /// which disables retransmission for the track.
     /// </summary>
     internal sealed record NegotiatedTrack(
         string Mid,
         byte PayloadType,
         uint ClockRate,
+        string EncodingName,
         byte? RtxPayloadType = null);
 
     private sealed class DtlsLowerTransport(PeerConnection owner) : IDatagramTransport
