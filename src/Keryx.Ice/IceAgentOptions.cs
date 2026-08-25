@@ -154,6 +154,18 @@ public sealed class IceAgentOptions
     /// </summary>
     public bool StrictInboundSourceValidation { get; set; } = true;
 
+    /// <summary>
+    /// Restricts connectivity checks (and everything <see cref="IceAgent.LocalCandidates"/> and
+    /// <see cref="IceAgent.OnLocalCandidate"/> surface) to relayed candidates only, mirroring a browser's
+    /// <c>iceTransportPolicy: "relay"</c>. Host and server-reflexive candidates are still bound and
+    /// gathered internally - a host candidate is the required base a TURN allocation is computed
+    /// from (RFC 8445 section 5.1.1.2) - they are simply never offered as a usable local candidate or
+    /// paired against a remote one, so the only pair that can ever succeed routes through a
+    /// <see cref="TurnServers"/> allocation. Requires at least one entry in <see cref="TurnServers"/>
+    /// to be of any use: with none, gathering produces no candidates at all. Off by default.
+    /// </summary>
+    public bool RelayOnly { get; set; }
+
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }
 
