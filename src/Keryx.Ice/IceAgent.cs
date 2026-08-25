@@ -66,6 +66,11 @@ public sealed class IceAgent : IDisposable
     private const int MaxDatagram = 1472;
     private const int ReceiveBufferSize = 2048;
 
+    // The mDNS negative cache is a short-lived flood suppressant, not a store: this ceiling bounds it
+    // regardless of the configured TTL, so distinct failing names arriving faster than they expire
+    // still cannot grow it without bound.
+    private const int MaxMdnsNegativeCacheEntries = 256;
+
     private readonly object _lock = new();
     private readonly IceAgentOptions _options;
     private readonly IKeryxLogger _logger;
@@ -82,6 +87,10 @@ public sealed class IceAgent : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly byte[] _localKey;
     private readonly IMdnsResolver? _mdnsResolver;
+    private readonly SemaphoreSlim _mdnsResolutionSlots;
+    private readonly object _mdnsLock = new();
+    private readonly HashSet<string> _mdnsInFlight = [];
+    private readonly Dictionary<string, long> _mdnsNegativeCache = [];
 
     private Socket? _socket;
     private Task? _receiveLoop;
@@ -113,6 +122,7 @@ public sealed class IceAgent : IDisposable
         LocalPassword = _options.LocalPassword ?? IceCredentials.NewPassword();
         _localKey = StunCredentials.ShortTermKey(LocalPassword);
         _mdnsResolver = _options.ResolveMdnsCandidates ? (_options.MdnsResolver ?? MulticastMdnsResolver.Shared) : null;
+        _mdnsResolutionSlots = new SemaphoreSlim(_options.MaxConcurrentMdnsResolutions, _options.MaxConcurrentMdnsResolutions);
         _transport = new IceTransport(this);
     }
 
@@ -398,35 +408,143 @@ public sealed class IceAgent : IDisposable
             return;
         }
 
+        // A single hostile signalling peer can flood distinct <uuid>.local lines; each resolution
+        // otherwise spawns a task, one or two UDP sockets and a LAN multicast query. Four bounds keep
+        // that in check: a negative cache suppresses a repeat of a name that just failed, an in-flight
+        // set collapses duplicate names still resolving, a pending ceiling drops names once too many
+        // are already outstanding (so a flood cannot spawn unbounded tasks), and a slot semaphore the
+        // admitted tasks queue on caps how many actually open sockets at once. A legitimate burst is
+        // admitted in full and simply served a few at a time.
+        var key = hostName.ToLowerInvariant();
+        lock (_mdnsLock)
+        {
+            var now = Environment.TickCount64;
+            if (_mdnsNegativeCache.TryGetValue(key, out var expiry))
+            {
+                if (now < expiry)
+                {
+                    _logger.Log(KeryxLogLevel.Debug, $"Skipping recently-unresolved mDNS remote candidate host '{hostName}'.");
+                    return;
+                }
+
+                _mdnsNegativeCache.Remove(key);
+            }
+
+            if (_mdnsInFlight.Contains(key))
+            {
+                _logger.Log(KeryxLogLevel.Debug, $"Coalescing duplicate in-flight mDNS remote candidate host '{hostName}'.");
+                return;
+            }
+
+            if (_mdnsInFlight.Count >= _options.MaxPendingMdnsResolutions)
+            {
+                _logger.Log(KeryxLogLevel.Warning, $"Dropping mDNS remote candidate '{candidateAttribute}': too many pending resolutions.");
+                return;
+            }
+
+            _mdnsInFlight.Add(key);
+        }
+
         _ = Task.Run(
             async () =>
             {
-                IPAddress? address;
+                var resolved = false;
+                var acquired = false;
                 try
                 {
-                    address = await resolver.ResolveAsync(hostName, _cts.Token).ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is OperationCanceledException or SocketException)
-                {
-                    _logger.Log(KeryxLogLevel.Warning, $"Skipping unresolvable mDNS remote candidate '{candidateAttribute}'.", ex);
-                    return;
-                }
+                    try
+                    {
+                        await _mdnsResolutionSlots.WaitAsync(_cts.Token).ConfigureAwait(false);
+                        acquired = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
 
-                if (address is null)
-                {
-                    _logger.Log(KeryxLogLevel.Warning, $"Skipping unresolvable mDNS remote candidate '{candidateAttribute}'; host '{hostName}' did not answer.");
-                    return;
-                }
+                    IPAddress? address;
+                    try
+                    {
+                        address = await resolver.ResolveAsync(hostName, _cts.Token).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is OperationCanceledException or SocketException)
+                    {
+                        _logger.Log(KeryxLogLevel.Warning, $"Skipping unresolvable mDNS remote candidate '{candidateAttribute}'.", ex);
+                        return;
+                    }
 
-                if (_cts.IsCancellationRequested)
-                {
-                    return;
-                }
+                    if (address is null)
+                    {
+                        _logger.Log(KeryxLogLevel.Warning, $"Skipping unresolvable mDNS remote candidate '{candidateAttribute}'; host '{hostName}' did not answer.");
+                        return;
+                    }
 
-                _logger.Log(KeryxLogLevel.Debug, $"Resolved mDNS candidate host '{hostName}' to {address}.");
-                AddRemoteCandidate(resolve(address));
+                    if (_cts.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    resolved = true;
+                    _logger.Log(KeryxLogLevel.Debug, $"Resolved mDNS candidate host '{hostName}' to {address}.");
+                    AddRemoteCandidate(resolve(address));
+                }
+                finally
+                {
+                    if (acquired)
+                    {
+                        _mdnsResolutionSlots.Release();
+                    }
+
+                    lock (_mdnsLock)
+                    {
+                        _mdnsInFlight.Remove(key);
+                        if (!resolved)
+                        {
+                            NegativeCacheMdnsFailureLocked(key);
+                        }
+                    }
+                }
             },
             CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Records a failed <c>.local</c> resolution so an immediate re-signal of the same name is
+    /// skipped. Expired entries are purged on the way in, and the table is size-capped, so a flood of
+    /// distinct failing names cannot grow it without bound.
+    /// </summary>
+    private void NegativeCacheMdnsFailureLocked(string key)
+    {
+        var now = Environment.TickCount64;
+        if (_mdnsNegativeCache.Count > 0)
+        {
+            List<string>? expired = null;
+            foreach (var entry in _mdnsNegativeCache)
+            {
+                if (now >= entry.Value)
+                {
+                    (expired ??= []).Add(entry.Key);
+                }
+            }
+
+            if (expired is not null)
+            {
+                foreach (var name in expired)
+                {
+                    _mdnsNegativeCache.Remove(name);
+                }
+            }
+        }
+
+        // A hard ceiling independent of the TTL: even if failures arrive faster than they expire, the
+        // table stays small. Once full, further failures simply are not remembered (they still had to
+        // pass the slot cap to get here), which is safe - they just are not suppressed early.
+        if (_mdnsNegativeCache.Count >= MaxMdnsNegativeCacheEntries)
+        {
+            return;
+        }
+
+        _mdnsNegativeCache[key] = now + (long)_options.MdnsNegativeCacheDuration.TotalMilliseconds;
     }
 
     /// <summary>
@@ -550,6 +668,7 @@ public sealed class IceAgent : IDisposable
         }
 
         _cts.Dispose();
+        _mdnsResolutionSlots.Dispose();
     }
 
     internal void SendOnSelectedPair(ReadOnlySpan<byte> datagram)
@@ -1559,6 +1678,16 @@ public sealed class IceAgent : IDisposable
     {
         if (_remoteCandidates.Contains(candidate))
         {
+            return false;
+        }
+
+        // RFC 8445 permits limiting the candidate set. Beyond the cap a signalled candidate is dropped
+        // cleanly - no throw, no pair rebuild, no TURN permission task - so a peer trickling huge
+        // counts cannot drive the O(n) rebuild or the per-add permission work without bound. The cap
+        // dwarfs any legitimate session, so a real peer's candidates are never lost to it.
+        if (_remoteCandidates.Count >= _options.MaxRemoteCandidates)
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Dropping remote candidate {candidate}: remote-candidate cap ({_options.MaxRemoteCandidates}) reached.");
             return false;
         }
 
