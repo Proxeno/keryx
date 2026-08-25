@@ -7,5 +7,8 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Keryx.Srtp.Tests" />
+    <!-- Benchmark harness reaches the transform layer directly to measure pure AES-GCM / AES-CM+HMAC
+         crypto throughput without the encrypt context's replay/rollover bookkeeping. -->
+    <InternalsVisibleTo Include="Keryx.Benchmarks" />
   </ItemGroup>
 </Project>

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- BenchmarkDotNet requires an optimized, non-server-GC host for stable numbers; it also
+         rebuilds the benchmarks into their own generated project at run time. This project is a
+         console app, so `dotnet test` never runs it and it stays out of the CI test suite. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../../src/Keryx.Srtp/Keryx.Srtp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Rtp/Keryx.Rtp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Sdp/Keryx.Sdp.csproj" />
+    <ProjectReference Include="../../src/Keryx/Keryx.csproj" />
+  </ItemGroup>
+</Project>
