@@ -19,7 +19,7 @@ using Keryx.Srtp;
 var duration = TimeSpan.FromSeconds(ArgValue(args, "--duration", 5));
 var profileName = ArgString(args, "--profile", "AeadAes128Gcm");
 var profile = ResolveProfile(profileName);
-var arms = ArgList(args, "--arms", [1, 2, 3, 4, 5]);
+var arms = ArgList(args, "--arms", [1, 2, 3, 4, 5, 6]);
 var cores = Environment.ProcessorCount;
 
 Console.WriteLine("=================================================================");
@@ -55,6 +55,11 @@ if (arms.Contains(4))
 if (arms.Contains(5))
 {
     BroadcastFanoutArm(profile, duration, cores);
+}
+
+if (arms.Contains(6))
+{
+    BatchedSendArm(profile, duration);
 }
 
 Console.WriteLine("Done.");
@@ -426,6 +431,165 @@ static double RunBroadcastFanout(int workers, int subscriberCount, TimeSpan dura
             s.Dispose();
         }
     }
+}
+
+// Arm 6: the send lever in isolation (broadcast-scale.md §3). Fan one ingest packet out to N
+// subscribers, then flush that whole batch out of ONE shared socket, two ways: the batched
+// BatchedDatagramSender (one sendmmsg(2) per chunk on Linux) vs a per-datagram SendTo loop (one
+// syscall each, the pre-batching path). Reports datagram/s and the batched speedup. On macOS the
+// sender has no sendmmsg, so both rows run the managed loop and the speedup is ~1x by construction —
+// run under benchmarks/Keryx.ScalingSpike/sendmmsg-linux.Dockerfile to see the native win.
+static void BatchedSendArm(SrtpProtectionProfile profile, TimeSpan duration)
+{
+    var subscribers = (int)ArgValue(Environment.GetCommandLineArgs(), "--batch-subs", 512);
+
+    Console.WriteLine("-----------------------------------------------------------------");
+    Console.WriteLine(" Arm 6: batched fan-out send vs per-datagram send (shared socket)");
+    Console.WriteLine("-----------------------------------------------------------------");
+    Console.WriteLine($"  One fan-out batch of {subscribers:N0} datagrams, flushed out of one socket.");
+    Console.WriteLine($"  Native sendmmsg available: {BatchedDatagramSender.NativeBatchSendSupported}");
+    Console.WriteLine();
+
+    // Distinct loopback destinations (the fan-out shape: B datagrams to B distinct 5-tuples). Cap the
+    // receiver count so the arm binds a bounded number of sockets; the batch cycles across them.
+    var receiverCount = Math.Min(subscribers, 256);
+    var receivers = new Socket[receiverCount];
+    var destinations = new IPEndPoint[receiverCount];
+    using var drainCts = new CancellationTokenSource();
+    var drains = new Task[receiverCount];
+    for (var i = 0; i < receiverCount; i++)
+    {
+        var r = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+        {
+            ReceiveBufferSize = 1 << 22,
+        };
+        r.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        receivers[i] = r;
+        destinations[i] = (IPEndPoint)r.LocalEndPoint!;
+        var socket = r;
+        drains[i] = Task.Run(async () =>
+        {
+            var buffer = new byte[Ingest.PacketSize + 64 + profile.RtpOverhead];
+            while (!drainCts.IsCancellationRequested)
+            {
+                try
+                {
+                    await socket.ReceiveAsync(buffer, drainCts.Token);
+                }
+                catch (Exception)
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    // Build subscribers whose destinations cycle across the bound receivers, then fan out one packet to
+    // materialise the batch of ready-to-send datagrams.
+    var subs = new List<BroadcastSubscriber>(subscribers);
+    for (var i = 0; i < subscribers; i++)
+    {
+        var forwarder = new RtpForwarder(0xA000_0000u + (uint)i);
+        forwarder.SelectLayer(SimulcastLayerId.Parse("hi"));
+        var key = new byte[profile.MasterKeyLength];
+        var salt = new byte[profile.MasterSaltLength];
+        RandomNumberGenerator.Fill(key);
+        RandomNumberGenerator.Fill(salt);
+        var srtp = new SrtpEncryptContext(profile, new SrtpSessionKeys(key, salt));
+        subs.Add(new BroadcastSubscriber(forwarder, srtp, destinations[i % receiverCount]));
+    }
+
+    using var sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+    {
+        SendBufferSize = 1 << 24,
+    };
+    using var batchSender = new BatchedDatagramSender(sender);
+
+    try
+    {
+        var fanout = new BroadcastFanout(maxDegreeOfParallelism: 1, parallelThreshold: int.MaxValue);
+        var classification = new RtpLayerClassification(
+            SimulcastLayerId.Parse("hi"), FanoutIngest.UpstreamSsrc, IsRepair: false, RtpLayerClassificationSource.RidExtension);
+        var packet = FanoutIngest.Build();
+        FanoutIngest.SetSequenceAndTimestamp(packet, 0, 0);
+
+        var broadcast = new List<BroadcastDatagram>();
+        fanout.Forward(in classification, packet, canStartLayer: true, subs);
+        FanoutIngest.SetSequenceAndTimestamp(packet, 1, 3000);
+        fanout.Forward(in classification, packet, canStartLayer: false, subs, broadcast);
+
+        // Stage the batch into the Datagram[] the sender consumes (exactly BroadcastEndpoint.SendBatch's
+        // conversion). Payloads are stable windows into the subscribers' output buffers.
+        var batch = new Datagram[broadcast.Count];
+        for (var i = 0; i < broadcast.Count; i++)
+        {
+            batch[i] = new Datagram(broadcast[i].Payload, broadcast[i].Destination);
+        }
+
+        var window = TimeSpan.FromSeconds(Math.Min(2, duration.TotalSeconds));
+        var perDatagram = MeasurePerDatagram(sender, batch, window);
+        var batched = MeasureBatched(batchSender, batch, window);
+
+        Console.WriteLine("   path             |    datagram/s |   batches/s | vs per-datagram");
+        Console.WriteLine("   -----------------+---------------+-------------+----------------");
+        Console.WriteLine($"   per-datagram loop| {perDatagram,13:N0} | {perDatagram / batch.Length,11:N0} |          1.00x");
+        Console.WriteLine($"   batched sendmmsg | {batched,13:N0} | {batched / batch.Length,11:N0} | {batched / perDatagram,13:F2}x");
+        Console.WriteLine();
+        Console.WriteLine($"  batch size {batch.Length}, native path {(batchSender.UsesNativeBatchSend ? "ACTIVE (sendmmsg)" : "inactive (managed fallback)")}.");
+        Console.WriteLine();
+    }
+    finally
+    {
+        drainCts.Cancel();
+        foreach (var s in subs)
+        {
+            s.Dispose();
+        }
+
+        foreach (var r in receivers)
+        {
+            r.Dispose();
+        }
+    }
+}
+
+static double MeasurePerDatagram(Socket sender, Datagram[] batch, TimeSpan window)
+{
+    var end = Stopwatch.GetTimestamp() + (long)(window.TotalSeconds * Stopwatch.Frequency);
+    var start = Stopwatch.GetTimestamp();
+    long sent = 0;
+    while (Stopwatch.GetTimestamp() < end)
+    {
+        foreach (var d in batch)
+        {
+            try
+            {
+                sender.SendTo(d.Payload.Span, SocketFlags.None, d.Destination);
+                sent++;
+            }
+            catch (SocketException)
+            {
+                // ENOBUFS/EWOULDBLOCK under a full send buffer; counted as a drop.
+            }
+        }
+    }
+
+    return sent / Stopwatch.GetElapsedTime(start).TotalSeconds;
+}
+
+static double MeasureBatched(BatchedDatagramSender sender, Datagram[] batch, TimeSpan window)
+{
+    sender.Send(batch); // warm
+
+    var end = Stopwatch.GetTimestamp() + (long)(window.TotalSeconds * Stopwatch.Frequency);
+    var start = Stopwatch.GetTimestamp();
+    long sent = 0;
+    while (Stopwatch.GetTimestamp() < end)
+    {
+        sent += sender.Send(batch);
+    }
+
+    return sent / Stopwatch.GetElapsedTime(start).TotalSeconds;
 }
 
 static List<BroadcastSubscriber> BuildFanoutSubscribers(int count, SrtpProtectionProfile profile)
