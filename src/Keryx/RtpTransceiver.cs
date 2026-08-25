@@ -54,7 +54,21 @@ public sealed class RtpTransceiver
     public RtpReceiver Receiver { get; }
 
     /// <summary>The primary codec negotiated for this m-line, <see langword="null"/> before it settles.</summary>
+    /// <remarks>
+    /// A convenience view of the first non-rtx entry in <see cref="NegotiatedCodecs"/>: the codec that
+    /// drives this transceiver's sender for the session. Kept for the common single-codec case.
+    /// </remarks>
     public NegotiatedCodec? NegotiatedCodec { get; internal set; }
+
+    /// <summary>
+    /// Every media codec the peer accepted for this m-line, in negotiated preference order, each with its
+    /// own payload type — empty before negotiation settles or when the m-line was rejected. RFC 4588 rtx
+    /// repair codecs are not listed here (retransmission is plumbed separately through the sender). The
+    /// first entry is the primary, mirrored by <see cref="NegotiatedCodec"/>. The sender keeps to the
+    /// primary for the session (no mid-stream switching); the list lets an application see the full set
+    /// the peer agreed to.
+    /// </summary>
+    public IReadOnlyList<NegotiatedCodec> NegotiatedCodecs { get; internal set; } = [];
 
     /// <summary>
     /// Marks this transceiver stopped (session-model.md §3.3/§4.2): the next offer re-emits its m-line
