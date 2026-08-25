@@ -164,4 +164,197 @@ public sealed class IceAgentSecurityTests
         agent.SelectedPair.Should().BeNull();
         agent.State.Should().NotBe(IceAgentState.Connected);
     }
+
+    /// <summary>
+    /// Establishes a connected, nominated pair of loopback agents and hands back a queue that
+    /// captures every datagram <paramref name="receiver"/>'s transport surfaces, for the source
+    /// validation tests below.
+    /// </summary>
+    private static async Task<(IceAgent Survivor, IceAgent Peer, List<byte[]> Received)> ConnectNominatedPairAsync(
+        IceAgentOptions survivorOptions, CancellationToken cancellationToken)
+    {
+        var survivor = new IceAgent(survivorOptions);
+        var peer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        Trickle(survivor, peer);
+        Trickle(peer, survivor);
+        survivor.SetRemoteCredentials(peer.LocalUfrag, peer.LocalPassword);
+        peer.SetRemoteCredentials(survivor.LocalUfrag, survivor.LocalPassword);
+
+        var received = new List<byte[]>();
+        survivor.Transport.OnReceived += datagram =>
+        {
+            lock (received)
+            {
+                received.Add(datagram.ToArray());
+            }
+        };
+
+        await survivor.StartGatheringAsync(cancellationToken);
+        await peer.StartGatheringAsync(cancellationToken);
+        (await survivor.WaitForConnectedAsync(TimeSpan.FromSeconds(8), cancellationToken)).Should().BeTrue();
+        (await WaitUntilAsync(() => survivor.SelectedPair is { Nominated: true }, TimeSpan.FromSeconds(8)))
+            .Should().BeTrue();
+
+        return (survivor, peer, received);
+    }
+
+    private static async Task<bool> ReceivedAnythingAsync(List<byte[]> received, TimeSpan timeout)
+        => await WaitUntilAsync(
+            () =>
+            {
+                lock (received)
+                {
+                    return received.Count > 0;
+                }
+            },
+            timeout);
+
+    /// <summary>
+    /// The positive case behind <see cref="IceAgentOptions.StrictInboundSourceValidation"/>: once a
+    /// pair is nominated, a non-STUN datagram genuinely from the peer - the address the selected
+    /// pair's remote endpoint names - must still reach the transport. The defense-in-depth check must
+    /// never interfere with the legitimate flow it is meant to protect.
+    /// </summary>
+    [Fact]
+    public async Task StrictSourceValidation_PassesDatagramsFromTheSelectedPairsRemoteEndpoint()
+    {
+        var cancellationToken = Timeout();
+        var (survivor, peer, received) = await ConnectNominatedPairAsync(
+            LoopbackOptions(IceRole.Controlling), cancellationToken);
+        using var _survivor = survivor;
+        using var _peer = peer;
+
+        byte[] dtls = [22, 0xFE, 0xFD, 0x01, 0x02, 0x03];
+        peer.Transport.Send(dtls);
+
+        (await ReceivedAnythingAsync(received, TimeSpan.FromSeconds(5))).Should().BeTrue();
+        lock (received)
+        {
+            received.Should().ContainSingle();
+            received[0].Should().Equal(dtls);
+        }
+    }
+
+    /// <summary>
+    /// The core defense-in-depth guarantee: once a pair is nominated, a non-STUN datagram whose
+    /// source is not the selected pair's remote endpoint - exactly what an off-path attacker who can
+    /// put UDP on the socket produces - never reaches the transport, even though it demultiplexes as
+    /// DTLS/RTP/RTCP under RFC 7983 and would have been surfaced unconditionally before this change.
+    /// </summary>
+    [Fact]
+    public async Task StrictSourceValidation_DropsDatagramsFromAnUnrelatedSource()
+    {
+        var cancellationToken = Timeout();
+        var (survivor, peer, received) = await ConnectNominatedPairAsync(
+            LoopbackOptions(IceRole.Controlling), cancellationToken);
+        using var _survivor = survivor;
+        using var _peer = peer;
+
+        using var attacker = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        attacker.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var target = new IPEndPoint(IPAddress.Loopback, survivor.LocalEndPoint!.Port);
+
+        byte[] forged = [22, 0xFE, 0xFD, 0xAA, 0xBB];
+        attacker.SendTo(forged, target);
+
+        // Not merely a race: send genuine media from the peer right after and confirm it is the only
+        // thing that ever arrives, proving the forged datagram was dropped rather than delayed.
+        byte[] legitimate = [22, 0xFE, 0xFD, 0x11, 0x22];
+        peer.Transport.Send(legitimate);
+
+        (await ReceivedAnythingAsync(received, TimeSpan.FromSeconds(5))).Should().BeTrue();
+        lock (received)
+        {
+            received.Should().ContainSingle("the forged datagram from an unrelated source must be dropped");
+            received[0].Should().Equal(legitimate);
+        }
+    }
+
+    /// <summary>
+    /// Turning <see cref="IceAgentOptions.StrictInboundSourceValidation"/> off restores the original
+    /// unconditional RFC 7983 pass-through, so an integrator can disable the defense-in-depth check
+    /// if it ever gets in the way of a legitimate path this test suite did not anticipate.
+    /// </summary>
+    [Fact]
+    public async Task StrictSourceValidation_WhenDisabled_PassesDatagramsFromAnySource()
+    {
+        var cancellationToken = Timeout();
+        var options = LoopbackOptions(IceRole.Controlling);
+        options.StrictInboundSourceValidation = false;
+        var (survivor, peer, received) = await ConnectNominatedPairAsync(options, cancellationToken);
+        using var _survivor = survivor;
+        using var _peer = peer;
+
+        using var attacker = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        attacker.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var target = new IPEndPoint(IPAddress.Loopback, survivor.LocalEndPoint!.Port);
+
+        byte[] datagram = [22, 0xFE, 0xFD, 0x33, 0x44];
+        attacker.SendTo(datagram, target);
+
+        (await ReceivedAnythingAsync(received, TimeSpan.FromSeconds(5))).Should().BeTrue();
+        lock (received)
+        {
+            received[0].Should().Equal(datagram);
+        }
+    }
+
+    /// <summary>
+    /// For a remote peer that reaches the survivor through the peer's own TURN server, the remote
+    /// candidate's advertised transport address - and so the selected pair's remote endpoint - is the
+    /// relay's address, not the peer's host address (RFC 8445 section 5.1: a relayed candidate's
+    /// connection address is the relay). Validation must key off that address exactly like it does
+    /// for a direct pair, not some other address the relay candidate happens to carry.
+    /// </summary>
+    [Fact]
+    public async Task StrictSourceValidation_PassesRelayedPairTrafficFromTheRelayAddress()
+    {
+        var cancellationToken = Timeout();
+        using var survivor = new IceAgent(LoopbackOptions(IceRole.Controlling));
+        using var peer = new IceAgent(LoopbackOptions(IceRole.Controlled));
+
+        // The peer's real, loopback-bound address is re-advertised to survivor as a "relay"
+        // candidate - standing in for a peer whose only advertised path is through its own TURN
+        // server. The address is unchanged; only the type claim changes, exactly like a real relayed
+        // candidate whose connection address is the relay rather than the peer's host address.
+        peer.OnLocalCandidate += (_, candidate) => survivor.AddRemoteCandidate(new IceCandidate(
+            candidate.Foundation,
+            candidate.Component,
+            candidate.Transport,
+            candidate.Priority,
+            candidate.Address,
+            candidate.Port,
+            IceCandidateType.Relayed,
+            candidate.RelatedAddress,
+            candidate.RelatedPort));
+        Trickle(survivor, peer);
+        survivor.SetRemoteCredentials(peer.LocalUfrag, peer.LocalPassword);
+        peer.SetRemoteCredentials(survivor.LocalUfrag, survivor.LocalPassword);
+
+        var received = new List<byte[]>();
+        survivor.Transport.OnReceived += datagram =>
+        {
+            lock (received)
+            {
+                received.Add(datagram.ToArray());
+            }
+        };
+
+        await survivor.StartGatheringAsync(cancellationToken);
+        await peer.StartGatheringAsync(cancellationToken);
+        (await survivor.WaitForConnectedAsync(TimeSpan.FromSeconds(8), cancellationToken)).Should().BeTrue();
+        (await WaitUntilAsync(() => survivor.SelectedPair is { Nominated: true }, TimeSpan.FromSeconds(8)))
+            .Should().BeTrue();
+        survivor.SelectedPair!.Remote.Type.Should().Be(IceCandidateType.Relayed);
+
+        byte[] media = [128, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        peer.Transport.Send(media);
+
+        (await ReceivedAnythingAsync(received, TimeSpan.FromSeconds(5))).Should().BeTrue();
+        lock (received)
+        {
+            received[0].Should().Equal(media);
+        }
+    }
 }
