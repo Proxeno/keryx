@@ -665,6 +665,8 @@ public sealed partial class PeerConnection
                 ExpectedRemoteFingerprintSha256 = fingerprint.Value,
                 SrtpProfiles = [.. _config.SrtpProfiles],
                 MaxDatagramSize = _config.Mtu,
+                OfferedCipherSuites = _config.DtlsOfferedCipherSuites,
+                OfferedNamedGroups = _config.DtlsOfferedNamedGroups,
                 Logger = _logger,
             });
 

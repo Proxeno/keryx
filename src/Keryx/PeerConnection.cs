@@ -223,6 +223,15 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <summary>The SRTP protection profile the DTLS handshake agreed on, or null before it completes.</summary>
     public SrtpProfile? NegotiatedSrtpProfile => _srtp?.Profile;
 
+    /// <summary>The DTLS cipher suite the handshake agreed on (e.g. <c>TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256</c>), or null before it completes.</summary>
+    public string? NegotiatedDtlsCipherSuite => _dtls?.NegotiatedCipherSuite;
+
+    /// <summary>
+    /// The ECDHE named group (RFC 8422 registry id) the DTLS handshake agreed on, or null before it
+    /// completes. Internal: exposed only for the Chrome-interop DTLS curve matrix to assert against.
+    /// </summary>
+    internal ushort? NegotiatedDtlsNamedGroup => _dtls?.NegotiatedNamedGroup;
+
     /// <summary>The local DTLS certificate fingerprint published as <c>a=fingerprint:sha-256</c>.</summary>
     public string LocalFingerprint => _certificate.Sha256Fingerprint;
 

@@ -316,4 +316,20 @@ public sealed class PeerConnectionConfig
 
     /// <summary>The <c>a=mid</c> of the data channel m-section.</summary>
     public string ApplicationMid { get; set; } = "2";
+
+    /// <summary>
+    /// Overrides the DTLS cipher suites this connection offers (as DTLS client) or prefers (as DTLS
+    /// server), most preferred first. Null uses Keryx's default suite preference for
+    /// <see cref="Certificate"/>'s key type. Not part of the public surface: it exists so the
+    /// Chrome-interop DTLS suite matrix can force a single suite and prove it against a real browser.
+    /// </summary>
+    internal IReadOnlyList<ushort>? DtlsOfferedCipherSuites { get; set; }
+
+    /// <summary>
+    /// Overrides the DTLS ECDHE named groups this connection offers (as DTLS client) or prefers (as
+    /// DTLS server), most preferred first. Null uses Keryx's default curve preference. Not part of
+    /// the public surface: it exists so the Chrome-interop DTLS suite matrix can force a single curve
+    /// and prove it against a real browser.
+    /// </summary>
+    internal IReadOnlyList<ushort>? DtlsOfferedNamedGroups { get; set; }
 }
