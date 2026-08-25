@@ -6,7 +6,7 @@ namespace Keryx;
 /// A locally gathered ICE candidate, ready to hand to signalling.
 /// </summary>
 /// <remarks>
-/// Raised while <see cref="PeerConnection.CreateOfferAsync"/> or
+/// Raised while <see cref="PeerConnection.CreateOfferAsync(System.Threading.CancellationToken)"/> or
 /// <see cref="PeerConnection.CreateAnswerAsync"/> is gathering, so a trickling peer can start checks
 /// before the full description is written. The same candidates also appear as <c>a=candidate</c> lines
 /// in the returned SDP, which makes the description usable by a vanilla-ICE peer.

@@ -1183,6 +1183,14 @@ public sealed partial class PeerConnection
     internal object? SrtpContextForTest => _srtp;
 
     /// <summary>
+    /// Test-only: the ICE agent's currently selected candidate pair, so a test can assert by reference
+    /// identity that an ICE restart ran a fresh connectivity-check phase and nominated a <em>new</em> pair
+    /// (the old instance is discarded by <see cref="Ice.IceAgent.Restart"/>). Null before any pair
+    /// succeeds, and briefly during the restart window before a new pair is nominated.
+    /// </summary>
+    internal object? SelectedIceCandidatePairForTest => _ice?.SelectedPair;
+
+    /// <summary>
     /// Decapsulates one inbound RFC 4588 RTX packet back to the media packet it repairs and delivers it
     /// through the ordinary receive path. The repair carries its own SSRC, payload type and sequence
     /// number; the media SSRC is recovered from the RFC 5576 FID association (falling back to the last

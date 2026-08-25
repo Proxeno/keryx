@@ -22,7 +22,7 @@ namespace Keryx;
 /// ICE. It offers <c>a=setup:actpass</c>, so a browser answering <c>a=setup:active</c> makes Keryx the
 /// DTLS server. A minimal answerer path exists as well, which is what makes a Keryx-to-Keryx loopback
 /// possible; see the remarks on <see cref="CreateAnswerAsync"/> for its limits.</para>
-/// <para><b>Sequencing.</b> <see cref="CreateOfferAsync"/> gathers ICE candidates and returns a
+/// <para><b>Sequencing.</b> <see cref="CreateOfferAsync(System.Threading.CancellationToken)"/> gathers ICE candidates and returns a
 /// complete offer. <see cref="SetRemoteDescriptionAsync"/> applies the answer and starts a background
 /// driver that runs ICE connectivity, then the DTLS handshake, then derives SRTP contexts from the
 /// RFC 5705 exporter, then starts SCTP and the RTCP reporting loop. Await
@@ -49,10 +49,16 @@ namespace Keryx;
 /// removes or repoints m-lines (session-model.md §4.2): the session id stays constant while the o=
 /// version increments, the existing ICE transport, DTLS and SRTP context are reused untouched (no
 /// re-gather, no rekey — §4.3), and a transceiver added mid-session streams against the live SRTP
-/// context once its renegotiation settles. Glare handling (rollback) and ICE restart are not yet
-/// implemented.</para>
-/// <para><b>Not implemented.</b> No ULPFEC or RED, no rollback/glare handling, no ICE restart and no
-/// IPv6 relay candidates.</para>
+/// context once its renegotiation settles. Glare handling (rollback) is not yet implemented.</para>
+/// <para><b>ICE restart.</b> <see cref="RestartIce"/> or
+/// <see cref="CreateOfferAsync(bool, System.Threading.CancellationToken)"/> with <c>iceRestart: true</c>
+/// restarts ICE on a connected session (RFC 8445 §9): the offer carries fresh ICE credentials and
+/// re-emitted candidates, the answerer likewise regenerates its credentials, and applying the answer runs
+/// a new connectivity-check phase that switches the selected pair. The DTLS/SRTP context is preserved
+/// across the restart (RFC 8842). A fresh DTLS handshake with re-derived SRTP keys on restart is
+/// <em>deferred</em> (session-model.md §7): SRTP is not re-keyed here.</para>
+/// <para><b>Not implemented.</b> No ULPFEC or RED, no rollback/glare handling, no SRTP re-keying on ICE
+/// restart (deferred), and no IPv6 relay candidates.</para>
 /// </remarks>
 public sealed partial class PeerConnection : IAsyncDisposable
 {
@@ -107,6 +113,12 @@ public sealed partial class PeerConnection : IAsyncDisposable
     // OnNegotiationNeeded has been raised for the current pending change set and not yet cleared by a
     // local description apply; coalesces multiple AddTransceiver calls into a single event.
     private bool _negotiationNeeded;
+
+    // Set by RestartIce() to arm the next CreateOfferAsync as an ICE restart (RFC 8445 §9): the next
+    // offer regenerates the local ICE credentials, re-emits candidates and runs a fresh connectivity
+    // check phase. Cleared once an offer consumes it. Guarded by _lock. Mirrors the browser's
+    // RTCPeerConnection.restartIce() arming createOffer({ iceRestart: true }).
+    private bool _iceRestartArmed;
 
     private int _closed;
     private PeerConnectionState _state = PeerConnectionState.New;
@@ -360,6 +372,29 @@ public sealed partial class PeerConnection : IAsyncDisposable
     }
 
     /// <summary>
+    /// Arms the next <see cref="CreateOfferAsync(CancellationToken)"/> to restart ICE (RFC 8445 §9),
+    /// equivalently to calling <see cref="CreateOfferAsync(bool, CancellationToken)"/> with
+    /// <c>iceRestart: true</c>. Mirrors the browser's <c>RTCPeerConnection.restartIce()</c>: it does not
+    /// itself produce an offer, it flags the connection so that the offer generated next carries fresh ICE
+    /// credentials. A no-op if the connection is closed; harmless before the first negotiation (the first
+    /// offer already gathers fresh credentials).
+    /// </summary>
+    public void RestartIce()
+    {
+        lock (_lock)
+        {
+            if (_closed != 0)
+            {
+                return;
+            }
+
+            _iceRestartArmed = true;
+        }
+
+        _logger.Log(KeryxLogLevel.Debug, "ICE restart armed for the next offer.");
+    }
+
+    /// <summary>
     /// Gathers ICE candidates and produces a complete JSEP offer: BUNDLE group, one m-section per
     /// configured media kind plus the SCTP data channel section, <c>a=setup:actpass</c>, rtcp-mux, and
     /// every gathered <c>a=candidate</c> line followed by <c>a=end-of-candidates</c>.
@@ -367,9 +402,26 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// <param name="cancellationToken">Cancels gathering.</param>
     /// <returns>The offer, ready to hand to signalling.</returns>
     /// <exception cref="InvalidOperationException">An offer has already been created, or a remote offer is pending.</exception>
-    public async Task<string> CreateOfferAsync(CancellationToken cancellationToken = default)
+    public Task<string> CreateOfferAsync(CancellationToken cancellationToken = default) =>
+        CreateOfferAsync(iceRestart: false, cancellationToken);
+
+    /// <summary>
+    /// Produces a JSEP offer, optionally restarting ICE. With <paramref name="iceRestart"/> set — or after
+    /// <see cref="RestartIce"/> has armed the next offer — an already-connected session generates fresh
+    /// local ICE credentials, re-emits its candidates and offers them (RFC 8445 §9): applying the resulting
+    /// answer runs a new connectivity-check phase on the fresh credentials and switches the selected pair
+    /// to it, so media and data resume over the re-validated transport. The DTLS/SRTP context is preserved
+    /// across the restart (RFC 8842); a fresh DTLS handshake with re-derived SRTP keys is a separate,
+    /// deferred step (session-model.md §7).
+    /// </summary>
+    /// <param name="iceRestart">Whether this offer restarts ICE. Ignored before the session first connects.</param>
+    /// <param name="cancellationToken">Cancels gathering.</param>
+    /// <returns>The offer, ready to hand to signalling.</returns>
+    /// <exception cref="InvalidOperationException">An offer has already been created, or a remote offer is pending.</exception>
+    public async Task<string> CreateOfferAsync(bool iceRestart, CancellationToken cancellationToken = default)
     {
         IceAgent ice;
+        bool restart;
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_closed != 0, this);
@@ -389,14 +441,29 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
             _signalingState = SignalingState.HaveLocalOffer;
             ice = EnsureIceLocked(IceRole.Controlling);
+
+            // The restart is requested either explicitly or by a prior RestartIce(); consume the armed
+            // flag either way. It only takes effect once the agent has gathered (an ICE restart of a
+            // never-connected session is meaningless — the first offer already carries fresh credentials).
+            restart = (iceRestart || _iceRestartArmed) && ice.State != IceAgentState.New;
+            _iceRestartArmed = false;
         }
 
         RaiseSignalingStateChanged(SignalingState.HaveLocalOffer);
 
-        // A renegotiation reuses the existing ICE transport, credentials and gathered candidates — a
-        // plain renegotiation is not an ICE restart (session-model.md §4.2), so gather only the first time.
-        if (ice.State == IceAgentState.New)
+        if (restart)
         {
+            // ICE restart (RFC 8445 §9): regenerate the local credentials and reset the check list. The
+            // bound socket and gathered candidates are kept, so BuildOffer/AttachLocalCandidates below
+            // re-emit the same candidates under the new ufrag/pwd. The DTLS/SRTP transport rides the
+            // unchanged datagram seam untouched; SRTP is deliberately not re-keyed here (session-model.md
+            // §7 — a fresh DTLS handshake with re-derived SRTP is the deferred follow-on).
+            ice.Restart();
+        }
+        else if (ice.State == IceAgentState.New)
+        {
+            // A plain renegotiation reuses the existing ICE transport, credentials and gathered candidates
+            // (session-model.md §4.2), so gather only the first time.
             await ice.StartGatheringAsync(cancellationToken).ConfigureAwait(false);
         }
 
@@ -1626,6 +1693,22 @@ public sealed partial class PeerConnection : IAsyncDisposable
             ice = EnsureIceLocked(IceRole.Controlled);
         }
 
+        // ICE restart detection (RFC 8445 §9): a re-offer whose ICE ufrag differs from the credentials we
+        // are currently checking against is a restart, not a plain renegotiation. RemoteUfrag is null
+        // before the first offer is applied, so the initial negotiation never trips this. On a restart the
+        // answerer regenerates its own local credentials and resets its check list here, before the loop
+        // below re-adds the peer's restart candidates and the final SetRemoteCredentials installs the
+        // peer's fresh credentials; CreateAnswerAsync then emits our fresh ufrag/pwd. The DTLS/SRTP context
+        // is preserved (RFC 8842); SRTP re-keying is deferred (session-model.md §7).
+        var offeredUfrag = OfferedIceUfrag(offer);
+        if (ice.RemoteUfrag is { } currentUfrag
+            && offeredUfrag is not null
+            && !string.Equals(currentUfrag, offeredUfrag, StringComparison.Ordinal))
+        {
+            _logger.Log(KeryxLogLevel.Info, "Remote ICE restart detected; regenerating local credentials.");
+            ice.Restart();
+        }
+
         string? ufrag = null;
         string? password = null;
         var routes = new Dictionary<byte, RtpRoute>();
@@ -2039,6 +2122,24 @@ public sealed partial class PeerConnection : IAsyncDisposable
             + $" (rtx pt {negotiatedVideo?.RtxPayloadType?.ToString(CultureInfo.InvariantCulture) ?? "none"}),"
             + $" audio pt {negotiatedAudio?.PayloadType},"
             + $" transport-cc extmap {(transportCcExtensionId?.ToString(CultureInfo.InvariantCulture) ?? "none")}.");
+    }
+
+    /// <summary>
+    /// The <c>a=ice-ufrag</c> a description carries, taken from the first m-section that declares one and
+    /// falling back to the session-level value (RFC 8839). Used to tell an ICE restart re-offer (fresh
+    /// ufrag) from a plain renegotiation (unchanged ufrag).
+    /// </summary>
+    private static string? OfferedIceUfrag(SessionDescription description)
+    {
+        foreach (var media in description.MediaDescriptions)
+        {
+            if (media.IceUfrag is { } ufrag)
+            {
+                return ufrag;
+            }
+        }
+
+        return description.IceUfrag;
     }
 
     private static DtlsRole ToDtlsRole(SdpSetupRole role) => role switch
