@@ -988,7 +988,18 @@ public sealed partial class PeerConnection
             return;
         }
 
-        if (!RtpPacket.TryParse(_rxPlain.AsSpan(0, length), out var packet))
+        ProcessDecryptedRtp(_rxPlain.AsSpan(0, length));
+    }
+
+    /// <summary>
+    /// Drives one already-decrypted RTP packet through the receive path: parse, transport-cc arrival
+    /// recording, mid-first demux, RFC 4588 RTX decapsulation, and delivery. Split out of
+    /// <see cref="HandleRtp"/> so the post-SRTP path can be exercised deterministically by the test
+    /// assembly (via <see cref="DeliverDecryptedRtpForTest"/>) without standing up a transport.
+    /// </summary>
+    private void ProcessDecryptedRtp(ReadOnlySpan<byte> plaintext)
+    {
+        if (!RtpPacket.TryParse(plaintext, out var packet))
         {
             Interlocked.Increment(ref _srtpFailures);
             return;
@@ -1014,12 +1025,34 @@ public sealed partial class PeerConnection
         // so it is not re-NACKed. The raw repair packet is never surfaced to the application handler.
         if (route.IsRtx)
         {
-            HandleInboundRtx(route, packet, _rxPlain.AsSpan(0, length), routes);
+            HandleInboundRtx(route, packet, plaintext, routes);
             return;
         }
 
         DeliverInboundMedia(route, packet, routes);
     }
+
+    /// <summary>
+    /// Test-only seam: feeds an already-decrypted RTP packet through the exact post-SRTP receive path,
+    /// bypassing the SRTP unprotect step so a test can craft hostile packets (e.g. a flood of invented
+    /// SSRCs) without holding the session key. Exposed to the test assembly via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    internal void DeliverDecryptedRtpForTest(ReadOnlySpan<byte> rtpPacket) => ProcessDecryptedRtp(rtpPacket);
+
+    /// <summary>Test-only: number of distinct inbound sources with retained reception statistics.</summary>
+    internal int ReceiveSourceStatCountForTest
+    {
+        get
+        {
+            lock (_receiveStatsLock)
+            {
+                return _receiveStats.Count;
+            }
+        }
+    }
+
+    /// <summary>Test-only: number of distinct inbound sources with a retained receive jitter buffer.</summary>
+    internal int ReceiveStreamCountForTest => _receiveStreams.Count;
 
     /// <summary>
     /// Decapsulates one inbound RFC 4588 RTX packet back to the media packet it repairs and delivers it
@@ -1151,6 +1184,25 @@ public sealed partial class PeerConnection
         // Playout-order delivery: reorder the source through its jitter buffer, then drain every packet
         // that has become releasable and fire the handler for each in sequence order.
         var stream = GetOrCreateReceiveStream(packet.Header.Ssrc);
+        if (stream is null)
+        {
+            // The distinct-source cap is reached: don't allocate another jitter buffer for a source that
+            // may be an SSRC-flood forgery. Deliver this packet in arrival order instead, so a genuine
+            // (if late-appearing) source is not silently dropped, exactly as the buffer-off path does.
+            var arrivalInfo = new RtpPacketInfo(
+                route.Kind == MediaKind.Unknown ? null : route.Mid,
+                route.Kind,
+                payloadType,
+                packet.Header.Ssrc,
+                packet.Header.SequenceNumber,
+                packet.Header.Timestamp,
+                packet.Header.Marker,
+                rid);
+
+            handler(in arrivalInfo, packet.Payload);
+            return;
+        }
+
         if (rid is not null)
         {
             // A layer's SSRC maps to one stable RID (RFC 8852), so caching the last resolved value is
@@ -1168,14 +1220,24 @@ public sealed partial class PeerConnection
         DrainReceiveStream(packet.Header.Ssrc, stream, routes, handler);
     }
 
-    private ReceiveStream GetOrCreateReceiveStream(uint ssrc)
+    private ReceiveStream? GetOrCreateReceiveStream(uint ssrc)
     {
-        if (!_receiveStreams.TryGetValue(ssrc, out var stream))
+        if (_receiveStreams.TryGetValue(ssrc, out var stream))
         {
-            stream = new ReceiveStream(new JitterBuffer(_config.ReceiveJitterBuffer, _config.TimeProvider));
-            _receiveStreams[ssrc] = stream;
+            return stream;
         }
 
+        // Bound the number of per-source jitter buffers so a peer flooding invented SSRCs cannot pin
+        // unbounded memory (each buffer holds a ring of up to Capacity payload slabs). A legitimate
+        // BUNDLE session stays far below the cap; beyond it the caller falls back to arrival-order
+        // delivery for the new source.
+        if (_receiveStreams.Count >= _config.MaxReceiveSources)
+        {
+            return null;
+        }
+
+        stream = new ReceiveStream(new JitterBuffer(_config.ReceiveJitterBuffer, _config.TimeProvider));
+        _receiveStreams[ssrc] = stream;
         return stream;
     }
 
@@ -1362,6 +1424,15 @@ public sealed partial class PeerConnection
         {
             if (!_receiveStats.TryGetValue(ssrc, out var stats))
             {
+                // Bound the source table: a peer authenticated to the SRTP context can invent an SSRC per
+                // packet, and each unseen value would otherwise allocate a reception-statistics record
+                // (and a NACK tracker) that is never evicted. Once the cap is reached, packets from
+                // further sources are still delivered; they simply accrue no retained per-source state.
+                if (_receiveStats.Count >= _config.MaxReceiveSources)
+                {
+                    return;
+                }
+
                 stats = new InboundSourceStats(route.Kind);
                 _receiveStats[ssrc] = stats;
             }

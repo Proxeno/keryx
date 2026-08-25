@@ -272,6 +272,22 @@ public sealed class PeerConnectionConfig
     public ReceiverNackOptions ReceiverNack { get; } = new();
 
     /// <summary>
+    /// Hard cap on the number of distinct inbound synchronisation sources (SSRCs) whose per-source
+    /// receive state Keryx retains: RFC 3550 reception statistics, and — when enabled — a jitter buffer
+    /// and NACK loss detector. Defaults to 256, far above any legitimate BUNDLE session's source count
+    /// (a handful of media and RTX SSRCs per m-section, plus simulcast layers).
+    /// </summary>
+    /// <remarks>
+    /// A peer authenticated to the SRTP context can stamp an arbitrary SSRC on every packet it sends;
+    /// each unseen value would otherwise allocate a fresh statistics record — and, with the jitter buffer
+    /// on, a ring buffer that is never evicted — so a flood of invented SSRCs would pin unbounded memory,
+    /// the RTP analogue of the bounded SCTP reassembly path. Once the cap is reached, packets from further
+    /// sources are still parsed, demultiplexed and delivered to <see cref="PeerConnection.OnRtpPacketReceived"/>
+    /// in arrival order; they simply accrue no retained per-source state. Must be at least one.
+    /// </remarks>
+    public int MaxReceiveSources { get; set; } = 256;
+
+    /// <summary>
     /// A testing and diagnostics seam: called once with the ICE agent's datagram transport, and the
     /// transport it returns is what the connection sends on and receives from. Null (the default)
     /// uses the ICE transport directly.
