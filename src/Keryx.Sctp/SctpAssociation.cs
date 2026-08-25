@@ -2193,7 +2193,6 @@ public sealed class SctpAssociation : IDisposable
                 StartRetransmissionTimer(now);
             }
 
-            var window = Math.Min(_congestionWindow, (long)_peerReceiveWindow);
             foreach (var chunk in NewDataInSendOrder())
             {
                 if (chunk.Transmits > 0 || chunk.Acked || chunk.Abandoned)
@@ -2201,9 +2200,23 @@ public sealed class SctpAssociation : IDisposable
                     continue;
                 }
 
-                if (_flightSize > 0 && _flightSize + chunk.WireSize > window)
+                // Always keep at least one chunk in flight, then honour the two windows separately.
+                // The congestion window may be crossed by a single chunk so the sender can actually
+                // reach it and become cwnd-limited (RFC 4960 §7.2.1 grows cwnd only while it "is being
+                // fully utilized"); without this a cwnd that is not a whole multiple of the chunk wire
+                // size is never reached and slow start never opens. The peer's advertised receive
+                // window is receiver flow control (RFC 4960 §6.1) and is a hard cap: never overshoot it.
+                if (_flightSize > 0)
                 {
-                    break;
+                    if (_flightSize >= _congestionWindow)
+                    {
+                        break;
+                    }
+
+                    if (_flightSize + chunk.WireSize > _peerReceiveWindow)
+                    {
+                        break;
+                    }
                 }
 
                 chunk.Transmits = 1;
