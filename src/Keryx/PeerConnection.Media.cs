@@ -1216,10 +1216,15 @@ public sealed partial class PeerConnection
         var rtxToMedia = Volatile.Read(ref _rtxSsrcToMediaSsrc);
         if (!rtxToMedia.TryGetValue(rtxPacket.Header.Ssrc, out var mediaSsrc))
         {
-            // No FID association for this repair SSRC. A non-simulcast section carries a single media
-            // source, so the last media SSRC learned for the kind is the one being repaired; without
-            // even that, there is no source to attribute the repair to, so drop it rather than guess.
-            var learned = FirstTransceiver(route.Kind)?.Receiver.RemoteSsrc;
+            // No FID association for this repair SSRC — attribute the repair to the media source of the
+            // transceiver the repair route demuxed to. Resolve mid-first (the repair route carries the
+            // m-section's mid, exactly as the media path does), so with several same-kind transceivers the
+            // repair is attributed to the right receiver's learned media SSRC rather than whichever happens
+            // to be first of its kind; fall back to first-of-kind only for the mid-less legacy shape.
+            // Without even that there is no source to attribute the repair to, so drop it rather than guess.
+            var receiver = route.Mid.Length != 0 ? GetTransceiver(route.Mid) : null;
+            receiver ??= FirstTransceiver(route.Kind);
+            var learned = receiver?.Receiver.RemoteSsrc;
 
             if (learned is not { } knownMediaSsrc)
             {

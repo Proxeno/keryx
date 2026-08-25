@@ -32,6 +32,15 @@ public enum RtpForwardResult
 /// desired to active only when the caller offers a packet with <c>canStartLayer</c> set. Until then it
 /// keeps forwarding the active layer so the subscriber's picture never freezes.
 /// </para>
+/// <para>
+/// <b>Retransmission.</b> When constructed with an <see cref="RtpForwarderRtx"/>, the forwarder retains
+/// each rewritten packet and answers a downstream subscriber's NACK for a forwarded sequence number
+/// with an RFC 4588 repair via <see cref="TryRetransmit(ushort, Span{byte}, out int)"/> — the SFU seam
+/// for loss recovery on the packets it forwards, without the app hand-rolling a history. Independently,
+/// <see cref="TryForwardRtx"/> reassembles an inbound RTX packet for a relayed layer (decapsulate the
+/// repair, feed the recovered media packet to the forward path), so an upstream layer's retransmission
+/// is understood end to end.
+/// </para>
 /// <para>Not thread-safe: one forwarder serves one subscriber output and is driven from one send path.</para>
 /// </remarks>
 public sealed class RtpForwarder
@@ -42,6 +51,16 @@ public sealed class RtpForwarder
     private readonly RtpEgressExtensions? _egress;
     private readonly byte[]? _outboundMid;
     private readonly byte[]? _extScratch;
+
+    // Egress retransmission: the send history retains every rewritten packet keyed by its forwarded
+    // sequence number, and the retransmitter answers a downstream NACK out of it on the repair SSRC.
+    // Both are null unless RFC 4588 repair was enabled for the forwarded stream.
+    private readonly RtpSendHistory? _forwardHistory;
+    private readonly RtxRetransmitter? _retransmitter;
+
+    // Ingest RTX reassembly: a scratch buffer the repair packet is decapsulated into before the
+    // recovered media packet is offered to the forward path. Allocated lazily on the first repair.
+    private byte[]? _rtxDecapScratch;
 
     private readonly object _srLock = new();
     private readonly Dictionary<SimulcastLayerId, SenderReportMapping> _senderReports = new();
@@ -75,11 +94,18 @@ public sealed class RtpForwarder
     /// elements and rewrite MID to the subscriber's value. <see langword="null"/> re-emits the header
     /// extensions as received.
     /// </param>
+    /// <param name="rtx">
+    /// Enables RFC 4588 retransmission on the forwarded stream: the forwarder records each rewritten
+    /// packet and answers a downstream NACK with an RTX packet via <see cref="TryRetransmit(ushort, Span{byte}, out int)"/>.
+    /// <see langword="null"/> forwards without a repair stream. Ingest RTX reassembly
+    /// (<see cref="TryForwardRtx"/>) does not require this — it is understood regardless.
+    /// </param>
     public RtpForwarder(
         uint outboundSsrc,
         byte? outboundPayloadType = null,
         uint clockRate = 90000,
-        RtpEgressExtensions? egressExtensions = null)
+        RtpEgressExtensions? egressExtensions = null,
+        RtpForwarderRtx? rtx = null)
     {
         _outboundSsrc = outboundSsrc;
         _outboundPayloadType = outboundPayloadType;
@@ -94,6 +120,19 @@ public sealed class RtpForwarder
             // One RTP header extension block is bounded by the 16-bit word-count field; a subscriber's
             // rewritten block is smaller than the ingest one, so a modest scratch buffer suffices.
             _extScratch = new byte[512];
+        }
+
+        if (rtx is not null)
+        {
+            _forwardHistory = new RtpSendHistory(rtx.MaxPacketSize, rtx.HistoryOptions, rtx.TimeProvider);
+            _retransmitter = new RtxRetransmitter(
+                rtx.Ssrc,
+                rtx.PayloadType,
+                _clockRate,
+                _forwardHistory,
+                rtx.RetransmitOptions,
+                rtx.InitialSequenceNumber,
+                rtx.TimeProvider);
         }
     }
 
@@ -224,6 +263,11 @@ public sealed class RtpForwarder
         payload.CopyTo(destination[written..]);
         bytesWritten = written + payload.Length;
 
+        // Retain the rewritten packet keyed by its forwarded sequence number, so a downstream NACK for
+        // this stream can be answered as an RFC 4588 repair. The OSN of that repair is this forwarded
+        // sequence number, not the upstream one — the subscriber only ever saw the rewritten numbering.
+        _forwardHistory?.Store(outSeq, destination[..bytesWritten]);
+
         if (!_started || IsNewer(outSeq, _highestOutSeq))
         {
             _highestOutSeq = outSeq;
@@ -234,6 +278,154 @@ public sealed class RtpForwarder
         _lastOutTs = outTs;
 
         return RtpForwardResult.Forwarded;
+    }
+
+    /// <summary>True when the forwarded stream answers downstream NACKs with RFC 4588 repairs.</summary>
+    public bool RtxEnabled => _retransmitter is not null;
+
+    /// <summary>The repair stream's SSRC, or <see langword="null"/> when retransmission is disabled.</summary>
+    public uint? RtxSsrc => _retransmitter?.Ssrc;
+
+    /// <summary>The <c>rtx</c> payload type stamped on repairs, or <see langword="null"/> when disabled.</summary>
+    public byte? RtxPayloadType => _retransmitter?.PayloadType;
+
+    /// <summary>
+    /// Largest RTX packet <see cref="TryRetransmit(ushort, Span{byte}, out int)"/> can produce — the
+    /// retained rewritten packet plus the two-octet OSN — or 0 when retransmission is disabled. A repair
+    /// destination must hold this many bytes plus whatever headroom SRTP adds.
+    /// </summary>
+    public int MaxRtxPacketSize => _retransmitter?.MaxPacketSize ?? 0;
+
+    /// <summary>A snapshot of the repair stream's counters, or <see langword="null"/> when disabled.</summary>
+    public RtxStats? RtxStatistics => _retransmitter?.GetStats();
+
+    /// <summary>
+    /// Builds a sender report for the repair stream (RFC 3550 §6.4.1), or <see langword="null"/> when
+    /// retransmission is disabled. The forwarded media stream reports separately.
+    /// </summary>
+    /// <param name="wallClock">The wall-clock instant the report describes.</param>
+    /// <returns>The repair stream's sender report, or null.</returns>
+    public Rtcp.RtcpSenderReport? CreateRtxSenderReport(System.DateTimeOffset wallClock) =>
+        _retransmitter?.CreateSenderReport(wallClock);
+
+    /// <summary>
+    /// Answers a downstream subscriber's NACK for one forwarded packet with an RFC 4588 RTX packet on
+    /// the repair stream's SSRC and payload type. The sequence number is the <em>forwarded</em> one the
+    /// subscriber saw — the rewritten value carried on <see cref="OutboundSsrc"/>, which is also the OSN
+    /// the repair encodes. Never throws for a missing packet; only a destination too small to hold the
+    /// repair throws, as <see cref="RtxRetransmitter"/> does.
+    /// </summary>
+    /// <param name="forwardedSequenceNumber">The forwarded sequence number the NACK reported missing.</param>
+    /// <param name="destination">
+    /// Buffer receiving the RTX packet; must hold <see cref="MaxRtxPacketSize"/> bytes plus SRTP headroom.
+    /// </param>
+    /// <param name="length">On <see cref="RtxRetransmitResult.Retransmitted"/>, the packet's length.</param>
+    /// <returns>
+    /// Whether a repair was produced, and if not, why. <see cref="RtxRetransmitResult.HistoryMiss"/> when
+    /// retransmission is disabled or the packet is no longer retained.
+    /// </returns>
+    public RtxRetransmitResult TryRetransmit(ushort forwardedSequenceNumber, Span<byte> destination, out int length) =>
+        TryRetransmit(forwardedSequenceNumber, 0, 0, destination, out length);
+
+    /// <summary>
+    /// Answers a downstream NACK as <see cref="TryRetransmit(ushort, Span{byte}, out int)"/> does, also
+    /// stamping the transport-wide congestion-control header extension so the repair is visible to the
+    /// subscriber's feedback like any other outbound packet.
+    /// </summary>
+    /// <param name="forwardedSequenceNumber">The forwarded sequence number the NACK reported missing.</param>
+    /// <param name="transportCcExtensionId">The negotiated transport-wide-cc element id (1–14), or 0 for none.</param>
+    /// <param name="transportWideSequenceNumber">The transport-wide sequence number to stamp.</param>
+    /// <param name="destination">Buffer receiving the RTX packet, as above.</param>
+    /// <param name="length">On <see cref="RtxRetransmitResult.Retransmitted"/>, the packet's length.</param>
+    /// <returns>Whether a repair was produced, and if not, why.</returns>
+    public RtxRetransmitResult TryRetransmit(
+        ushort forwardedSequenceNumber,
+        byte transportCcExtensionId,
+        ushort transportWideSequenceNumber,
+        Span<byte> destination,
+        out int length)
+    {
+        length = 0;
+        if (_retransmitter is null)
+        {
+            return RtxRetransmitResult.HistoryMiss;
+        }
+
+        return _retransmitter.TryRetransmit(
+            forwardedSequenceNumber,
+            transportCcExtensionId,
+            transportWideSequenceNumber,
+            destination,
+            out length);
+    }
+
+    /// <summary>
+    /// Reassembles one inbound RFC 4588 RTX packet for a forwarded/simulcast source and offers the
+    /// recovered media packet to the forward path, so a relayed layer's repair is understood end to end:
+    /// the OSN prefix restores the original sequence number, the caller supplies the media SSRC and
+    /// payload type the repair does not carry, and the recovered packet is then rewritten for the
+    /// subscriber exactly as a directly received media packet of the same layer would be. Never throws.
+    /// </summary>
+    /// <param name="classification">
+    /// The repair packet's layer, from <see cref="SimulcastClassifier"/> (its <c>IsRepair</c> is set); the
+    /// recovered media packet is forwarded as that layer.
+    /// </param>
+    /// <param name="rtxPacket">The complete inbound RTX packet, RTP header included.</param>
+    /// <param name="originalMediaSsrc">The repaired media stream's SSRC (from <c>a=ssrc-group:FID</c>).</param>
+    /// <param name="originalPayloadType">The repaired media payload type (the rtx <c>apt</c>).</param>
+    /// <param name="canStartLayer">
+    /// True when the recovered packet begins an independently decodable unit of its layer, so a pending
+    /// switch to that layer may land on it.
+    /// </param>
+    /// <param name="destination">
+    /// Receives the rewritten media packet. Must not overlap <paramref name="rtxPacket"/>.
+    /// </param>
+    /// <param name="bytesWritten">On <see cref="RtpForwardResult.Forwarded"/>, the packet length.</param>
+    /// <returns>
+    /// Whether the recovered packet was forwarded, dropped (not the active layer, or a malformed repair),
+    /// or could not fit.
+    /// </returns>
+    public RtpForwardResult TryForwardRtx(
+        in RtpLayerClassification classification,
+        ReadOnlySpan<byte> rtxPacket,
+        uint originalMediaSsrc,
+        byte originalPayloadType,
+        bool canStartLayer,
+        Span<byte> destination,
+        out int bytesWritten)
+    {
+        bytesWritten = 0;
+
+        if (_rtxDecapScratch is null || _rtxDecapScratch.Length < rtxPacket.Length)
+        {
+            // The recovered packet is never larger than the repair it came from (the OSN prefix replaces,
+            // and is smaller than, nothing it adds), so the repair's own length is a safe upper bound.
+            _rtxDecapScratch = new byte[rtxPacket.Length];
+        }
+
+        if (!RtxPacket.TryDecapsulate(
+                rtxPacket,
+                originalMediaSsrc,
+                originalPayloadType,
+                _rtxDecapScratch,
+                out var recoveredLength,
+                out _)
+            || !RtpHeader.TryParse(_rtxDecapScratch.AsSpan(0, recoveredLength), out var recovered))
+        {
+            return RtpForwardResult.Dropped;
+        }
+
+        var payload = _rtxDecapScratch.AsSpan(recovered.HeaderLength, recoveredLength - recovered.HeaderLength);
+
+        // Offer the recovered packet as ordinary media of the same layer: clear the repair flag and carry
+        // the media SSRC, so the forward path rewrites it onto the outbound stream like a direct arrival.
+        var mediaClassification = new RtpLayerClassification(
+            classification.LayerId,
+            originalMediaSsrc,
+            IsRepair: false,
+            classification.Source);
+
+        return TryForward(in mediaClassification, in recovered, payload, canStartLayer, destination, out bytesWritten);
     }
 
     private void InitializeSegment(in RtpHeader header, SimulcastLayerId previousLayer, SimulcastLayerId newLayer)
