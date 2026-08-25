@@ -175,6 +175,11 @@ public sealed class TurnTcpTests
 
         toPeer.Should().Equal(42);
         server.ChannelDataFromClient.Should().Be(0);
+
+        // The peer's receive only proves the socket send happened; RelayedToPeer is incremented
+        // right after that send, so it can lag the peer's own receive by a scheduling hair. Wait
+        // for it rather than assuming it already landed.
+        (await TestTimeout.WaitForCountAsync(() => server.RelayedToPeer, 1)).Should().BeTrue();
         server.RelayedToPeer.Should().Be(1);
     }
 
