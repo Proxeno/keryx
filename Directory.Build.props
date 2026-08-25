@@ -11,9 +11,8 @@
     <IsPackable>false</IsPackable>
     <PackageId>Proxeno.$(MSBuildProjectName)</PackageId>
     <!-- Default package version. The pack workflow overrides this with the git tag at release time
-         (see .github/workflows/pack.yml). 0.3.2 completes the security-review follow-ups on top of
-         0.3.1: ICE mDNS/candidate caps, DTLS epoch-0 malformed-body discard, SCTP TSN-index + state
-         guards, and an H.264 depacketizer bound. -->
-    <VersionPrefix>0.3.2</VersionPrefix>
+         (see .github/workflows/pack.yml). 0.3.3 adds TURN relay over TCP and TLS (RFC 5766), wired
+         into ICE relay gathering as an additive, non-breaking option on top of 0.3.2. -->
+    <VersionPrefix>0.3.3</VersionPrefix>
   </PropertyGroup>
 </Project>
