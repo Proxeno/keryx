@@ -54,6 +54,14 @@ public enum SdpType
 
     /// <summary>An answer to a previously received offer.</summary>
     Answer,
+
+    /// <summary>
+    /// A rollback (JSEP §4.1.8.2, <c>RTCSdpType</c> <c>"rollback"</c>): discards a proposed-but-not-yet-
+    /// answered remote offer and returns <see cref="SignalingState"/> to <see cref="SignalingState.Stable"/>.
+    /// Passed to <see cref="PeerConnection.SetRemoteDescriptionAsync"/> to roll back a remote offer (a local
+    /// offer is rolled back with <see cref="PeerConnection.Rollback"/>); the SDP text is ignored.
+    /// </summary>
+    Rollback,
 }
 
 /// <summary>The kind of media an m-section carries.</summary>

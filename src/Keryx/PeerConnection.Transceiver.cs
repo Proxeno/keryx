@@ -283,6 +283,59 @@ public sealed partial class PeerConnection
     /// </summary>
     private RtpTransceiver[] SnapshotTransceivers() => _transceiverSnapshot;
 
+    /// <summary>
+    /// Restores the transceiver set to exactly the members captured before a rolled-back offer
+    /// (session-model.md §4.4): any transceiver auto-created by that offer is dropped (it is absent from
+    /// <paramref name="snapshot"/>), and every surviving member's provisional mid, direction and
+    /// pending-negotiation flag are reverted to their pre-offer values. The live <see cref="_transceivers"/>
+    /// list is mutated in place (never reassigned) so the public <see cref="Transceivers"/> view stays
+    /// valid, then the lock-free snapshot, first-of-kind caches and local-SSRC ownership map are rebuilt
+    /// from it. Called while holding the lock.
+    /// </summary>
+    private void RestoreTransceiversLocked(List<TransceiverSnapshot> snapshot)
+    {
+        _transceivers.Clear();
+        foreach (var state in snapshot)
+        {
+            var transceiver = state.Transceiver;
+            transceiver.Mid = state.Mid;
+            transceiver.Direction = state.Direction;
+            transceiver.NegotiationPending = state.NegotiationPending;
+            _transceivers.Add(transceiver);
+        }
+
+        // Republish the lock-free snapshot the receive path reads, and rebuild the first-of-kind caches and
+        // the local-SSRC ownership map from the restored set (a dropped auto-created transceiver's SSRCs
+        // must no longer resolve to a sender).
+        _transceiverSnapshot = [.. _transceivers];
+        _firstVideoTransceiver = null;
+        _firstAudioTransceiver = null;
+        var owners = new Dictionary<uint, LocalSsrcOwner>();
+        foreach (var transceiver in _transceivers)
+        {
+            switch (transceiver.Kind)
+            {
+                case MediaKind.Video:
+                    _firstVideoTransceiver ??= transceiver;
+                    break;
+                case MediaKind.Audio:
+                    _firstAudioTransceiver ??= transceiver;
+                    break;
+                default:
+                    break;
+            }
+
+            var sender = transceiver.Sender;
+            owners[sender.Ssrc] = new LocalSsrcOwner(sender, false);
+            if (sender.RtxSsrcRaw != 0)
+            {
+                owners[sender.RtxSsrcRaw] = new LocalSsrcOwner(sender, true);
+            }
+        }
+
+        _localSsrcOwners = owners;
+    }
+
     /// <summary>The first transceiver of <paramref name="kind"/>, or null when none is of that kind.</summary>
     private RtpTransceiver? FirstTransceiver(MediaKind kind) => kind switch
     {
