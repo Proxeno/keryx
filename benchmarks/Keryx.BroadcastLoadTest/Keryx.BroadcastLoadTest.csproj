@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Server GC is the right mode for a many-core broadcast SFU, and it is what the scale figures
+         should reflect. This is a console app, so `dotnet test` never runs it: it stays out of CI. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Keryx.Core/Keryx.Core.csproj" />
+    <ProjectReference Include="../../src/Keryx.Srtp/Keryx.Srtp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Rtp/Keryx.Rtp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Sdp/Keryx.Sdp.csproj" />
+    <ProjectReference Include="../../src/Keryx.Ice/Keryx.Ice.csproj" />
+    <ProjectReference Include="../../src/Keryx/Keryx.csproj" />
+    <ProjectReference Include="../../src/Keryx.Broadcast/Keryx.Broadcast.csproj" />
+  </ItemGroup>
+</Project>
