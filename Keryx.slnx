@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Keryx.Broadcast/Keryx.Broadcast.csproj" />
     <Project Path="src/Keryx.Core/Keryx.Core.csproj" />
     <Project Path="src/Keryx.Dtls/Keryx.Dtls.csproj" />
     <Project Path="src/Keryx.Ice/Keryx.Ice.csproj" />

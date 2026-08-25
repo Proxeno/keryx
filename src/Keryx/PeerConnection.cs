@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Security.Cryptography;
 using Keryx.Core;
 using Keryx.Dtls;
@@ -796,6 +797,34 @@ public sealed partial class PeerConnection : IAsyncDisposable
     }
 
     /// <summary>
+    /// Pushes one inbound datagram, already demultiplexed to this connection by a shared-socket owner
+    /// (a <c>BroadcastEndpoint</c>), into the connection's endpoint-session ICE agent
+    /// (<c>broadcast-scale.md</c> §2). Only meaningful when the connection was configured with
+    /// <see cref="PeerConnectionConfig.IceExternalTransport"/>; a datagram arriving before the ICE
+    /// agent exists (before the first offer/answer) is dropped, exactly as an early UDP datagram would
+    /// be on the self-owned path.
+    /// </summary>
+    /// <param name="datagram">The datagram; valid only for the duration of the call.</param>
+    /// <param name="from">The remote transport address it arrived from.</param>
+    public void InjectIceDatagram(ReadOnlySpan<byte> datagram, IPEndPoint from)
+    {
+        IceAgent? ice;
+        lock (_lock)
+        {
+            if (_closed != 0)
+            {
+                return;
+            }
+
+            ice = _ice;
+        }
+
+        // The agent is built lazily on the first offer/answer; a viewer's STUN check that races ahead
+        // of it is simply dropped and retransmitted, so there is nothing to do yet.
+        ice?.InjectDatagram(datagram, from);
+    }
+
+    /// <summary>
     /// Completes when the connection reaches <see cref="PeerConnectionState.Connected"/>, or returns
     /// false when it fails, closes, or <paramref name="timeout"/> elapses first.
     /// </summary>
@@ -1068,6 +1097,9 @@ public sealed partial class PeerConnection : IAsyncDisposable
             Logger = _logger,
             RelayOnly = _config.RelayOnly,
             GatherTcpCandidates = _config.GatherTcpCandidates,
+            ExternalTransport = _config.IceExternalTransport,
+            LocalUfrag = _config.LocalIceUfrag,
+            LocalPassword = _config.LocalIcePassword,
         };
 
         foreach (var server in _config.StunServers)

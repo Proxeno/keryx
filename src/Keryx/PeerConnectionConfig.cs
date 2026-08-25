@@ -469,6 +469,26 @@ public sealed class PeerConnectionConfig
     /// </remarks>
     public Func<IDatagramTransport, IDatagramTransport>? TransportInterceptor { get; set; }
 
+    /// <summary>
+    /// When set, the connection's ICE agent runs in endpoint-session mode over this caller-provided
+    /// datagram seam instead of binding its own UDP socket — the shared-socket broadcast fan-out shape
+    /// of <c>broadcast-scale.md</c> §2. A <c>BroadcastEndpoint</c> supplies it so many viewer
+    /// connections ride one socket, demuxed by 5-tuple. Null (the default) keeps the ordinary
+    /// self-owned-socket path. When set, <see cref="LocalIceUfrag"/> is normally supplied too so the
+    /// owner can pre-register the demux mapping before the viewer's first STUN check arrives.
+    /// </summary>
+    public Keryx.Ice.IceExternalTransportOptions? IceExternalTransport { get; set; }
+
+    /// <summary>
+    /// Overrides the local ICE <c>a=ice-ufrag</c>; generated when null. Set together with
+    /// <see cref="IceExternalTransport"/> so a broadcast endpoint can bind the viewer's 5-tuple to
+    /// this session by the ufrag its first STUN check carries.
+    /// </summary>
+    public string? LocalIceUfrag { get; set; }
+
+    /// <summary>Overrides the local ICE <c>a=ice-pwd</c>; generated when null.</summary>
+    public string? LocalIcePassword { get; set; }
+
     /// <summary>The <c>a=mid</c> of the video m-section.</summary>
     public string VideoMid { get; set; } = "0";
 
