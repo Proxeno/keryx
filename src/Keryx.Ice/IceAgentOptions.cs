@@ -192,6 +192,18 @@ public sealed class IceAgentOptions
     /// </summary>
     public bool GatherTcpCandidates { get; set; }
 
+    /// <summary>
+    /// The greatest number of ICE-TCP connections held at once - those accepted on the passive
+    /// listener plus any this agent dialed. When <see cref="GatherTcpCandidates"/> is set the passive
+    /// listener accepts inbound TCP connections before any ICE connectivity check has validated them,
+    /// and merely connecting to the advertised passive candidate needs no ICE credentials, so an
+    /// off-path party who can reach the listener could otherwise open connections without bound - each
+    /// one a socket, a receive task and a growable reassembly buffer, none of them ever timed out.
+    /// Beyond this cap a freshly accepted (or dialed) connection is closed immediately instead of being
+    /// tracked. The default dwarfs any legitimate session, which holds one connection per TCP pair.
+    /// </summary>
+    public int MaxTcpConnections { get; set; } = 256;
+
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }
 
@@ -237,6 +249,7 @@ public sealed class IceAgentOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentMdnsResolutions, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxPendingMdnsResolutions, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxRemoteCandidates, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxTcpConnections, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(MdnsNegativeCacheDuration.Ticks);
         ArgumentOutOfRangeException.ThrowIfNegative(MinPort);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxPort, 65535);
