@@ -138,6 +138,22 @@ public sealed class IceAgentOptions
     /// </summary>
     public int MaxRemoteCandidates { get; set; } = 100;
 
+    /// <summary>
+    /// Whether an inbound datagram that demultiplexes as non-STUN (RFC 7983: DTLS, RTP or RTCP) must
+    /// come from the selected pair's remote transport address once a pair has been selected, before
+    /// it is handed to <see cref="IDatagramTransport.OnReceived"/>. DTLS and SRTP already
+    /// authenticate their own traffic, so this is defense-in-depth - the same shape of check
+    /// libwebrtc applies - not the only line: it cheaply drops UDP an off-path attacker injects at
+    /// the socket before it ever reaches those layers. It has no effect before any pair is selected,
+    /// when several candidate sources are legitimately still in play (RFC 8445 section 7.2), and it
+    /// is re-evaluated against the current selection on every datagram, so peer-reflexive discovery,
+    /// renomination and failover to a new pair all keep working as the selection moves. A relayed
+    /// pair's remote address is the far side's relay - the value the selected pair already carries -
+    /// so relayed traffic validates the same way as direct traffic. On by default; set false only if
+    /// this ever rejects a legitimate path.
+    /// </summary>
+    public bool StrictInboundSourceValidation { get; set; } = true;
+
     /// <summary>Diagnostics sink; <see cref="NullLogger"/> when null.</summary>
     public IKeryxLogger? Logger { get; set; }
 

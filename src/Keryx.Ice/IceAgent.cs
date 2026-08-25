@@ -28,7 +28,12 @@ namespace Keryx.Ice;
 /// start with 20-63, RTP/RTCP with 128-191) is handed straight to
 /// <see cref="IDatagramTransport.OnReceived"/> on <see cref="Transport"/>, from the very first
 /// packet - nothing is buffered until a pair is nominated, because DTLS can arrive immediately
-/// after the peer's first successful check.</para>
+/// after the peer's first successful check. Once a pair has been selected,
+/// <see cref="IceAgentOptions.StrictInboundSourceValidation"/> (on by default) additionally requires
+/// such a datagram's source to match that pair's remote endpoint before it is surfaced - an
+/// off-path attacker who can put UDP on the socket is not on that pair's path and is dropped here,
+/// before DTLS or SRTP ever see the datagram. This is defense-in-depth, not authentication: DTLS and
+/// SRTP validate their own traffic regardless.</para>
 /// <para><b>Relayed candidates.</b> Each configured TURN server gets an allocation made over this
 /// same socket, so the relayed candidate's base is the socket and its <c>raddr</c>/<c>rport</c> are
 /// the reflexive address the TURN server observed (RFC 8445 section 5.1.1.2). Checks and media on a
@@ -1126,9 +1131,13 @@ public sealed class IceAgent : IDisposable
         {
             HandleStun(datagram, peer, candidate);
         }
-        else
+        else if (IsAcceptableInboundSource(peer))
         {
             _transport.Raise(datagram);
+        }
+        else
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Dropping relayed datagram from {peer}: not the selected pair's remote endpoint.");
         }
     }
 
@@ -1218,15 +1227,56 @@ public sealed class IceAgent : IDisposable
             {
                 HandleStun(datagram, from, viaRelay: null);
             }
-            else
+            else if (IsAcceptableInboundSource(from))
             {
                 // RFC 7983 demultiplexing: everything that is not STUN belongs to the layer above
                 // and must be surfaced immediately, even before nomination completes.
                 _transport.Raise(datagram);
             }
+            else
+            {
+                _logger.Log(KeryxLogLevel.Warning, $"Dropping non-STUN datagram from {from}: not the selected pair's remote endpoint.");
+            }
 
             DrainEvents();
         }
+    }
+
+    /// <summary>
+    /// Defense-in-depth source check for a datagram already classified as non-STUN (DTLS/RTP/RTCP):
+    /// with <see cref="IceAgentOptions.StrictInboundSourceValidation"/> on, once a pair has been
+    /// selected the datagram must come from that pair's remote endpoint. DTLS and SRTP authenticate
+    /// their own traffic regardless, so this only cheaply rejects UDP an off-path attacker injects at
+    /// the socket before it reaches those layers - it is not the security boundary.
+    /// </summary>
+    private bool IsAcceptableInboundSource(IPEndPoint from)
+    {
+        if (!_options.StrictInboundSourceValidation)
+        {
+            return true;
+        }
+
+        IceCandidatePair? selected;
+        lock (_lock)
+        {
+            selected = _selected;
+        }
+
+        // Before any pair is selected there is no ground truth to check against, and several
+        // candidate sources are legitimately in play while checks are still running (RFC 8445
+        // section 7.2) - including peer-reflexive discovery. Re-reading _selected fresh on every
+        // datagram, rather than caching it, means a later pair change (renomination, TURN failover)
+        // takes effect on the very next datagram.
+        if (selected is null)
+        {
+            return true;
+        }
+
+        // RemoteEndPoint is the remote candidate's own advertised transport address (RFC 8445
+        // section 5.1): for a peer relaying through their own TURN server that is the relay's
+        // address, not their host address, so relayed traffic is validated exactly like direct
+        // traffic with no relay-specific handling needed here.
+        return from.Equals(selected.RemoteEndPoint);
     }
 
     private bool TryHandleTurn(ReadOnlySpan<byte> datagram, IPEndPoint from)
