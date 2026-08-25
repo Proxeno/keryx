@@ -2,8 +2,11 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using Keryx;
 using Keryx.Core;
+using Keryx.Rtp;
+using Keryx.Rtp.Simulcast;
 using Keryx.ScaleHarness;
 using Keryx.Srtp;
 
@@ -16,7 +19,7 @@ using Keryx.Srtp;
 var duration = TimeSpan.FromSeconds(ArgValue(args, "--duration", 5));
 var profileName = ArgString(args, "--profile", "AeadAes128Gcm");
 var profile = ResolveProfile(profileName);
-var arms = ArgList(args, "--arms", [1, 2, 3, 4]);
+var arms = ArgList(args, "--arms", [1, 2, 3, 4, 5]);
 var cores = Environment.ProcessorCount;
 
 Console.WriteLine("=================================================================");
@@ -47,6 +50,11 @@ if (arms.Contains(3))
 if (arms.Contains(4))
 {
     SendToArm(duration);
+}
+
+if (arms.Contains(5))
+{
+    BroadcastFanoutArm(profile, duration, cores);
 }
 
 Console.WriteLine("Done.");
@@ -336,12 +344,131 @@ static void SendToArm(TimeSpan duration)
 }
 
 // -------------------------------------------------------------------------------------------------
+// Arm 5 — parallel broadcast fan-out (production BroadcastFanout): one ingest packet fanned out to a
+// fixed subscriber set, rewritten + SRTP-encrypted per subscriber across a worker pool. Sweep the
+// worker count and report delivered pkt/s and scaling vs one core — the production analogue of the
+// spike's Arm A, now going through RtpForwarder.TryForward + per-subscriber SrtpEncryptContext.
+// -------------------------------------------------------------------------------------------------
+static void BroadcastFanoutArm(SrtpProtectionProfile profile, TimeSpan duration, int cores)
+{
+    var subscribers = (int)ArgValue(Environment.GetCommandLineArgs(), "--fanout-subs", 1024);
+
+    Console.WriteLine("-----------------------------------------------------------------");
+    Console.WriteLine(" Arm 5: parallel broadcast fan-out (production BroadcastFanout)");
+    Console.WriteLine("-----------------------------------------------------------------");
+    Console.WriteLine($"  One ingest packet -> {subscribers:N0} subscribers (RtpForwarder rewrite +");
+    Console.WriteLine("  per-subscriber SRTP encrypt), fanned out across a worker pool. Sweep");
+    Console.WriteLine("  worker count -> delivered pkt/s.");
+    Console.WriteLine();
+
+    double singleCorePps = 0;
+    Console.WriteLine("   workers |  delivered pkt/s |   pkt/s/core |  scaling vs 1 core");
+    Console.WriteLine("   --------+------------------+--------------+-------------------");
+    foreach (var w in WorkerWidths(cores))
+    {
+        var pps = RunBroadcastFanout(w, subscribers, duration, profile);
+        if (w == 1)
+        {
+            singleCorePps = pps;
+        }
+
+        var perCore = pps / w;
+        var scaling = singleCorePps > 0 ? pps / (singleCorePps * w) : 1.0;
+        Console.WriteLine($"   {w,7} | {pps,16:N0} | {perCore,12:N0} | {scaling * 100,6:F1}% of linear");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"  720p subscribers @300 pps sustained at {cores} workers: computed from the top row above.");
+    Console.WriteLine();
+}
+
+static double RunBroadcastFanout(int workers, int subscriberCount, TimeSpan duration, SrtpProtectionProfile profile)
+{
+    var subscribers = BuildFanoutSubscribers(subscriberCount, profile);
+    try
+    {
+        var fanout = new BroadcastFanout(maxDegreeOfParallelism: workers, parallelThreshold: 1);
+        var classification = new RtpLayerClassification(
+            SimulcastLayerId.Parse("hi"),
+            FanoutIngest.UpstreamSsrc,
+            IsRepair: false,
+            RtpLayerClassificationSource.RidExtension);
+
+        var packet = FanoutIngest.Build();
+
+        // Warm: the first packet is the keyframe that promotes every forwarder's layer to active.
+        FanoutIngest.SetSequenceAndTimestamp(packet, sequenceNumber: 0, timestamp: 0);
+        fanout.Forward(in classification, packet, canStartLayer: true, subscribers);
+
+        var durationTicks = (long)(duration.TotalSeconds * Stopwatch.Frequency);
+        var end = Stopwatch.GetTimestamp() + durationTicks;
+        var start = Stopwatch.GetTimestamp();
+        long delivered = 0;
+        ushort seq = 1;
+        uint ts = 3000;
+        while (Stopwatch.GetTimestamp() < end)
+        {
+            for (var i = 0; i < 64; i++)
+            {
+                FanoutIngest.SetSequenceAndTimestamp(packet, seq++, ts);
+                ts += 3000;
+                delivered += fanout.Forward(in classification, packet, canStartLayer: false, subscribers);
+            }
+        }
+
+        var elapsed = Stopwatch.GetElapsedTime(start);
+        return delivered / elapsed.TotalSeconds;
+    }
+    finally
+    {
+        foreach (var s in subscribers)
+        {
+            s.Dispose();
+        }
+    }
+}
+
+static List<BroadcastSubscriber> BuildFanoutSubscribers(int count, SrtpProtectionProfile profile)
+{
+    var subscribers = new List<BroadcastSubscriber>(count);
+    for (var i = 0; i < count; i++)
+    {
+        var forwarder = new RtpForwarder(0xA000_0000u + (uint)i);
+        forwarder.SelectLayer(SimulcastLayerId.Parse("hi"));
+
+        var key = new byte[profile.MasterKeyLength];
+        var salt = new byte[profile.MasterSaltLength];
+        RandomNumberGenerator.Fill(key);
+        RandomNumberGenerator.Fill(salt);
+        var srtp = new SrtpEncryptContext(profile, new SrtpSessionKeys(key, salt));
+
+        var endpoint = new IPEndPoint(IPAddress.Loopback, 40000 + (i % 20000));
+        subscribers.Add(new BroadcastSubscriber(forwarder, srtp, endpoint));
+    }
+
+    return subscribers;
+}
+
+// -------------------------------------------------------------------------------------------------
 // Helpers.
 // -------------------------------------------------------------------------------------------------
 static double RuntimeGb()
 {
     var info = GC.GetGCMemoryInfo();
     return info.TotalAvailableMemoryBytes / (1024.0 * 1024 * 1024);
+}
+
+// Worker-count sweep: 1, 2, 4, ... up to the core count, always including the core count itself.
+static int[] WorkerWidths(int cores)
+{
+    var widths = new List<int>();
+    for (var w = 1; w < cores; w *= 2)
+    {
+        widths.Add(w);
+    }
+
+    widths.Add(cores);
+    return [.. widths];
 }
 
 static SrtpProtectionProfile ResolveProfile(string name) => name switch
@@ -385,6 +512,29 @@ static int[] ArgList(string[] args, string name, int[] fallback)
     }
 
     return result.Count > 0 ? result.ToArray() : fallback;
+}
+
+/// <summary>The single ingest packet Arm 5 fans out, as raw RTP bytes with a mutable seq/timestamp.</summary>
+internal static class FanoutIngest
+{
+    public const uint UpstreamSsrc = 0x1000_0000u;
+
+    /// <summary>Builds the ingest packet: a fixed 12-byte RTP header (no CSRC/extension) plus payload.</summary>
+    public static byte[] Build()
+    {
+        var header = Ingest.Header(UpstreamSsrc, sequenceNumber: 0, timestamp: 0);
+        var buffer = new byte[header.HeaderLength + Ingest.Payload.Length];
+        var written = header.WriteTo(buffer);
+        Ingest.Payload.CopyTo(buffer.AsSpan(written));
+        return buffer;
+    }
+
+    /// <summary>Overwrites the sequence number (bytes 2-3) and timestamp (bytes 4-7), big-endian.</summary>
+    public static void SetSequenceAndTimestamp(byte[] packet, ushort sequenceNumber, uint timestamp)
+    {
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), sequenceNumber);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(4), timestamp);
+    }
 }
 
 /// <summary>A minimal one-audio/one-video BUNDLE offer the footprint arm applies to each PeerConnection.</summary>
