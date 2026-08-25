@@ -10,5 +10,8 @@
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <IsPackable>false</IsPackable>
     <PackageId>Proxeno.$(MSBuildProjectName)</PackageId>
+    <!-- Default package version. The pack workflow overrides this with the git tag at release time
+         (see .github/workflows/pack.yml); PR 3 ships the additive public transceiver API as 0.3.0. -->
+    <VersionPrefix>0.3.0</VersionPrefix>
   </PropertyGroup>
 </Project>

@@ -1,0 +1,204 @@
+using Keryx.Sdp;
+
+namespace Keryx;
+
+/// <summary>
+/// One RTP transceiver: an ordered media object with its own mid, direction, negotiated codec and
+/// SSRC (session-model.md §2.1). Everything a <see cref="PeerConnection"/> sends and receives on an RTP
+/// m-line is keyed by a transceiver; the data channel section is not a transceiver.
+/// </summary>
+/// <remarks>
+/// Obtain one from <see cref="PeerConnection.AddTransceiver(MediaKind, MediaDirection, RtpTransceiverInit?)"/>
+/// or <see cref="PeerConnection.AddTrack(MediaKind, System.Collections.Generic.IReadOnlyList{SdpCodec})"/>,
+/// enumerate the set with <see cref="PeerConnection.Transceivers"/>, or receive one auto-created for an
+/// offered m-line through <see cref="PeerConnection.OnTransceiver"/>. In this release transceivers are
+/// added before the first negotiation (matching both shipping consumers); renegotiation to add or
+/// remove them mid-session is a later feature.
+/// </remarks>
+public sealed class RtpTransceiver
+{
+    internal RtpTransceiver(
+        MediaKind kind,
+        MediaDirection direction,
+        RtpSender sender,
+        RtpReceiver receiver,
+        string? mid)
+    {
+        Kind = kind;
+        Direction = direction;
+        Sender = sender;
+        Receiver = receiver;
+        Mid = mid;
+    }
+
+    /// <summary>The negotiated <c>a=mid</c>, or <see langword="null"/> until the first offer/answer assigns one.</summary>
+    public string? Mid { get; internal set; }
+
+    /// <summary>audio or video. Fixed at creation; a transceiver never changes kind.</summary>
+    public MediaKind Kind { get; }
+
+    /// <summary>The direction the application wants, settable before the next negotiation.</summary>
+    public MediaDirection Direction { get; set; }
+
+    /// <summary>
+    /// The direction actually negotiated (RFC 8829), <see langword="null"/> before negotiation settles
+    /// — and still <see langword="null"/> when the answer rejects the m-line (no common codec).
+    /// </summary>
+    public MediaDirection? CurrentDirection { get; internal set; }
+
+    /// <summary>The send half of this transceiver.</summary>
+    public RtpSender Sender { get; }
+
+    /// <summary>The receive half of this transceiver.</summary>
+    public RtpReceiver Receiver { get; }
+
+    /// <summary>The primary codec negotiated for this m-line, <see langword="null"/> before it settles.</summary>
+    public NegotiatedCodec? NegotiatedCodec { get; internal set; }
+
+    // Stopping a transceiver (rejected port-0 re-emission) is deliberately not exposed in 0.3.0: it
+    // needs the renegotiation machinery a later release adds, so the public surface carries no Stop() /
+    // Stopped it cannot honour. This internal flag is always false today and lets the binding logic that
+    // will consult it in a later PR compile unchanged; reintroducing the public members then is additive.
+    internal bool Stopped => false;
+
+    /// <summary>The per-transceiver codec preference list used when THIS side offers, or empty to fall
+    /// back to the connection's per-kind codec config.</summary>
+    internal IReadOnlyList<SdpCodec> OfferCodecs { get; set; } = [];
+
+    /// <summary>Whether an RFC 4588 rtx codec is offered for this (video) transceiver when THIS side offers.</summary>
+    internal bool EnableRetransmissionOnOffer { get; set; }
+
+    /// <summary>
+    /// When true, this transceiver keeps its <see cref="Direction"/> when it binds to a remote offer's
+    /// m-line; when false (the internally built legacy transceivers and auto-created ones), binding sets
+    /// the complement-of-offered default (session-model.md §3.2).
+    /// </summary>
+    internal bool PreserveDirectionOnBind { get; init; }
+}
+
+/// <summary>
+/// The send half of a transceiver (session-model.md §2.1): the local SSRCs it owns, the negotiated
+/// send codec, and the frame/forward entry points. Implements <see cref="IRtpForwarder"/> so an SFU
+/// fan-out loop can hold the sender directly. Every member is safe on the hot path — the send entry
+/// points take the connection's send lock, check SRTP readiness, and return 0/false rather than
+/// throwing when the connection is not yet ready.
+/// </summary>
+public sealed class RtpSender : IRtpForwarder
+{
+    private readonly PeerConnection _owner;
+
+    internal RtpSender(PeerConnection owner, MediaKind kind, uint ssrc, uint rtxSsrc, string trackId)
+    {
+        _owner = owner;
+        Kind = kind;
+        Ssrc = ssrc;
+        RtxSsrcRaw = rtxSsrc;
+        TrackId = trackId;
+    }
+
+    /// <summary>The media kind this sender emits.</summary>
+    public MediaKind Kind { get; }
+
+    /// <summary>The local SSRC this sender owns; stable for the transceiver's life.</summary>
+    public uint Ssrc { get; }
+
+    /// <summary>
+    /// The RFC 4588 rtx repair SSRC this sender owns. A video sender is allocated one at creation (so
+    /// this is non-null for video whether or not rtx is ultimately negotiated — read
+    /// <see cref="RtxPayloadType"/> to learn whether a repair codec was kept); <see langword="null"/>
+    /// for audio, which never uses RTX.
+    /// </summary>
+    public uint? RtxSsrc => RtxSsrcRaw == 0 ? null : RtxSsrcRaw;
+
+    /// <summary>The negotiated send payload type, <see langword="null"/> before negotiation settles.</summary>
+    public byte? PayloadType => Negotiated?.PayloadType;
+
+    /// <summary>The negotiated rtx payload type, <see langword="null"/> when the peer kept no repair codec.</summary>
+    public byte? RtxPayloadType => Negotiated?.RtxPayloadType;
+
+    /// <summary>The raw repair SSRC (0 when none), for the internal SDP/RTX wiring.</summary>
+    internal uint RtxSsrcRaw { get; }
+
+    /// <summary>The msid track id this sender publishes.</summary>
+    internal string TrackId { get; }
+
+    /// <summary>What negotiation settled on for this sender, <see langword="null"/> before it settles.</summary>
+    internal PeerConnection.NegotiatedTrack? Negotiated { get; set; }
+
+    /// <summary>The live wire sender, <see langword="null"/> until the connection driver builds it.</summary>
+    internal PeerConnection.TrackSender? Track { get; set; }
+
+    /// <summary>The last reception-report-derived outbound link-quality snapshot for this stream.</summary>
+    internal volatile OutboundStreamQuality? Quality;
+
+    /// <summary>
+    /// Packetizes one codec frame (an H.264 Annex B access unit, one Opus packet, …) and sends it over
+    /// SRTP on this sender's SSRC.
+    /// </summary>
+    /// <param name="frame">The codec frame to packetize and send.</param>
+    /// <param name="rtpTimestamp">The presentation timestamp in the codec's clock rate.</param>
+    /// <returns>
+    /// The number of RTP packets sent, or 0 when the connection is not yet
+    /// <see cref="PeerConnectionState.Connected"/> or no send codec was negotiated for this transceiver.
+    /// </returns>
+    public int SendFrame(ReadOnlySpan<byte> frame, uint rtpTimestamp) =>
+        _owner.SendFrameOnSender(this, frame, rtpTimestamp);
+
+    /// <summary>
+    /// Forwards one already-packetized RTP payload verbatim onto this sender's SSRC and sequence space
+    /// — the SFU subscriber-egress path. See <see cref="PeerConnection.TryForwardRtp"/> for the exact
+    /// semantics; this never throws and returns false when the sender is not ready.
+    /// </summary>
+    /// <param name="payload">The RTP payload, written verbatim; never re-packetized.</param>
+    /// <param name="rtpTimestamp">The RTP timestamp to stamp on the packet.</param>
+    /// <param name="marker">The marker bit.</param>
+    /// <param name="payloadType">The payload type this subscriber negotiated.</param>
+    /// <returns>True when the packet reached the send path; false when the sender is not ready.</returns>
+    public bool TryForwardRtp(ReadOnlySpan<byte> payload, uint rtpTimestamp, bool marker, byte payloadType) =>
+        _owner.ForwardRtpOnSender(this, payload, rtpTimestamp, marker, payloadType);
+}
+
+/// <summary>
+/// The receive half of a transceiver (session-model.md §2.1): the remote sender's SSRC learned from
+/// inbound RTP, and the receive payload types negotiated for this m-line.
+/// </summary>
+public sealed class RtpReceiver
+{
+    private volatile object? _remoteSsrc;
+
+    /// <summary>The remote sender's SSRC, learned from inbound RTP; <see langword="null"/> until one arrives.</summary>
+    public uint? Ssrc => (uint?)_remoteSsrc;
+
+    /// <summary>The negotiated receive payload type(s) for this m-line.</summary>
+    public IReadOnlyList<byte> PayloadTypes { get; internal set; } = [];
+
+    /// <summary>The last demultiplexed remote SSRC snapshot; a single volatile reference write/read, no lock.</summary>
+    internal uint? RemoteSsrc
+    {
+        get => (uint?)_remoteSsrc;
+        set => _remoteSsrc = value;
+    }
+}
+
+/// <summary>
+/// Optional initialization for <see cref="PeerConnection.AddTransceiver(MediaKind, MediaDirection, RtpTransceiverInit?)"/>
+/// (session-model.md §2.2).
+/// </summary>
+public sealed class RtpTransceiverInit
+{
+    /// <summary>Per-transceiver codec preference list. Empty falls back to the connection's per-kind config.</summary>
+    public IList<SdpCodec> Codecs { get; } = new List<SdpCodec>();
+
+    /// <summary>
+    /// The preferred mid to use when THIS side builds the offer (for example the legacy <c>"0"</c>).
+    /// Ignored when binding to a remote offer's m-line, whose mid always wins.
+    /// </summary>
+    public string? Mid { get; set; }
+
+    /// <summary>
+    /// Whether to offer an RFC 4588 rtx codec for this (video) transceiver, or <see langword="null"/>
+    /// (the default) to inherit <see cref="PeerConnectionConfig.EnableRetransmission"/>. Ignored for
+    /// audio, which does not use RTX.
+    /// </summary>
+    public bool? EnableRetransmission { get; set; }
+}
