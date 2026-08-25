@@ -39,9 +39,15 @@ public sealed class ViewerSession
     /// <summary>
     /// The local ICE ufrag this session answers with. A viewer's first STUN Binding request names it
     /// in the USERNAME attribute (<c>{local-ufrag}:{remote-ufrag}</c>), which is how the endpoint
-    /// binds that first 5-tuple to this session.
+    /// binds that first 5-tuple to this session. An ICE restart regenerates it (RFC 8445 §9); the
+    /// endpoint keeps this in step with its demux map through
+    /// <c>BroadcastEndpoint.RebindViewerIceUfrag</c>.
     /// </summary>
-    public string LocalIceUfrag { get; }
+    public string LocalIceUfrag { get; private set; }
+
+    // Adopts the connection's post-restart local ufrag; called by the endpoint under its lifecycle lock
+    // while it moves the ufrag->session demux binding, so this and _byUfrag never disagree.
+    internal void SetLocalIceUfrag(string ufrag) => LocalIceUfrag = ufrag;
 
     /// <summary>The remote 5-tuples currently routed to this session; snapshot, for diagnostics.</summary>
     public IReadOnlyList<IPEndPoint> BoundEndPoints
@@ -51,6 +57,22 @@ public sealed class ViewerSession
             lock (_lock)
             {
                 return [.. _boundEndPoints];
+            }
+        }
+    }
+
+    /// <summary>
+    /// The viewer's current fan-out destination: the most recently bound remote 5-tuple, or null before the
+    /// viewer's first STUN check binds one. This is the address a <c>BroadcastSubscriber</c> bridged from
+    /// this session sends to; it settles once ICE connectivity establishes.
+    /// </summary>
+    internal IPEndPoint? PrimaryDestination
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _boundEndPoints.Count == 0 ? null : _boundEndPoints[^1];
             }
         }
     }

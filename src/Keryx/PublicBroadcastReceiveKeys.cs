@@ -54,13 +54,39 @@ internal sealed class PublicBroadcastReceiveKeys : IDisposable
         SrtpDecryptContext Current,
         SrtpDecryptContext? Previous);
 
+    // The receive path only ever consults the current and previous epoch (see Snapshot). Older contexts are
+    // retained purely so an in-flight unprotect that already read an earlier snapshot never touches a disposed
+    // context — but across many on-demand epoch rotations that list would grow without bound, so it is capped:
+    // once more than this many are retained the oldest (long past the current/previous window, and far older
+    // than any packet still in flight given rotations are seconds-to-minutes apart) is disposed. Must be >= 2
+    // so the current+previous pair is never trimmed.
+    internal const int DefaultMaxRetainedContexts = 8;
+
     private readonly IKeryxLogger _logger;
+    private readonly int _maxRetainedContexts;
     private readonly object _installLock = new();
     private readonly List<SrtpDecryptContext> _retained = [];
     private volatile Snapshot? _snapshot;
     private bool _disposed;
 
-    internal PublicBroadcastReceiveKeys(IKeryxLogger logger) => _logger = logger;
+    internal PublicBroadcastReceiveKeys(IKeryxLogger logger, int maxRetainedContexts = DefaultMaxRetainedContexts)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxRetainedContexts, 2);
+        _logger = logger;
+        _maxRetainedContexts = maxRetainedContexts;
+    }
+
+    /// <summary>The number of decrypt contexts currently retained; bounded by the retention cap.</summary>
+    internal int RetainedContextCount
+    {
+        get
+        {
+            lock (_installLock)
+            {
+                return _retained.Count;
+            }
+        }
+    }
 
     /// <summary>
     /// Installs (or rotates to) a shared broadcast key for the given SSRC scope. The current epoch, if
@@ -88,7 +114,21 @@ internal sealed class PublicBroadcastReceiveKeys : IDisposable
             }
 
             _retained.Add(context);
+
+            // Publish the new snapshot (current + immediately-previous) BEFORE trimming, so the two contexts
+            // the receive path can still consult are never candidates for disposal.
             _snapshot = new Snapshot(ssrcs, context, existing?.Current);
+
+            // Bound the retained set: dispose the oldest contexts once past the cap. Those are older than the
+            // previous epoch, so no live snapshot references them; a rotation cadence far slower than packet
+            // flight time means no in-flight unprotect can still hold one either.
+            while (_retained.Count > _maxRetainedContexts)
+            {
+                var oldest = _retained[0];
+                _retained.RemoveAt(0);
+                oldest.Dispose();
+            }
+
             _logger.Log(
                 KeryxLogLevel.Debug,
                 $"Installed public-broadcast receive key epoch {export.Epoch} for {broadcastSsrcs.Count} SSRC(s).");
