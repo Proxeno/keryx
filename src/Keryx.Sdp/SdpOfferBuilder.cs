@@ -119,7 +119,14 @@ public sealed class SdpOfferBuilder
 
         if (BundlePolicy == SdpBundlePolicy.MaxBundle)
         {
-            session.SetBundleGroup(Media.Select(static m => m.Mid));
+            // A rejected (port-0) m-section MUST NOT appear in the BUNDLE group (RFC 8843 §6, §8.3):
+            // the group's first mid is the tag, and the tag must be a live m-line the shared transport
+            // can anchor to. Listing a rejected section — or worse, listing it first — points a peer's
+            // transport at a dead m-line; a strict offerer (Firefox) then gathers no candidates for the
+            // bundle and the whole connection fails. Filtering rejected sections re-anchors the tag onto
+            // the first surviving section. With no rejected sections the group is unchanged, so a normal
+            // all-accepted offer or answer is byte-identical.
+            session.SetBundleGroup(Media.Where(static m => m.Port != 0).Select(static m => m.Mid));
         }
 
         if (ExtMapAllowMixed)

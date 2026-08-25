@@ -2044,6 +2044,20 @@ public sealed partial class PeerConnection : IAsyncDisposable
 
         foreach (var media in result.Media)
         {
+            // A rejected (port-0) answer section carries no live transport, so it must not anchor any of
+            // the shared BUNDLE state below. When a peer rejects the m-line Keryx offered as the BUNDLE
+            // tag (RFC 8843 §8.3) — most commonly the video section, because it could not negotiate the
+            // codec — the transport re-anchors onto the first surviving section (the peer's re-selected
+            // tag): ICE credentials, the DTLS fingerprint and role, the transport-wide extension ids and
+            // the remote candidates are all taken from accepted sections only, so ICE/DTLS/SRTP and the
+            // data channel continue on the m-lines that survived. Skipping the section also ignores any
+            // stale ice-ufrag / a=candidate / extmap a lenient peer left on its port-0 m-line. With no
+            // rejected sections this never triggers, so an all-accepted answer negotiates exactly as before.
+            if (media.IsRejected)
+            {
+                continue;
+            }
+
             ufrag ??= media.IceUfrag;
             password ??= media.IcePwd;
             CollectFidAssociations(media.Answered.GetSsrcGroups(), rtxToMedia);
