@@ -24,6 +24,9 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
     /// <summary>The transport token for UDP candidates.</summary>
     public const string UdpTransport = "udp";
 
+    /// <summary>The transport token for TCP candidates (RFC 6544).</summary>
+    public const string TcpTransport = "tcp";
+
     /// <summary>
     /// The DNS suffix a browser gives an mDNS host candidate when it obfuscates a private address
     /// as <c>&lt;uuid&gt;.local</c> (draft-ietf-mmusic-mdns-ice-candidates). Such a connection
@@ -36,7 +39,7 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
     /// <param name="foundation">The foundation; candidates of the same type, base and server share one.</param>
     /// <param name="component">The component id; always 1 for a bundled, rtcp-muxed session.</param>
     /// <param name="transport">The transport token, normally <c>udp</c>.</param>
-    /// <param name="priority">The candidate priority from <see cref="IcePriority.Compute"/>.</param>
+    /// <param name="priority">The candidate priority from <see cref="IcePriority.Compute(IceCandidateType, int, int)"/>.</param>
     /// <param name="address">The transport address.</param>
     /// <param name="port">The transport port.</param>
     /// <param name="type">How the address was learned.</param>
@@ -86,6 +89,29 @@ public sealed class IceCandidate : IEquatable<IceCandidate>
 
     /// <summary>True when <see cref="Transport"/> names UDP, ignoring case.</summary>
     public bool IsUdp => string.Equals(Transport, UdpTransport, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when <see cref="Transport"/> names TCP, ignoring case (RFC 6544).</summary>
+    public bool IsTcp => string.Equals(Transport, TcpTransport, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The RFC 6544 <c>tcptype</c> of a TCP candidate (<c>passive</c>, <c>active</c> or <c>so</c>),
+    /// read from the preserved extensions, or null for a UDP candidate or a TCP candidate without one.
+    /// </summary>
+    public string? TcpType
+    {
+        get
+        {
+            foreach (var (name, value) in Extensions)
+            {
+                if (string.Equals(name, "tcptype", StringComparison.OrdinalIgnoreCase))
+                {
+                    return value;
+                }
+            }
+
+            return null;
+        }
+    }
 
     /// <summary>The candidate priority (RFC 8445 section 5.1.2.1).</summary>
     public uint Priority { get; }

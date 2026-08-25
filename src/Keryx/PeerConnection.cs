@@ -1005,11 +1005,17 @@ public sealed partial class PeerConnection : IAsyncDisposable
             MaxPort = _config.MaxPort,
             Logger = _logger,
             RelayOnly = _config.RelayOnly,
+            GatherTcpCandidates = _config.GatherTcpCandidates,
         };
 
         foreach (var server in _config.StunServers)
         {
             options.StunServers.Add(server);
+        }
+
+        foreach (var stunHost in _config.StunServerHosts)
+        {
+            options.StunServerHosts.Add(stunHost);
         }
 
         foreach (var turnServer in _config.TurnServers)

@@ -5,6 +5,7 @@ using Keryx.Rtp;
 using Keryx.Rtp.CongestionControl;
 using Keryx.Rtp.Rtcp;
 using Keryx.Sdp;
+using Keryx.Stun;
 using Keryx.Turn;
 
 namespace Keryx;
@@ -29,10 +30,20 @@ public sealed class PeerConnectionConfig
     public DtlsCertificate? Certificate { get; set; }
 
     /// <summary>
-    /// STUN servers queried during gathering to learn a server-reflexive candidate. Empty by default,
-    /// which gathers host candidates only — the right choice on a public-facing server.
+    /// STUN servers queried during gathering to learn a server-reflexive candidate, as
+    /// already-resolved transport addresses. Empty by default, which gathers host candidates only —
+    /// the right choice on a public-facing server. To configure a STUN server by host name (resolved
+    /// via DNS when gathering starts, the way <see cref="TurnServers"/> already accepts a host), add
+    /// a <see cref="StunServerOptions"/> to <see cref="StunServerHosts"/> instead.
     /// </summary>
     public IList<IPEndPoint> StunServers { get; } = [];
+
+    /// <summary>
+    /// STUN servers queried during gathering, addressed by host name and port and resolved via DNS
+    /// when gathering starts, symmetric with <see cref="TurnServers"/>. Empty by default. Both this
+    /// list and <see cref="StunServers"/> are queried.
+    /// </summary>
+    public IList<StunServerOptions> StunServerHosts { get; } = [];
 
     /// <summary>
     /// TURN servers to allocate a relayed candidate on during gathering, each with its long-term
@@ -52,6 +63,14 @@ public sealed class PeerConnectionConfig
     /// use.
     /// </summary>
     public bool RelayOnly { get; set; }
+
+    /// <summary>
+    /// Also gather passive TCP host candidates (RFC 6544, see
+    /// <see cref="Keryx.Ice.IceAgentOptions.GatherTcpCandidates"/>), so a session can traverse a TCP
+    /// pair when UDP is blocked. Off by default, which keeps gathering UDP-only and the default
+    /// golden SDP byte-identical (no extra <c>a=candidate ... tcp ...</c> lines).
+    /// </summary>
+    public bool GatherTcpCandidates { get; set; }
 
     /// <summary>
     /// The local address to bind. Null binds every up, non-loopback IPv4 interface; set it to

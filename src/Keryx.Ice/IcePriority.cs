@@ -17,6 +17,13 @@ public static class IcePriority
     /// <summary>Recommended type preference for relayed candidates.</summary>
     public const int RelayedTypePreference = 0;
 
+    /// <summary>
+    /// Type preference for a TCP host candidate (RFC 6544 section 4.2). Lower than
+    /// <see cref="HostTypePreference"/> so a UDP host pair is always preferred when both a UDP and a
+    /// TCP path work, which keeps TCP the fallback for when UDP is blocked.
+    /// </summary>
+    public const int TcpHostTypePreference = 90;
+
     /// <summary>The highest local preference, used when an agent has a single usable interface.</summary>
     public const int MaxLocalPreference = 65535;
 
@@ -46,6 +53,28 @@ public static class IcePriority
         ArgumentOutOfRangeException.ThrowIfGreaterThan(component, 256);
 
         return ((uint)TypePreference(type) << 24) | ((uint)localPreference << 8) | (uint)(256 - component);
+    }
+
+    /// <summary>
+    /// Candidate priority for an explicit type preference, using the same
+    /// <c>2^24 * type-preference + 2^8 * local-preference + (256 - component)</c> formula as
+    /// <see cref="Compute(IceCandidateType, int, int)"/>. Used for a TCP host candidate
+    /// (<see cref="TcpHostTypePreference"/>), whose type preference has no <see cref="IceCandidateType"/>
+    /// of its own (RFC 6544 section 4.2).
+    /// </summary>
+    /// <param name="typePreference">0-126; the candidate's type preference.</param>
+    /// <param name="localPreference">0-65535; higher means a more preferred interface.</param>
+    /// <param name="component">The component id; 1 for a bundled, rtcp-muxed WebRTC session.</param>
+    public static uint Compute(int typePreference, int localPreference = MaxLocalPreference, int component = 1)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(typePreference);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(typePreference, 126);
+        ArgumentOutOfRangeException.ThrowIfNegative(localPreference);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(localPreference, MaxLocalPreference);
+        ArgumentOutOfRangeException.ThrowIfLessThan(component, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(component, 256);
+
+        return ((uint)typePreference << 24) | ((uint)localPreference << 8) | (uint)(256 - component);
     }
 
     /// <summary>

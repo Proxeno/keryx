@@ -92,6 +92,13 @@ public sealed class IceAgent : IDisposable
     private readonly List<RelayAllocation> _allocations = [];
     private readonly CancellationTokenSource _cts = new();
 
+    // ICE-TCP (RFC 6544), only in play when IceAgentOptions.GatherTcpCandidates is set. Connections
+    // are keyed by the peer's transport address - the same key whether this agent accepted the
+    // connection on its passive listener or dialed a remote passive candidate - so a check or media
+    // for a TCP pair finds the one connection to that peer. _tcpDialsInFlight de-duplicates dials.
+    private readonly ConcurrentDictionary<IPEndPoint, IceTcpConnection> _tcpConnections = new();
+    private readonly ConcurrentDictionary<IPEndPoint, byte> _tcpDialsInFlight = new();
+
     // The short-term key derived from LocalPassword. Not readonly: an ICE restart (RFC 8445 section 9)
     // regenerates the local credentials and re-derives this in place.
     private byte[] _localKey;
@@ -102,7 +109,10 @@ public sealed class IceAgent : IDisposable
     private readonly Dictionary<string, long> _mdnsNegativeCache = [];
 
     private Socket? _socket;
+    private Socket? _tcpListener;
+    private int _tcpPort;
     private Task? _receiveLoop;
+    private Task? _tcpAcceptLoop;
     private Task? _checkLoop;
     private StunClient? _gatherClient;
     private IceRole _role;
@@ -330,6 +340,14 @@ public sealed class IceAgent : IDisposable
         _receiveLoop = Task.Run(() => ReceiveLoopAsync(socket, _cts.Token), CancellationToken.None);
         _checkLoop = Task.Run(() => CheckLoopAsync(_cts.Token), CancellationToken.None);
 
+        // RFC 6544: a passive TCP listener alongside the UDP socket, when TCP gathering is enabled.
+        // It binds the same address family and an ephemeral port, then an accept loop takes inbound
+        // connections; each passive TCP host candidate advertises that listening port.
+        if (_options.GatherTcpCandidates)
+        {
+            StartTcpListener();
+        }
+
         var addresses = LocalAddresses(socket);
         for (var i = 0; i < addresses.Count; i++)
         {
@@ -347,6 +365,27 @@ public sealed class IceAgent : IDisposable
             };
 
             AddLocalCandidate(candidate);
+
+            if (_tcpListener is not null)
+            {
+                // RFC 6544 section 4.5: a passive TCP host candidate, advertised with
+                // "tcptype passive"; its priority uses the TCP host type preference, so it always
+                // ranks below the UDP host candidate on the same interface.
+                var tcpCandidate = new IceCandidate(
+                    Foundation(IceCandidateType.Host, addresses[i], null, IceCandidate.TcpTransport),
+                    component: 1,
+                    IceCandidate.TcpTransport,
+                    IcePriority.Compute(IcePriority.TcpHostTypePreference, localPreference),
+                    addresses[i],
+                    _tcpPort,
+                    IceCandidateType.Host,
+                    extensions: [new KeyValuePair<string, string>("tcptype", "passive")])
+                {
+                    LocalPreference = localPreference,
+                };
+
+                AddLocalCandidate(tcpCandidate);
+            }
         }
 
         await GatherServerReflexiveAsync(boundPort, cancellationToken).ConfigureAwait(false);
@@ -744,6 +783,7 @@ public sealed class IceAgent : IDisposable
 
         _cts.Cancel();
         socket?.Close();
+        CloseTcp();
 
         foreach (var allocation in allocations)
         {
@@ -770,7 +810,10 @@ public sealed class IceAgent : IDisposable
 
         try
         {
-            Task.WhenAll(_receiveLoop ?? Task.CompletedTask, _checkLoop ?? Task.CompletedTask)
+            Task.WhenAll(
+                    _receiveLoop ?? Task.CompletedTask,
+                    _checkLoop ?? Task.CompletedTask,
+                    _tcpAcceptLoop ?? Task.CompletedTask)
                 .Wait(TimeSpan.FromSeconds(2));
         }
         catch (Exception)
@@ -931,7 +974,7 @@ public sealed class IceAgent : IDisposable
 
     private async Task GatherServerReflexiveAsync(int boundPort, CancellationToken cancellationToken)
     {
-        if (_options.StunServers.Count == 0)
+        if (_options.StunServers.Count == 0 && _options.StunServerHosts.Count == 0)
         {
             return;
         }
@@ -949,7 +992,24 @@ public sealed class IceAgent : IDisposable
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cts.Token);
-            foreach (var server in _options.StunServers)
+
+            // Already-resolved endpoints first (the back-compat form), then the host+port entries,
+            // each resolved via DNS the same way TURN servers are. Resolution failures are logged
+            // and skipped alongside query failures, so one bad entry never aborts the rest.
+            var servers = new List<IPEndPoint>(_options.StunServers);
+            foreach (var host in _options.StunServerHosts)
+            {
+                try
+                {
+                    servers.Add(await host.ResolveAsync(linked.Token).ConfigureAwait(false));
+                }
+                catch (Exception ex) when (ex is SocketException or InvalidOperationException or OperationCanceledException)
+                {
+                    _logger.Log(KeryxLogLevel.Warning, $"STUN server {host} did not resolve to a queryable address.", ex);
+                }
+            }
+
+            foreach (var server in servers)
             {
                 try
                 {
@@ -1234,7 +1294,7 @@ public sealed class IceAgent : IDisposable
         // relayed ICE check is just an ICE check and relayed media is just media (RFC 7983).
         if (StunMessage.LooksLikeStun(datagram))
         {
-            HandleStun(datagram, peer, candidate);
+            HandleStun(datagram, peer, candidate, viaTcp: null);
         }
         else if (IsAcceptableInboundSource(peer))
         {
@@ -1275,12 +1335,14 @@ public sealed class IceAgent : IDisposable
         DrainEvents();
     }
 
-    private static string Foundation(IceCandidateType type, IPAddress baseAddress, IPEndPoint? server)
+    private static string Foundation(IceCandidateType type, IPAddress baseAddress, IPEndPoint? server, string transport = IceCandidate.UdpTransport)
     {
         // RFC 8445 section 5.1.1.3: candidates sharing type, base, STUN/TURN server and protocol
         // must share a foundation. A stable 32-bit hash of those inputs satisfies that, and looks
-        // like the numeric foundations Chrome emits.
-        var key = $"{type}|{baseAddress}|{server?.ToString() ?? "-"}|udp";
+        // like the numeric foundations Chrome emits. The transport is part of the key so a TCP host
+        // candidate never shares a foundation - and so never freezes/unfreezes together - with the
+        // UDP host candidate on the same base.
+        var key = $"{type}|{baseAddress}|{server?.ToString() ?? "-"}|{transport}";
         var hash = 2166136261u;
         foreach (var b in Encoding.UTF8.GetBytes(key))
         {
@@ -1288,6 +1350,192 @@ public sealed class IceAgent : IDisposable
         }
 
         return hash.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    // ---------------------------------------------------------------- TCP (RFC 6544)
+
+    /// <summary>
+    /// Binds the passive TCP listener alongside the UDP socket and starts accepting. The listener
+    /// mirrors the UDP socket's family and dual-stack choice, and binds an ephemeral port (or one
+    /// from the configured range), so a passive TCP host candidate can advertise where to reach it.
+    /// </summary>
+    private void StartTcpListener()
+    {
+        var family = _options.BindAddress?.AddressFamily
+            ?? (Socket.OSSupportsIPv6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork);
+        var listener = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
+        try
+        {
+            if (family == AddressFamily.InterNetworkV6 && _options.BindAddress is null)
+            {
+                listener.DualMode = true;
+            }
+
+            var address = _options.BindAddress
+                ?? (family == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any);
+            listener.Bind(new IPEndPoint(address, 0));
+            listener.Listen(backlog: 16);
+        }
+        catch
+        {
+            listener.Dispose();
+            throw;
+        }
+
+        _tcpPort = ((IPEndPoint)listener.LocalEndPoint!).Port;
+        _tcpListener = listener;
+        _tcpAcceptLoop = Task.Run(() => AcceptLoopAsync(listener, _cts.Token), CancellationToken.None);
+    }
+
+    private async Task AcceptLoopAsync(Socket listener, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            Socket accepted;
+            try
+            {
+                accepted = await listener.AcceptAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+            {
+                return;
+            }
+            catch (SocketException ex)
+            {
+                _logger.Log(KeryxLogLevel.Trace, "ICE-TCP accept error; continuing.", ex);
+                continue;
+            }
+
+            if (accepted.RemoteEndPoint is not IPEndPoint remote)
+            {
+                accepted.Dispose();
+                continue;
+            }
+
+            RegisterTcpConnection(accepted, Normalize(remote), dialed: false);
+        }
+    }
+
+    /// <summary>
+    /// Wraps an accepted or dialed socket in an <see cref="IceTcpConnection"/> keyed by the peer's
+    /// address, unless one to that peer already exists (a dial that raced an accept), and starts its
+    /// receive loop.
+    /// </summary>
+    private void RegisterTcpConnection(Socket socket, IPEndPoint remote, bool dialed)
+    {
+        var connection = new IceTcpConnection(socket, remote, _logger, _cts.Token);
+        if (!_tcpConnections.TryAdd(remote, connection))
+        {
+            connection.Dispose();
+            return;
+        }
+
+        connection.StartReceiving(HandleTcpMessage, OnTcpConnectionClosed);
+        _logger.Log(KeryxLogLevel.Debug, $"ICE-TCP connection to {remote} {(dialed ? "dialed" : "accepted")}.");
+    }
+
+    private void OnTcpConnectionClosed(IceTcpConnection connection)
+    {
+        if (_tcpConnections.TryRemove(new KeyValuePair<IPEndPoint, IceTcpConnection>(connection.RemoteEndPoint, connection)))
+        {
+            connection.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Feeds one whole framed message from a TCP connection back through the same demultiplexing as a
+    /// UDP datagram (RFC 7983): STUN is handled as a check, with the connection carried so the reply
+    /// goes back over it; everything else is surfaced to the datagram transport.
+    /// </summary>
+    private void HandleTcpMessage(IceTcpConnection connection, ReadOnlySpan<byte> message)
+    {
+        if (StunMessage.LooksLikeStun(message))
+        {
+            HandleStun(message, connection.RemoteEndPoint, viaRelay: null, connection);
+        }
+        else if (IsAcceptableInboundSource(connection.RemoteEndPoint))
+        {
+            _transport.Raise(message);
+        }
+        else
+        {
+            _logger.Log(KeryxLogLevel.Warning, $"Dropping non-STUN ICE-TCP message from {connection.RemoteEndPoint}: not the selected pair's remote endpoint.");
+        }
+
+        DrainEvents();
+    }
+
+    /// <summary>
+    /// Sends a datagram for a TCP pair. If a connection to the pair's remote address already exists
+    /// (accepted or previously dialed) it is used; otherwise, when this agent is controlling, a dial
+    /// is kicked off and the datagram is dropped - the connectivity check that triggered it will be
+    /// retransmitted once the connection is up. A controlled agent never dials: it waits for the
+    /// controlling peer to connect to its passive candidate, which keeps exactly one TCP connection
+    /// per pair and so keeps strict inbound-source validation consistent on both ends.
+    /// </summary>
+    private void SendOverTcp(IceCandidatePair pair, ReadOnlySpan<byte> datagram)
+    {
+        var remote = pair.RemoteEndPoint;
+        if (_tcpConnections.TryGetValue(remote, out var connection))
+        {
+            connection.Send(datagram);
+            return;
+        }
+
+        bool controlling;
+        lock (_lock)
+        {
+            controlling = _role == IceRole.Controlling;
+        }
+
+        // Only a remote passive candidate is dialable; a peer-reflexive TCP candidate is one this
+        // agent only ever learned by accepting a connection, so there is nothing to dial for it.
+        if (controlling && pair.Remote.Type == IceCandidateType.Host && pair.Remote.IsTcp)
+        {
+            DialTcpConnection(remote);
+        }
+    }
+
+    private void DialTcpConnection(IPEndPoint remote)
+    {
+        if (_tcpConnections.ContainsKey(remote) || !_tcpDialsInFlight.TryAdd(remote, 0))
+        {
+            return;
+        }
+
+        _ = Task.Run(
+            async () =>
+            {
+                Socket? socket = null;
+                try
+                {
+                    socket = new Socket(remote.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                    await socket.ConnectAsync(remote, _cts.Token).ConfigureAwait(false);
+                    RegisterTcpConnection(socket, remote, dialed: true);
+                    socket = null;
+                }
+                catch (Exception ex) when (ex is SocketException or ObjectDisposedException or OperationCanceledException)
+                {
+                    _logger.Log(KeryxLogLevel.Debug, $"ICE-TCP dial to {remote} failed.", ex);
+                    socket?.Dispose();
+                }
+                finally
+                {
+                    _tcpDialsInFlight.TryRemove(remote, out _);
+                }
+            },
+            CancellationToken.None);
+    }
+
+    private void CloseTcp()
+    {
+        _tcpListener?.Close();
+        foreach (var connection in _tcpConnections.Values)
+        {
+            connection.Dispose();
+        }
+
+        _tcpConnections.Clear();
     }
 
     // ---------------------------------------------------------------- receive
@@ -1340,7 +1588,7 @@ public sealed class IceAgent : IDisposable
 
             if (StunMessage.LooksLikeStun(datagram))
             {
-                HandleStun(datagram, from, viaRelay: null);
+                HandleStun(datagram, from, viaRelay: null, viaTcp: null);
             }
             else if (IsAcceptableInboundSource(from))
             {
@@ -1418,7 +1666,7 @@ public sealed class IceAgent : IDisposable
         return false;
     }
 
-    private void HandleStun(ReadOnlySpan<byte> datagram, IPEndPoint from, IceCandidate? viaRelay)
+    private void HandleStun(ReadOnlySpan<byte> datagram, IPEndPoint from, IceCandidate? viaRelay, IceTcpConnection? viaTcp = null)
     {
         if (!StunMessage.TryDecode(datagram, out var message) || message.Method != StunMethod.Binding)
         {
@@ -1429,7 +1677,7 @@ public sealed class IceAgent : IDisposable
         switch (message.Class)
         {
             case StunClass.Request:
-                HandleBindingRequest(message, from, viaRelay);
+                HandleBindingRequest(message, from, viaRelay, viaTcp);
                 break;
             case StunClass.SuccessResponse:
             case StunClass.ErrorResponse:
@@ -1438,7 +1686,7 @@ public sealed class IceAgent : IDisposable
                     return;
                 }
 
-                HandleCheckResponse(message, from, viaRelay);
+                HandleCheckResponse(message, from, viaRelay, viaTcp);
                 break;
             case StunClass.Indication:
                 // RFC 7675 section 5.1: consent to keep sending is refreshed only by a validated
@@ -1455,7 +1703,7 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    private void HandleBindingRequest(StunMessage request, IPEndPoint from, IceCandidate? viaRelay)
+    private void HandleBindingRequest(StunMessage request, IPEndPoint from, IceCandidate? viaRelay, IceTcpConnection? viaTcp)
     {
         if (!request.ValidateFingerprint())
         {
@@ -1473,7 +1721,7 @@ public sealed class IceAgent : IDisposable
         if (!request.ValidateMessageIntegrity(_localKey))
         {
             _logger.Log(KeryxLogLevel.Warning, $"Dropping ICE check from {from} with a bad MESSAGE-INTEGRITY.");
-            SendStun(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.Unauthorized, "Unauthorized"), from, key: null, viaRelay);
+            SendStun(StunMessage.CreateErrorResponse(request, StunErrorCodeAttribute.Unauthorized, "Unauthorized"), from, key: null, viaRelay, viaTcp);
             return;
         }
 
@@ -1516,7 +1764,7 @@ public sealed class IceAgent : IDisposable
 
             if (response is null)
             {
-                var remote = FindOrCreatePeerReflexiveLocked(from, request.GetAttribute<StunPriorityAttribute>()?.Priority);
+                var remote = FindOrCreatePeerReflexiveLocked(from, request.GetAttribute<StunPriorityAttribute>()?.Priority, overTcp: viaTcp is not null);
                 var pair = remote is null ? null : FindPairLocked(remote, viaRelay);
                 if (pair is not null)
                 {
@@ -1547,11 +1795,11 @@ public sealed class IceAgent : IDisposable
             }
         }
 
-        SendStun(response, from, responseKey, viaRelay);
+        SendStun(response, from, responseKey, viaRelay, viaTcp);
         DrainEvents();
     }
 
-    private void HandleCheckResponse(StunMessage response, IPEndPoint from, IceCandidate? viaRelay)
+    private void HandleCheckResponse(StunMessage response, IPEndPoint from, IceCandidate? viaRelay, IceTcpConnection? viaTcp)
     {
         OutstandingCheck? check;
         lock (_lock)
@@ -1570,9 +1818,10 @@ public sealed class IceAgent : IDisposable
         }
 
         // The same rule applied to the local end: a check sent through the relay must come back
-        // through the relay, and a direct check must come back directly.
+        // through the relay, a check over a TCP connection must come back over TCP, and a direct
+        // check must come back directly.
         var expectedRelay = check.Pair.Local.Type == IceCandidateType.Relayed ? check.Pair.Local : null;
-        if (!Equals(expectedRelay, viaRelay))
+        if (!Equals(expectedRelay, viaRelay) || check.Pair.Local.IsTcp != (viaTcp is not null))
         {
             _logger.Log(KeryxLogLevel.Warning, $"ICE check response for {check.Pair} arrived on the wrong local candidate; ignoring.");
             return;
@@ -1884,11 +2133,15 @@ public sealed class IceAgent : IDisposable
         return true;
     }
 
-    private IceCandidate? FindOrCreatePeerReflexiveLocked(IPEndPoint from, uint? priority)
+    private IceCandidate? FindOrCreatePeerReflexiveLocked(IPEndPoint from, uint? priority, bool overTcp)
     {
+        // A TCP check reveals a TCP peer-reflexive candidate and a UDP check a UDP one, so the
+        // transport matches and RebuildPairsLocked pairs it against a local candidate of the same
+        // transport (a TCP prflx against the passive TCP host, never against the UDP host).
+        var transport = overTcp ? IceCandidate.TcpTransport : IceCandidate.UdpTransport;
         foreach (var candidate in _remoteCandidates)
         {
-            if (candidate.EndPoint.Equals(from))
+            if (candidate.EndPoint.Equals(from) && candidate.IsTcp == overTcp)
             {
                 return candidate;
             }
@@ -1899,7 +2152,7 @@ public sealed class IceAgent : IDisposable
         var discovered = new IceCandidate(
             $"prflx{++_prflxCounter}",
             component: 1,
-            IceCandidate.UdpTransport,
+            transport,
             priority ?? IcePriority.Compute(IceCandidateType.PeerReflexive),
             from.Address,
             from.Port,
@@ -1934,8 +2187,12 @@ public sealed class IceAgent : IDisposable
                 IceCandidate? local = null;
                 foreach (var candidate in _localCandidates)
                 {
+                    // Same transport as well as same family: a candidate pair must agree on the
+                    // transport protocol (RFC 8445 section 6.1.2.2 / RFC 6544), so a remote TCP
+                    // candidate pairs with the local passive TCP host, never with the UDP host.
                     if (candidate.Type != IceCandidateType.Relayed
-                        && candidate.Address.AddressFamily == remote.Address.AddressFamily)
+                        && candidate.Address.AddressFamily == remote.Address.AddressFamily
+                        && candidate.IsTcp == remote.IsTcp)
                     {
                         local = candidate;
                         break;
@@ -1954,8 +2211,10 @@ public sealed class IceAgent : IDisposable
             // a different route - so each allocation gets its own pair per remote candidate.
             foreach (var allocation in _allocations)
             {
+                // A relayed candidate is always UDP, so it only pairs with a UDP remote candidate.
                 if (allocation.Candidate is not { } relay
                     || relay.Address.AddressFamily != remote.Address.AddressFamily
+                    || relay.IsTcp != remote.IsTcp
                     || FindPairLocked(remote, relay) is not null)
                 {
                     continue;
@@ -2216,9 +2475,15 @@ public sealed class IceAgent : IDisposable
         }
     }
 
-    private void SendStun(StunMessage message, IPEndPoint destination, byte[]? key, IceCandidate? viaRelay)
+    private void SendStun(StunMessage message, IPEndPoint destination, byte[]? key, IceCandidate? viaRelay, IceTcpConnection? viaTcp = null)
     {
         var datagram = message.Encode(key, appendFingerprint: true);
+        if (viaTcp is not null)
+        {
+            viaTcp.Send(datagram);
+            return;
+        }
+
         if (viaRelay is null)
         {
             SendRaw(datagram, destination);
@@ -2234,6 +2499,12 @@ public sealed class IceAgent : IDisposable
     /// </summary>
     private void SendForPair(IceCandidatePair pair, ReadOnlySpan<byte> datagram)
     {
+        if (pair.Local.IsTcp)
+        {
+            SendOverTcp(pair, datagram);
+            return;
+        }
+
         if (pair.Local.Type != IceCandidateType.Relayed)
         {
             SendRaw(datagram, pair.RemoteEndPoint);
