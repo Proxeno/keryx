@@ -5,6 +5,7 @@ using FluentAssertions;
 using Keryx.Broadcast;
 using Keryx.Dtls;
 using Keryx.Rtp;
+using Keryx.Rtp.Rtcp;
 using Keryx.Rtp.Simulcast;
 using Keryx.Sdp;
 using Keryx.Srtp;
@@ -373,6 +374,121 @@ public sealed class SharedKeyBroadcastTests
         tier.TryResend(60000, harness.Endpoint(0), out _).Should().BeFalse();
     }
 
+    // -------------------------------------------------------------------------------------------------
+    // Shared-key SRTCP (spec §5.5): the shared stream's sender reports encrypt once and viewers decrypt.
+    // -------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A broadcast sender report encrypts once under the shared key and every viewer decrypts it with the
+    /// installed shared key (§5.5), recovering the NTP↔RTP mapping — without which shared-key A/V sync
+    /// would be broken. A non-broadcast SSRC is not routed to the shared key.
+    /// </summary>
+    [Fact]
+    public void SenderReport_EncryptsOnce_AndViewersDecryptUnderSharedKey()
+    {
+        using var key = PublicBroadcastKey.CreateForPublicContent(Profile);
+        using var harness = new ViewerHarness(3);
+        using var tier = new SharedKeyBroadcastTier(key, BroadcastSsrc);
+        harness.EnrollAll(tier);
+
+        var sr = new RtcpSenderReport
+        {
+            SenderSsrc = BroadcastSsrc,
+            NtpTimestamp = 0xE1A2_B3C4_D5E6_F708u,
+            RtpTimestamp = 123456u,
+            PacketCount = 10,
+            OctetCount = 9000,
+        };
+        var plain = new byte[sr.Length];
+        sr.WriteTo(plain);
+
+        var datagrams = new List<BroadcastDatagram>();
+        tier.FanoutSenderReport(plain, datagrams).Should().Be(3, "one SR datagram per viewer");
+
+        // Encrypt-once: every viewer's SR shares one ciphertext buffer.
+        MemoryMarshal.TryGetArray(datagrams[0].Payload, out var first).Should().BeTrue();
+        for (var i = 1; i < datagrams.Count; i++)
+        {
+            MemoryMarshal.TryGetArray(datagrams[i].Payload, out var seg).Should().BeTrue();
+            seg.Array.Should().BeSameAs(first.Array);
+        }
+
+        using var receiver = new PublicBroadcastReceiveKeysHarness(BroadcastSsrc);
+        receiver.Install(key.Export());
+        var recovered = new byte[2048];
+
+        receiver.TryUnprotectRtcp(BroadcastSsrc, datagrams[0].Payload.Span, recovered, out var length)
+            .Should().Be(PublicBroadcastReceiveKeys.Outcome.Unprotected);
+        RtcpSenderReport.TryParse(recovered.AsSpan(0, length), out var decoded).Should().BeTrue();
+        decoded!.SenderSsrc.Should().Be(BroadcastSsrc);
+        decoded.NtpTimestamp.Should().Be(sr.NtpTimestamp);
+        decoded.RtpTimestamp.Should().Be(sr.RtpTimestamp);
+
+        // Viewer→SFU RTCP (a different SSRC) is never routed to the shared key.
+        receiver.TryUnprotectRtcp(0xAAAA_BBBBu, datagrams[0].Payload.Span, recovered, out _)
+            .Should().Be(PublicBroadcastReceiveKeys.Outcome.NotBroadcast);
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // Robustness: reordered/duplicate ingest is dropped-and-counted, never a hot-path crash.
+    // -------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A reordered or duplicate ingest packet rewrites to an already-used SRTP index; the encrypt context
+    /// correctly refuses it (reusing an index repeats the keystream/nonce), but the fan-out must
+    /// <b>drop-and-count</b> it, not crash. The stream continues with the next in-order packet.
+    /// </summary>
+    [Fact]
+    public void Fanout_DropsAndCountsReorderedIngest_WithoutThrowing()
+    {
+        using var key = PublicBroadcastKey.CreateForPublicContent(Profile);
+        using var harness = new ViewerHarness(2);
+        using var tier = new SharedKeyBroadcastTier(key, BroadcastSsrc);
+        harness.EnrollAll(tier);
+        tier.SelectTier(Hi);
+
+        var datagrams = new List<BroadcastDatagram>();
+
+        // Two in-order packets forward normally.
+        tier.Fanout(Classification(), BuildIngestPacket(0, 0, PacketPayload(0)), canStartLayer: true, datagrams).Should().Be(2);
+        tier.Fanout(Classification(), BuildIngestPacket(1, 3000, PacketPayload(1)), canStartLayer: false, datagrams).Should().Be(2);
+
+        // A duplicate of sequence 1 rewrites to an already-used index: dropped and counted, no throw.
+        var replay = () => tier.Fanout(Classification(), BuildIngestPacket(1, 3000, PacketPayload(1)), canStartLayer: false, datagrams);
+        replay.Should().NotThrow();
+        replay().Should().Be(0);
+        tier.DroppedReorderedPackets.Should().BeGreaterThanOrEqualTo(1);
+
+        // The stream recovers: the next in-order packet forwards.
+        tier.Fanout(Classification(), BuildIngestPacket(2, 6000, PacketPayload(2)), canStartLayer: false, datagrams).Should().Be(2);
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // Nonce-safety: two tiers over the same key+SSRC are refused.
+    // -------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Two encrypt contexts over one (key instance, SSRC) would repeat the SRTP keystream and AEAD nonce.
+    /// Constructing a second tier for the same key+SSRC is refused; a different SSRC (or a rotated key
+    /// instance) is fine.
+    /// </summary>
+    [Fact]
+    public void SecondTier_SameKeyAndSsrc_IsRefused()
+    {
+        using var key = PublicBroadcastKey.CreateForPublicContent(Profile);
+        using var first = new SharedKeyBroadcastTier(key, BroadcastSsrc);
+
+        var collide = () => new SharedKeyBroadcastTier(key, BroadcastSsrc);
+        collide.Should().Throw<InvalidOperationException>().WithMessage("*already active*");
+
+        // Same key, different SSRC is a distinct key-stream and is allowed.
+        using var otherSsrc = new SharedKeyBroadcastTier(key, 0x0BEE_F222u);
+
+        // After the first tier is disposed, its key+SSRC reservation is released and can be reused.
+        first.Dispose();
+        using var reused = new SharedKeyBroadcastTier(key, BroadcastSsrc);
+    }
+
     /// <summary>A fan-out with no enrolled viewers produces nothing and does not throw.</summary>
     [Fact]
     public void Fanout_WithNoViewers_IsANoOp()
@@ -507,6 +623,9 @@ public sealed class SharedKeyBroadcastTests
 
         public PublicBroadcastReceiveKeys.Outcome TryUnprotect(uint ssrc, ReadOnlySpan<byte> packet) =>
             _keys.TryUnprotectRtp(ssrc, packet, _recovered, out _);
+
+        public PublicBroadcastReceiveKeys.Outcome TryUnprotectRtcp(uint ssrc, ReadOnlySpan<byte> packet, Span<byte> output, out int length) =>
+            _keys.TryUnprotectRtcp(ssrc, packet, output, out length);
 
         public void Dispose() => _keys.Dispose();
     }

@@ -159,7 +159,11 @@ to "from someone holding the broadcast key".
   fails to authenticate is dropped, never retried against the private keys.
 - **No enrollment of a media-sending viewer.** `SharedKeyBroadcastTier.Enroll` throws for any session
   with a receiving media m-line (recvonly/sendrecv from the SFU's view, checked on both the desired and
-  the negotiated direction) — such a viewer could send media under the shared key and forge toward others.
+  the negotiated direction). This is defense-in-depth: an enrolled viewer's *inbound* media always rides
+  its own DTLS-derived keys, and the shared key is only installed on the viewer's *receive* broadcast
+  SSRCs, so participant media structurally cannot ride the shared key — the refusal guards against an
+  application composing a broadcast leg with a media-receiving one on the same session. The guard is
+  point-in-time (post-enrollment renegotiation is the application's responsibility).
 - **No path from a private/1:1/mixed room.** The mode exists only inside the broadcast fan-out component,
   behind the public-named key type; there is no per-`PeerConnection` "use shared key" switch, and a
   session may be enrolled in exactly one broadcast's key.

@@ -52,25 +52,47 @@ namespace Keryx.Broadcast;
 public sealed class SharedKeyBroadcastTier : IDisposable
 {
     private readonly object _membershipLock = new();
+    // Enforces that no (PublicBroadcastKey instance, broadcast SSRC) pair is ever protected by two encrypt
+    // contexts at once — that would give two independent packet-index counters over one key+SSRC, repeating
+    // AES-CM keystream and AES-GCM nonces. Reference equality on the key is exactly right: a rotated epoch
+    // is a distinct instance, so it never collides with the epoch it replaced.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<KeyStreamIdentity, byte> ActiveKeyStreams = new();
+
     private readonly List<ViewerSession> _viewers = [];
     private readonly List<IPEndPoint> _destinationScratch = [];
+    private readonly List<SrtpEncryptContext> _retiredContexts = [];
     private readonly IKeryxLogger _logger;
     private readonly SharedKeyBroadcastTierOptions _options;
     private readonly RtpForwarder _forwarder;
     private readonly byte[] _rewrite;
     private readonly byte[] _cipher;
     private readonly SharedCiphertextHistory? _history;
+    private readonly KeyStreamIdentity _keyStreamIdentity;
 
-    // The current shared key and the encrypt-once context derived from it. Rebuilt on RotateEpoch. Guarded
-    // by _membershipLock for the rare rotation; the hot Fanout path reads _encrypt without a lock because
-    // Fanout is single-threaded per the type contract and rotation is expected between passes, not during.
+    // The current shared key and the encrypt-once context derived from it. RotateEpoch swaps _encrypt to a
+    // fresh context (a volatile reference publish) and retires — but does NOT dispose — the old one, so a
+    // Fanout racing a rotation always reads a live context, never a disposed one. Retired contexts are
+    // freed only at Dispose. Fanout is single-threaded per the type contract; retaining rather than
+    // disposing makes a rotation from another thread fail-closed on the send path too (no
+    // ObjectDisposedException). For a clean epoch switchover, sequence RotateEpoch relative to the send
+    // thread (mint+distribute, then rotate at an RTP-timestamp boundary).
     private PublicBroadcastKey _key;
-    private SrtpEncryptContext _encrypt;
+    private volatile SrtpEncryptContext _encrypt;
+    private long _droppedReorderedPackets;
 
     // Published destination snapshot the hot path reads without allocating. Rebuilt on membership change
     // and on RefreshDestinations (when a viewer's ICE binding settles after enrollment).
     private volatile IPEndPoint[] _destinations = [];
     private volatile bool _disposed;
+
+    // A (key-instance, SSRC) identity with reference equality on the key, keying ActiveKeyStreams.
+    private readonly record struct KeyStreamIdentity(PublicBroadcastKey Key, uint Ssrc)
+    {
+        public bool Equals(KeyStreamIdentity other) => ReferenceEquals(Key, other.Key) && Ssrc == other.Ssrc;
+
+        public override int GetHashCode() =>
+            HashCode.Combine(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Key), Ssrc);
+    }
 
     /// <summary>Creates a shared-key tier for one broadcast SSRC under a public broadcast key.</summary>
     /// <param name="key">
@@ -80,6 +102,11 @@ public sealed class SharedKeyBroadcastTier : IDisposable
     /// <param name="broadcastSsrc">The single SSRC every viewer of this tier receives.</param>
     /// <param name="options">Tuning; defaults are used when null.</param>
     /// <exception cref="ArgumentNullException"><paramref name="key"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Another live tier is already protecting this <paramref name="key"/> instance on
+    /// <paramref name="broadcastSsrc"/>. Two encrypt contexts over one key+SSRC would repeat SRTP
+    /// keystream/nonces, so the collision is refused.
+    /// </exception>
     public SharedKeyBroadcastTier(PublicBroadcastKey key, uint broadcastSsrc, SharedKeyBroadcastTierOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(key);
@@ -88,14 +115,31 @@ public sealed class SharedKeyBroadcastTier : IDisposable
         _key = key;
         BroadcastSsrc = broadcastSsrc;
 
-        _forwarder = new RtpForwarder(broadcastSsrc, _options.OutboundPayloadType, _options.ClockRate);
-        var capacity = _options.MaxIngestPacketSize + 128;
-        _rewrite = new byte[capacity];
-        _cipher = new byte[capacity + key.Profile.RtpOverhead];
-        _encrypt = new SrtpEncryptContext(key.Profile, key.ToSessionKeys(), _logger);
-        _history = _options.RetransmitHistoryDepth > 0
-            ? new SharedCiphertextHistory(_options.RetransmitHistoryDepth, capacity + key.Profile.RtpOverhead)
-            : null;
+        _keyStreamIdentity = new KeyStreamIdentity(key, broadcastSsrc);
+        if (!ActiveKeyStreams.TryAdd(_keyStreamIdentity, 0))
+        {
+            throw new InvalidOperationException(
+                $"A shared-key broadcast tier is already active for this key on SSRC 0x{broadcastSsrc:x8}. "
+                + "One key+SSRC must be protected by exactly one encrypt context; two would repeat the SRTP "
+                + "keystream and AEAD nonce (broadcast-scale.md §5.4).");
+        }
+
+        try
+        {
+            _forwarder = new RtpForwarder(broadcastSsrc, _options.OutboundPayloadType, _options.ClockRate);
+            var capacity = _options.MaxIngestPacketSize + 128;
+            _rewrite = new byte[capacity];
+            _cipher = new byte[capacity + key.Profile.RtpOverhead];
+            _encrypt = new SrtpEncryptContext(key.Profile, key.ToSessionKeys(), _logger);
+            _history = _options.RetransmitHistoryDepth > 0
+                ? new SharedCiphertextHistory(_options.RetransmitHistoryDepth, capacity + key.Profile.RtpOverhead)
+                : null;
+        }
+        catch
+        {
+            ActiveKeyStreams.TryRemove(_keyStreamIdentity, out _);
+            throw;
+        }
     }
 
     /// <summary>The single SSRC every viewer of this tier receives.</summary>
@@ -103,6 +147,13 @@ public sealed class SharedKeyBroadcastTier : IDisposable
 
     /// <summary>The epoch of the shared key currently in force.</summary>
     public int Epoch => _key.Epoch;
+
+    /// <summary>
+    /// The number of ingest packets this tier dropped because their rewritten SRTP index had already been
+    /// used (a reordered or duplicate ingest packet). Such a packet is dropped, not protected — reusing an
+    /// index would repeat the keystream/nonce — and never crashes the fan-out.
+    /// </summary>
+    public long DroppedReorderedPackets => Interlocked.Read(ref _droppedReorderedPackets);
 
     /// <summary>The number of viewers currently enrolled in this tier.</summary>
     public int ViewerCount
@@ -131,6 +182,15 @@ public sealed class SharedKeyBroadcastTier : IDisposable
     /// the shared key and is refused (spec §5.4). A session already enrolled in a different broadcast's
     /// shared key is also refused.
     /// </summary>
+    /// <remarks>
+    /// The check is <b>point-in-time</b>: it inspects the session's transceivers as they are now. What
+    /// makes the property hold regardless is structural, not this check — inbound media on this connection
+    /// rides its own DTLS-derived keys and the shared key is only ever installed on the viewer's
+    /// <i>receive</i> broadcast SSRCs, so participant media can never structurally ride the shared key. The
+    /// receive-m-line refusal is defense-in-depth against an application composing a broadcast leg with a
+    /// media-receiving one on the same session; a post-enrollment renegotiation that adds a receiving
+    /// m-line is the application's responsibility to keep off shared-key sessions.
+    /// </remarks>
     /// <param name="session">The viewer session to enroll.</param>
     /// <exception cref="ArgumentNullException"><paramref name="session"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
@@ -339,12 +399,19 @@ public sealed class SharedKeyBroadcastTier : IDisposable
     public byte[] EncodeKeyMessage() => PublicBroadcastKeyMessage.Encode(_key.Export(), [BroadcastSsrc]);
 
     /// <summary>
-    /// Rotates to a new epoch (spec §5.1): mints a fresh random key, rebuilds the encrypt-once context,
-    /// and returns the new export to distribute over the viewers' data channels. Distribute the new key,
-    /// then switch: viewers hold both epochs across the switch (they try current then previous). The
-    /// previous <see cref="PublicBroadcastKey"/> handed to the constructor is left undisposed for the
-    /// caller to retire once no packet under it can still be in flight.
+    /// Rotates to a new epoch (spec §5.1): mints a fresh random key, builds a new encrypt-once context and
+    /// publishes it, and returns the new export to distribute over the viewers' data channels. Distribute
+    /// the new key, then switch: viewers hold both epochs across the switch (they try current then
+    /// previous). The previous <see cref="PublicBroadcastKey"/> handed to the constructor is left undisposed
+    /// for the caller to retire once no packet under it can still be in flight.
     /// </summary>
+    /// <remarks>
+    /// The old encrypt context is <b>retired, not disposed</b>: a <see cref="Fanout"/> racing this rotation
+    /// always sees a live context (the swap is a volatile publish), never a disposed one, so rotation from a
+    /// thread other than the send thread cannot throw <see cref="ObjectDisposedException"/> on the send
+    /// path. Retired contexts are freed at <see cref="Dispose"/>. For a clean switchover (no packets briefly
+    /// under the old key after the intended boundary), sequence this call relative to the send thread.
+    /// </remarks>
     /// <returns>The new epoch's key export.</returns>
     /// <exception cref="ObjectDisposedException">The tier is disposed.</exception>
     public PublicBroadcastKeyExport RotateEpoch()
@@ -354,7 +421,7 @@ public sealed class SharedKeyBroadcastTier : IDisposable
         {
             var next = _key.RotateEpoch();
             var encrypt = new SrtpEncryptContext(next.Profile, next.ToSessionKeys(), _logger);
-            _encrypt.Dispose();
+            _retiredContexts.Add(_encrypt);
             _encrypt = encrypt;
             _key = next;
             _logger.Log(KeryxLogLevel.Info, $"Shared-key broadcast SSRC 0x{BroadcastSsrc:x8} rotated to epoch {next.Epoch}.");
@@ -387,7 +454,21 @@ public sealed class SharedKeyBroadcastTier : IDisposable
         // The rewritten packet carries the broadcast SSRC and the tier's contiguous sequence space; its
         // sequence number (bytes 2-3) keys the shared NACK history.
         broadcastSequenceNumber = BinaryPrimitives.ReadUInt16BigEndian(_rewrite.AsSpan(2, 2));
-        cipherLength = _encrypt.ProtectRtp(_rewrite.AsSpan(0, rewritten), _cipher);
+
+        try
+        {
+            cipherLength = _encrypt.ProtectRtp(_rewrite.AsSpan(0, rewritten), _cipher);
+        }
+        catch (InvalidOperationException)
+        {
+            // A reordered or duplicate ingest packet rewrote to an already-used SRTP index. ProtectRtp
+            // correctly refuses it (reusing an index repeats the keystream/AEAD nonce) — but that refusal
+            // must not crash the fan-out. Drop and count it; the stream continues with the next packet.
+            Interlocked.Increment(ref _droppedReorderedPackets);
+            cipherLength = 0;
+            return false;
+        }
+
         return true;
     }
 
@@ -402,7 +483,8 @@ public sealed class SharedKeyBroadcastTier : IDisposable
         _destinations = _destinationScratch.Count == 0 ? [] : [.. _destinationScratch];
     }
 
-    /// <summary>Disposes the encrypt-once context and releases every viewer's enrollment claim.</summary>
+    /// <summary>Disposes the current and every retired encrypt-once context, releases every viewer's
+    /// enrollment claim, and frees this tier's key+SSRC key-stream reservation.</summary>
     public void Dispose()
     {
         if (_disposed)
@@ -421,6 +503,14 @@ public sealed class SharedKeyBroadcastTier : IDisposable
             _viewers.Clear();
             _destinations = [];
             _encrypt.Dispose();
+            foreach (var retired in _retiredContexts)
+            {
+                retired.Dispose();
+            }
+
+            _retiredContexts.Clear();
         }
+
+        ActiveKeyStreams.TryRemove(_keyStreamIdentity, out _);
     }
 }

@@ -128,6 +128,33 @@ internal sealed class PublicBroadcastReceiveKeys : IDisposable
         return Outcome.Failed;
     }
 
+    /// <summary>
+    /// Tries to unprotect a broadcast SRTCP packet (the shared stream's sender reports, spec §5.5) under
+    /// the installed shared key(s). Only called for a broadcast SSRC; tries the current epoch, then the
+    /// previous. Viewer→SFU RTCP is never routed here — it rides the connection's own DTLS keys.
+    /// </summary>
+    internal Outcome TryUnprotectRtcp(uint ssrc, ReadOnlySpan<byte> srtcpPacket, Span<byte> output, out int length)
+    {
+        length = 0;
+        var snapshot = _snapshot;
+        if (snapshot is null || !snapshot.Ssrcs.Contains(ssrc))
+        {
+            return Outcome.NotBroadcast;
+        }
+
+        if (snapshot.Current.TryUnprotectRtcp(srtcpPacket, output, out length))
+        {
+            return Outcome.Unprotected;
+        }
+
+        if (snapshot.Previous is { } previous && previous.TryUnprotectRtcp(srtcpPacket, output, out length))
+        {
+            return Outcome.Unprotected;
+        }
+
+        return Outcome.Failed;
+    }
+
     public void Dispose()
     {
         lock (_installLock)

@@ -1966,8 +1966,7 @@ public sealed partial class PeerConnection
 
     private void HandleRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram)
     {
-        if (datagram.Length > _rxPlain.Length
-            || !srtp.Inbound.TryUnprotectRtcp(datagram, _rxPlain, out var length))
+        if (datagram.Length > _rxPlain.Length || !TryUnprotectRtcp(srtp, datagram, out var length))
         {
             Interlocked.Increment(ref _srtpFailures);
             return;
@@ -1976,6 +1975,38 @@ public sealed partial class PeerConnection
         Interlocked.Increment(ref _rtcpReceived);
         var now = DateTimeOffset.UtcNow;
         var reader = new RtcpCompoundReader(_rxPlain.AsSpan(0, length));
+        DrainRtcpCompound(ref reader, now);
+    }
+
+    // Unprotects one inbound RTCP datagram into _rxPlain, choosing keys by SSRC scope. Returns false when
+    // no context authenticated it (a broadcast-SSRC packet that fails is dropped, never retried on DTLS).
+    private bool TryUnprotectRtcp(SrtpContext srtp, ReadOnlySpan<byte> datagram, out int length)
+    {
+        // Shared-key public-broadcast SRTCP (spec §5.5): the shared stream's sender reports ride the
+        // broadcast key, not this connection's DTLS keys. The SRTCP sender SSRC (bytes 4-7) is in the
+        // clear (RFC 3711 §3.4 encrypts only past the 8-octet header), so it routes the same way inbound
+        // RTP does — by SSRC scope. Anything not on a broadcast SSRC (all viewer→SFU RTCP) uses DTLS keys.
+        var broadcast = _broadcastReceive;
+        if (broadcast is not null && datagram.Length >= 8)
+        {
+            var ssrc = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(datagram[4..8]);
+            switch (broadcast.TryUnprotectRtcp(ssrc, datagram, _rxPlain, out length))
+            {
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.Unprotected:
+                    return true;
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.Failed:
+                    return false;
+                case Broadcast.PublicBroadcastReceiveKeys.Outcome.NotBroadcast:
+                default:
+                    break;
+            }
+        }
+
+        return srtp.Inbound.TryUnprotectRtcp(datagram, _rxPlain, out length);
+    }
+
+    private void DrainRtcpCompound(ref RtcpCompoundReader reader, DateTimeOffset now)
+    {
         while (reader.MoveNext())
         {
             if (RtcpPacket.TryParse(reader.Current.Packet, out var parsed) && parsed is not null)
