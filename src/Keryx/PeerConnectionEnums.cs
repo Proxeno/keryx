@@ -27,7 +27,7 @@ public enum PeerConnectionState
 /// <summary>
 /// The JSEP signaling state of a <see cref="PeerConnection"/> (RFC 8829 §3.2), mirroring
 /// <c>RTCSignalingState</c>. Keryx produces and applies descriptions through
-/// <see cref="PeerConnection.CreateOfferAsync"/> / <see cref="PeerConnection.CreateAnswerAsync"/> /
+/// <see cref="PeerConnection.CreateOfferAsync(System.Threading.CancellationToken)"/> / <see cref="PeerConnection.CreateAnswerAsync"/> /
 /// <see cref="PeerConnection.SetRemoteDescriptionAsync"/>; each moves the machine between these states.
 /// There is deliberately no public <c>SetLocalDescription</c> (session-model.md §4.1).
 /// </summary>
