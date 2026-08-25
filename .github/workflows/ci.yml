@@ -42,17 +42,19 @@ jobs:
   # Firefox interop, CI-enforced. A third real-engine lane alongside the Chrome lane, reusing the
   # same role-flexible fixture and the same BrowserLauncher seam. It is valuable precisely because
   # Firefox exercises paths Chrome does not: it negotiates two-byte RTP header extensions more
-  # readily, prefers a different codec/PT ordering, makes its own a=setup role choice, and decodes
-  # H.264 only through the downloadable OpenH264 GMP rather than a built-in decoder. This job installs
-  # Firefox, so the FirefoxInterop tests (excluded from build-test above) MUST actually run here.
+  # readily, prefers a different codec/PT ordering, makes its own a=setup role choice, and does H.264
+  # only through the downloadable OpenH264 GMP rather than a built-in codec. This job installs Firefox,
+  # so the FirefoxInterop tests (excluded from build-test above) MUST actually run here.
   # KERYX_REQUIRE_FIREFOX=1 turns a missing or unlaunchable browser into a failure instead of the
   # graceful skip local dev gets, so an interop regression fails the build rather than passing.
-  # The lane proves the two directions headless Firefox can sustain against an H.264-only Keryx:
-  # Keryx offers H.264 + data channels and Firefox decodes/round-trips (media-server shape), and Keryx
-  # forwards RTP that Firefox receives (SFU egress). The browser-sends-H.264 ingest shape is left to the
-  # Chrome lane: headless Firefox's OpenH264 GMP decodes but does not encode, so a Firefox sendonly
-  # offer would carry no media. Data channels use classic SCTP DATA (not RFC 8260 I-DATA), which is what
-  # Firefox actually handles — see PeerConnection.StartSctp.
+  # The lane proves all three shapes against Firefox: Keryx offers H.264 + data channels and Firefox
+  # decodes/round-trips (media-server), Firefox offers sendonly and Keryx receives its H.264 (ingest),
+  # and Keryx forwards RTP that Firefox receives (SFU egress). Two things make H.264 work headless on a
+  # Linux runner that macOS does not need: the OpenH264 GMP is registered into each test profile, and
+  # its sandbox is disabled (MOZ_DISABLE_GMP_SANDBOX) so the plugin process can start — without it
+  # Firefox rejects Keryx's H.264 video m-section, which is Keryx's BUNDLE tag, and then gathers no ICE
+  # candidates at all. Data channels use classic SCTP DATA (not RFC 8260 I-DATA), which is what Firefox
+  # handles — see PeerConnection.StartSctp.
   firefox-interop:
     runs-on: ubuntu-latest
     # Safety bound: the FirefoxInterop tests each carry their own ~90s deadline and run serially, so a
@@ -68,11 +70,12 @@ jobs:
         id: setup-firefox
         with:
           firefox-version: latest
-      # Keryx speaks H.264 only, and Firefox needs Cisco's OpenH264 GMP to decode it (Firefox ships no
-      # built-in H.264): it downloads the GMP on demand. Warming it once into a template profile (and
-      # copying it into each test's throwaway profile via KERYX_FIREFOX_GMP_DIR) keeps every test from
-      # racing that download at SDP time. Best effort: the tests' prefs also enable Firefox's own
-      # on-demand fetch as a fallback, so a slow warm-up does not fail the job outright.
+      # Keryx speaks H.264 only, and Firefox needs Cisco's OpenH264 GMP to encode/decode it (Firefox
+      # ships no built-in H.264): it downloads the GMP on demand. Warming it once into a template
+      # profile — waiting for the registration pref, not just the plugin file — and copying that profile
+      # into each test's throwaway profile via KERYX_FIREFOX_GMP_DIR keeps every test from racing the
+      # download at SDP time. Best effort: the tests' prefs also enable Firefox's own on-demand fetch as
+      # a fallback, so a slow warm-up does not fail the job outright.
       - name: Warm up OpenH264 GMP
         run: |
           FF="${{ steps.setup-firefox.outputs.firefox-path }}"
@@ -88,16 +91,22 @@ jobs:
           EOF
           "$FF" --headless --no-remote --new-instance --profile "$PROFILE" about:blank &
           FF_PID=$!
-          for i in $(seq 1 30); do
-            if ls "$PROFILE"/gmp-gmpopenh264/*/libgmpopenh264.* >/dev/null 2>&1; then
-              echo "OpenH264 GMP downloaded."
+          # Wait for the plugin file AND the registration pref: Firefox only loads a GMP whose version
+          # is recorded in prefs.js, and that write lands after the download, so killing on the file
+          # alone leaves a profile that ignores the plugin (BrowserLauncher copies prefs.js to register
+          # it in each test profile). Require both before killing.
+          for i in $(seq 1 40); do
+            if ls "$PROFILE"/gmp-gmpopenh264/*/libgmpopenh264.* >/dev/null 2>&1 \
+               && grep -q 'gmp-gmpopenh264.version' "$PROFILE/prefs.js" 2>/dev/null; then
+              echo "OpenH264 GMP downloaded and registered."
               break
             fi
             sleep 2
           done
+          sleep 2
           kill "$FF_PID" 2>/dev/null || true
           echo "KERYX_FIREFOX_GMP_DIR=$PROFILE" >> "$GITHUB_ENV"
-          ls -R "$PROFILE/gmp-gmpopenh264" 2>/dev/null || echo "OpenH264 GMP not present after warm-up (tests will fetch on demand)"
+          grep 'gmp-gmpopenh264.version' "$PROFILE/prefs.js" 2>/dev/null || echo "OpenH264 GMP not registered after warm-up (tests will fetch on demand)"
       - run: dotnet build Keryx.slnx --configuration Release
       # The DTLS-SRTP/ICE path uses host candidates only — no STUN, TURN or mDNS — so it runs headless.
       # It is not loopback-only: headless Firefox gathers just its real interface address and binds its

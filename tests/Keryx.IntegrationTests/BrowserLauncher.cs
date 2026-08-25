@@ -139,6 +139,17 @@ internal static class BrowserLauncher
             },
         };
 
+        if (kind == BrowserKind.Firefox)
+        {
+            // Let the OpenH264 GMP child process start in a restricted headless environment (a CI
+            // container, and the GitHub runner). Without this the GMP sandbox fails to initialise, the
+            // plugin never loads, Firefox has no usable H.264 codec, and it rejects Keryx's H.264 video
+            // m-section — which, because that m-section is Keryx's BUNDLE tag, makes Firefox gather no
+            // ICE candidates at all and the whole handshake fail. This is what a real Linux runner needs
+            // that macOS (VideoToolbox H.264, working GMP sandbox) does not.
+            browser.StartInfo.Environment["MOZ_DISABLE_GMP_SANDBOX"] = "1";
+        }
+
         foreach (var argument in Arguments(kind, url, profileDir))
         {
             browser.StartInfo.ArgumentList.Add(argument);
@@ -194,16 +205,19 @@ internal static class BrowserLauncher
 
     /// <summary>
     /// Writes the <c>user.js</c> that turns a fresh Firefox profile into one that can complete a
-    /// headless, host-candidate-only WebRTC handshake against Keryx, and copies a warmed OpenH264 GMP
-    /// into it when one is offered. Firefox's defaults fight this interop in two ways this undoes:
+    /// headless, host-candidate-only WebRTC handshake against Keryx, and copies a warmed, registered
+    /// OpenH264 GMP into it when one is offered. Firefox's defaults fight this interop in two ways this
+    /// undoes:
     /// <list type="bullet">
     /// <item><c>media.peerconnection.ice.obfuscate_host_addresses=false</c> — disables the mDNS
     /// <c>.local</c> candidate hiding, so Firefox advertises a real interface address that Keryx (bound
     /// to <see cref="System.Net.IPAddress.Any"/>) can pair with. <c>media.peerconnection.ice.loopback</c>
     /// is left on so a 127.0.0.1 candidate is also offered where the platform exposes one.</item>
     /// <item>the <c>media.gmp-gmpopenh264.*</c> prefs enable the OpenH264 GMP so Firefox can offer,
-    /// answer and <em>decode</em> H.264 — the only video codec Keryx speaks. (Headless Firefox does not
-    /// <em>encode</em> H.264, so the Firefox lane never asks it to send video.)</item>
+    /// answer, encode and decode H.264 — the only video codec Keryx speaks. The GMP only actually loads
+    /// with its sandbox disabled in a headless CI environment (see <see cref="Launch"/>) and only when
+    /// the copied profile registers it (see <see cref="CopyWarmedGmp"/>); when both hold, video flows in
+    /// both directions.</item>
     /// </list>
     /// The remaining prefs silence first-run, telemetry and update chatter that would otherwise add
     /// latency and network noise to a headless CI launch.
@@ -219,7 +233,7 @@ internal static class BrowserLauncher
         var gmpTemplate = Environment.GetEnvironmentVariable("KERYX_FIREFOX_GMP_DIR");
         if (!string.IsNullOrEmpty(gmpTemplate))
         {
-            CopyOpenH264Gmp(gmpTemplate, profileDir);
+            CopyWarmedGmp(gmpTemplate, profileDir);
         }
 
         string[] prefs =
@@ -276,13 +290,18 @@ internal static class BrowserLauncher
         $"user_pref(\"{name}\", \"{value}\");";
 
     /// <summary>
-    /// Copies the <c>gmp-gmpopenh264</c> plugin tree from a warmed template profile into a throwaway
-    /// profile, so the throwaway can encode/decode H.264 immediately instead of racing an on-demand
-    /// download. Best effort: a missing template simply leaves Firefox to fetch the GMP itself.
+    /// Copies the OpenH264 GMP from a warmed template profile into a throwaway profile: both the
+    /// <c>gmp-gmpopenh264</c> plugin tree and the <c>prefs.js</c> that <em>registers</em> it. Copying
+    /// the plugin files alone is not enough — Firefox only loads a GMP whose version is recorded in
+    /// prefs (<c>media.gmp-gmpopenh264.version</c> and friends, written when Firefox downloaded it), so
+    /// without prefs.js the throwaway would ignore the copied files, reject H.264 and (H.264 being
+    /// Keryx's BUNDLE tag) fail ICE. The interop <c>user.js</c> is written afterwards and, being applied
+    /// over prefs.js at startup, wins for the interop prefs while the GMP registration is preserved.
+    /// Best effort: a missing template simply leaves Firefox to fetch the GMP itself.
     /// </summary>
-    /// <param name="templateProfileDir">The warmed profile that already holds the GMP.</param>
+    /// <param name="templateProfileDir">The warmed profile that already holds and registers the GMP.</param>
     /// <param name="profileDir">The throwaway profile to copy it into.</param>
-    private static void CopyOpenH264Gmp(string templateProfileDir, string profileDir)
+    private static void CopyWarmedGmp(string templateProfileDir, string profileDir)
     {
         try
         {
@@ -301,6 +320,12 @@ internal static class BrowserLauncher
             foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
             {
                 File.Copy(file, file.Replace(source, destination, StringComparison.Ordinal), overwrite: true);
+            }
+
+            var prefs = Path.Combine(templateProfileDir, "prefs.js");
+            if (File.Exists(prefs))
+            {
+                File.Copy(prefs, Path.Combine(profileDir, "prefs.js"), overwrite: true);
             }
         }
         catch (Exception)

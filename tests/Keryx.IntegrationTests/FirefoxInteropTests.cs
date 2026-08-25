@@ -9,9 +9,9 @@ namespace Keryx.IntegrationTests;
 
 /// <summary>
 /// The end goal of the stack, proven against a second real browser engine: headless Firefox fetches
-/// an offer from a Keryx <see cref="PeerConnection"/> over HTTP signaling, answers it, ICE connects on
-/// a pure 127.0.0.1 loopback, DTLS completes, Firefox decodes the H.264 video Keryx sends, and both
-/// data channels round-trip. It mirrors <see cref="ChromeInteropTests"/> and drives the identical
+/// an offer from a Keryx <see cref="PeerConnection"/> over HTTP signaling, answers it, ICE connects
+/// over host candidates only (no STUN/TURN/mDNS), DTLS completes, Firefox decodes the H.264 video Keryx
+/// sends, and both data channels round-trip. It mirrors <see cref="ChromeInteropTests"/> and drives the identical
 /// role-flexible fixture (<c>assets/chrome-client.html</c>) through the same
 /// <see cref="BrowserLauncher"/> seam — the value is that Firefox exercises paths Chrome does not
 /// (two-byte header extensions negotiated more readily, its own codec/PT preferences and <c>a=setup</c>

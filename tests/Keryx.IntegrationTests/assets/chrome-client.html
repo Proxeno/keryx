@@ -77,9 +77,10 @@ function wireChannel(dc) {
 
 // A moving, always-changing picture so the browser's encoder produces a steady RTP stream
 // (a still frame would be encoded once and then go quiet). Used only by role=offer-send, which
-// only the Chrome lane exercises: headless Chrome encodes H.264 from a canvas capture, whereas
-// headless Firefox cannot encode H.264 at all (its OpenH264 GMP decodes but does not encode), so
-// the Firefox lane omits the browser-sends-video shape rather than drive a source it cannot encode.
+// only the Chrome lane exercises: headless Chrome encodes H.264 from a canvas capture in every
+// environment, whereas headless Firefox has no portable H.264 encoder (it encodes on Linux but
+// not on macOS), so the Firefox lane omits the browser-sends-video shape rather than drive a
+// source it cannot reliably encode.
 function makeSyntheticVideoTrack() {
   const canvas = Object.assign(document.createElement("canvas"), { width: 320, height: 240 });
   const ctx = canvas.getContext("2d");

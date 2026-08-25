@@ -18,11 +18,13 @@ namespace Keryx.IntegrationTests;
 /// codec-matching and DTLS-role paths against inputs Chrome does not produce.
 /// <para>
 /// The complementary ingest shape (browser offers <c>sendonly</c>, Keryx receives the browser's RTP)
-/// that the Chrome lane proves is deliberately absent here: Keryx accepts only H.264 video, and
-/// headless Firefox cannot <em>encode</em> H.264 — its OpenH264 GMP decodes (so the keryx-offers flow
-/// works) but produces zero encoded frames, so a Firefox <c>sendonly</c> offer would carry no media to
-/// receive. That is a headless-Firefox codec limitation, not a Keryx defect; Chrome, whose H.264
-/// encoder works headless, covers the ingest direction.
+/// that the Chrome lane proves is deliberately absent here because headless Firefox's H.264 encoder is
+/// not portable: with the GMP sandbox disabled it encodes on Linux (where CI runs) but a headless macOS
+/// Firefox produces zero encoded frames (it has no working headless H.264 encoder), so a Firefox
+/// <c>sendonly</c> offer would carry media on CI but none on a developer's Mac — an inconsistency that
+/// would fail the lane locally. Keeping the browser-sends-H.264 direction on the Chrome lane, whose
+/// H.264 encoder works headless everywhere, keeps this lane green on both. H.264 <em>decode</em> (the
+/// keryx-offers and egress flows) is portable once the GMP is registered and its sandbox disabled.
 /// </para>
 /// </summary>
 /// <remarks>
