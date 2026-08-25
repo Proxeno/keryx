@@ -27,6 +27,19 @@ public sealed class RembFeedbackGenerator
     public static readonly TimeSpan DefaultFeedbackInterval = TimeSpan.FromMilliseconds(1000);
 
     /// <summary>
+    /// The most distinct SSRCs a single REMB will ever name. The wire format
+    /// (<c>draft-alvestrand-rmcat-remb-03</c> §2.2) carries an 8-bit <c>Num SSRC</c> count, so a value past
+    /// 255 cannot even be represented — the count byte would wrap while the body still carried every entry.
+    /// A peer authenticated to the SRTP context can stamp an arbitrary SSRC on every packet it sends, and
+    /// each unseen value would otherwise be retained forever (unbounded memory) and add four bytes to the
+    /// emitted packet (past a few hundred SSRCs the REMB no longer fits the RTCP MTU buffer, so building it
+    /// throws on the receive loop). Capping the retained set here bounds all three, exactly as the receive
+    /// path caps per-source state at <c>MaxReceiveSources</c>. The estimator still observes every packet's
+    /// timing, so the bitrate estimate is unaffected; only the list of named SSRCs is bounded.
+    /// </summary>
+    public const int MaxTrackedSsrcs = 255;
+
+    /// <summary>
     /// A drop of at least this fraction below the last reported estimate forces an immediate REMB rather
     /// than waiting out the interval, so the sender learns of congestion promptly (libwebrtc's 3% trigger).
     /// </summary>
@@ -85,7 +98,12 @@ public sealed class RembFeedbackGenerator
         _estimator.OnPacketReceived(absoluteSendTime, arrivalTimeMicroseconds, payloadSizeBytes);
         _hasArrival = true;
         _lastArrivalMicroseconds = arrivalTimeMicroseconds;
-        if (_ssrcSet.Add(ssrc))
+
+        // Retain at most MaxTrackedSsrcs distinct sources: an authenticated peer can invent a fresh SSRC on
+        // every packet, so an uncapped set would grow without bound and eventually build a REMB too large
+        // for the RTCP MTU buffer. Sources past the cap still feed the estimator above; they are simply not
+        // named in the feedback, which only advertises which streams the estimate covers.
+        if (_ssrcSet.Count < MaxTrackedSsrcs && _ssrcSet.Add(ssrc))
         {
             _ssrcs.Add(ssrc);
         }

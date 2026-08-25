@@ -2252,6 +2252,14 @@ public sealed partial class PeerConnection
                 // The ICE transport lost its pair, or a layer was disposed mid-send.
                 return false;
             }
+            catch (ByteBufferException ex)
+            {
+                // A compound that does not fit the fixed RTCP MTU buffer must never fault the caller: this
+                // path runs on the single ICE receive loop, so an escaping exception would tear the whole
+                // transport down. Drop the report instead — a skipped RTCP packet is a self-correcting loss.
+                _logger.Log(KeryxLogLevel.Warning, "Dropping an oversized RTCP compound that did not fit the send buffer.", ex);
+                return false;
+            }
         }
     }
 
