@@ -13,6 +13,9 @@ Hot per-packet paths at the ~1200-byte target packet size, with `[MemoryDiagnose
 | `PacketizeBenchmarks` | `H264Packetizer.Packetize` for a 720p P-frame (FU-A) and keyframe (STAP-A + FU-A). |
 | `ForwardBenchmarks` | `RtpForwarder.TryForward` — the per-subscriber SFU rewrite primitive. |
 | `ReceivePathBenchmarks` | `ProcessDecryptedRtp` — the full post-SRTP receive path for one ingest source. |
+| `ClockReadBenchmarks` | The per-packet clock reads: `PeerConnection.MonotonicMicroseconds` and `DateTimeOffset.UtcNow` Unix milliseconds. |
+| `SendLockBenchmarks` | `lock (object)` as the send path uses it, uncontended and against a feedback/RTX-send contender thread. |
+| `GetTransceiverBenchmarks` | `PeerConnection.GetTransceiver(mid)` for the last mid (worst-case linear scan) at 2, 8 and 32 transceivers. |
 
 Run:
 
