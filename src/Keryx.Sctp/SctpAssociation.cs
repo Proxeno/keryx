@@ -64,7 +64,7 @@ public sealed class SctpAssociation : IDisposable
     // fast-retransmit processing resolve a chunk by TSN in O(1) instead of scanning _out, so a peer
     // that grows a large send backlog and then floods overlapping in-window gap-ack blocks cannot
     // force O(blocks x window x _out) work. Every add/remove/clear of _out routes through
-    // AddOutgoing/RemoveOutgoingWhere/ClearOutgoing so the two never drift; OutgoingChunk.Tsn is
+    // AddOutgoing/RemoveOutgoingThrough/ClearOutgoing so the two never drift; OutgoingChunk.Tsn is
     // init-only, so an entry's key is stable for its lifetime and TSNs in _out are unique.
     private readonly Dictionary<uint, OutgoingChunk> _outByTsn = new();
     private readonly Dictionary<ushort, ushort> _sendSequence = new();
@@ -307,6 +307,31 @@ public sealed class SctpAssociation : IDisposable
             lock (_lock)
             {
                 return Math.Max(_fragments.Count, _received.Count);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Snapshot of the outstanding chunk TSNs in queue order, plus whether the TSN index agrees with
+    /// the queue (same count, and every queued chunk resolves to the same instance). Test observability
+    /// only.
+    /// </summary>
+    internal (uint[] Tsns, bool IndexConsistent) OutgoingSnapshotForTest
+    {
+        get
+        {
+            lock (_lock)
+            {
+                var tsns = new uint[_out.Count];
+                var consistent = _out.Count == _outByTsn.Count;
+                for (var i = 0; i < _out.Count; i++)
+                {
+                    tsns[i] = _out[i].Tsn;
+                    consistent &= _outByTsn.TryGetValue(tsns[i], out var indexed)
+                                  && ReferenceEquals(indexed, _out[i]);
+                }
+
+                return (tsns, consistent);
             }
         }
     }
@@ -2547,7 +2572,7 @@ public sealed class SctpAssociation : IDisposable
             GrowCongestionWindow(flightBefore, ackedBytes);
         }
 
-        RemoveOutgoingWhere(c => Serial.Lte(c.Tsn, _peerCumulativeAck));
+        RemoveOutgoingThrough(_peerCumulativeAck);
         MaybeSendForwardTsn();
 
         // A stream reset queued while its data was still in flight can proceed now that a SACK has
@@ -2638,20 +2663,35 @@ public sealed class SctpAssociation : IDisposable
     }
 
     /// <summary>
-    /// Removes every outgoing chunk matching <paramref name="predicate"/> from the queue and the TSN
-    /// index in a single pass, keeping the two consistent.
+    /// Removes every outgoing chunk whose TSN is at or before <paramref name="tsn"/> (serial-number
+    /// arithmetic) from the queue and the TSN index in a single in-place compaction pass, keeping the two
+    /// consistent. Allocation-free: this runs once per SACK.
     /// </summary>
-    private void RemoveOutgoingWhere(Predicate<OutgoingChunk> predicate) =>
-        _out.RemoveAll(chunk =>
+    private void RemoveOutgoingThrough(uint tsn)
+    {
+        var write = 0;
+        for (var read = 0; read < _out.Count; read++)
         {
-            if (!predicate(chunk))
+            var chunk = _out[read];
+            if (Serial.Lte(chunk.Tsn, tsn))
             {
-                return false;
+                _outByTsn.Remove(chunk.Tsn);
+                continue;
             }
 
-            _outByTsn.Remove(chunk.Tsn);
-            return true;
-        });
+            if (write != read)
+            {
+                _out[write] = chunk;
+            }
+
+            write++;
+        }
+
+        if (write < _out.Count)
+        {
+            _out.RemoveRange(write, _out.Count - write);
+        }
+    }
 
     /// <summary>Empties the outgoing queue and its TSN index together.</summary>
     private void ClearOutgoing()
@@ -2772,7 +2812,7 @@ public sealed class SctpAssociation : IDisposable
         }
 
         _controlQueue.Add(forward);
-        RemoveOutgoingWhere(c => Serial.Lte(c.Tsn, _advancedPeerAckPoint));
+        RemoveOutgoingThrough(_advancedPeerAckPoint);
     }
 
     /// <summary>

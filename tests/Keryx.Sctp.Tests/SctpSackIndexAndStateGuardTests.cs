@@ -106,6 +106,66 @@ public class SctpSackIndexAndStateGuardTests
         }
     }
 
+    [Fact]
+    public void CumulativeAckThroughTheMiddleKeepsSurvivorOrderAndTsnsIndexConsistent()
+    {
+        // A cumulative ack through the middle of a transmitted backlog removes only the chunks it
+        // acknowledges: the survivors keep their enqueue order and the TSN index still resolves every
+        // one of them (and only them). This guards the in-place compaction that replaced the
+        // predicate-based removal.
+        const int backlog = 32;
+        var (injectorTransport, victimTransport) = LoopbackTransport.CreatePair();
+        victimTransport.MaxDatagramSize = 1 << 20;
+        var victim = new SctpAssociation(victimTransport, Config(isInitiator: true, usesEvenStreamIds: true, receiveWindow: 16u * 1024 * 1024));
+
+        try
+        {
+            victim.Start();
+            var channel = victim.CreateChannel("bulk");
+            var payload = new byte[] { 0x5a };
+            for (var i = 0; i < backlog; i++)
+            {
+                channel.Send(payload);
+            }
+
+            _ = victim.ConnectAsync().ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+            WaitFor(() => victim.State == SctpAssociationState.CookieWait).Should().BeTrue();
+            InjectInitAck(injectorTransport, victim.LocalVerificationTag, peerTag: 0x2222_2222u, peerInitialTsn: 1000u, advertisedWindow: 16u * 1024 * 1024);
+            WaitFor(() => victim.State == SctpAssociationState.CookieEchoed).Should().BeTrue();
+            InjectCookieAck(injectorTransport, victim.LocalVerificationTag);
+
+            WaitFor(() => victim.State == SctpAssociationState.Established).Should().BeTrue();
+            WaitFor(() => victim.GetStatistics().BytesInFlight > 0
+                          && victim.GetStatistics().QueuedChunks >= backlog).Should().BeTrue();
+
+            var before = victim.OutgoingSnapshotForTest;
+            before.Tsns.Should().HaveCountGreaterThanOrEqualTo(backlog);
+            before.IndexConsistent.Should().BeTrue();
+
+            // Cumulative-ack the first half of the queue. The ack point is the last TSN in the acked
+            // half; the rest must remain, in their original order.
+            var acked = before.Tsns.Length / 2;
+            InjectSack(
+                injectorTransport,
+                victim.LocalVerificationTag,
+                cumulativeTsnAck: before.Tsns[acked - 1],
+                window: 16u * 1024 * 1024,
+                blocks: Array.Empty<SctpGapAckBlock>());
+
+            WaitFor(() => victim.GetStatistics().QueuedChunks == before.Tsns.Length - acked).Should().BeTrue();
+
+            var after = victim.OutgoingSnapshotForTest;
+            after.Tsns.Should().Equal(before.Tsns[acked..]);
+            after.IndexConsistent.Should().BeTrue();
+        }
+        finally
+        {
+            victim.Dispose();
+            injectorTransport.Dispose();
+            victimTransport.Dispose();
+        }
+    }
+
     // ---------------------------------------------------------------- Finding 2
 
     [Fact]
