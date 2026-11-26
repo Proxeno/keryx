@@ -1,8 +1,12 @@
 # Broadcast fan-out at scale
 
-Status: **proposed design — no implementation.** §5 (shared-key encrypt-once broadcast) **requires
-explicit owner sign-off before any code lands**; everything else is implementable as specified once
-the §6 phasing decisions are taken. This document designs the path from today's SFU shape (one
+Status: **design document, partly implemented.** Shipped: the batched `sendmmsg` sender
+(`Keryx.Core.BatchedDatagramSender`, §3), the shared-socket `BroadcastEndpoint` with its
+`SO_REUSEPORT` socket pool and per-shard statistics (`Keryx.Broadcast`, §2), parallel per-subscriber
+encrypt (`BroadcastFanout`, §4) and the shared-key tier types (`SharedKeyBroadcastTier`,
+`PublicBroadcastKey`, §5). Not implemented: the §4.2 per-shard session ownership. §5 (shared-key
+encrypt-once broadcast) **required explicit owner sign-off**; the sections below keep their
+original design wording. This document designs the path from today's SFU shape (one
 `PeerConnection` per viewer, one socket per connection, one encrypt per delivered packet) to
 Twitch/concert-style broadcast: **one ingest → tens of thousands of viewers at 480p–720p**, pushed
 until the limiting resource is the NIC itself.
@@ -519,9 +523,12 @@ surface; sends remain per-socket `SendTo` (nothing to batch yet — the honest l
 `Keryx.Broadcast` assembly vs. inside `Keryx`; and the `IceEndpointSession` addition to
 `Keryx.Ice`)*. 5-tuple demux, ufrag first-contact binding, `SharedSocketTransport`, ICE
 endpoint-session mode, per-viewer DTLS/SRTP over the shared socket (§2.2). **Interop-gated**: the
-CI browser lanes (Chrome, Firefox — `.github/workflows/ci.yml:25,58`) and the pion lane
-(`ci.yml:127`) each grow a shared-port variant, so "a stock browser connects to the shared port,
-completes ICE+DTLS, and plays media" is CI-enforced, not asserted.
+CI browser lanes (Chrome, Firefox) and the pion lane each grow a shared-port variant, so "a stock browser connects to the shared port,
+completes ICE+DTLS, and plays media" is CI-enforced, not asserted. **Status (shipped):** the
+`shared-port-chrome-interop`, `shared-port-firefox-interop` and `shared-port-pion-interop` jobs in
+`ci.yml` run these against a `BroadcastEndpoint` with `SocketPoolSize = 2` (a real two-socket pool on
+the Linux runner), on both the per-connection `TryForwardRtp` path and the bridged
+`BroadcastFanout` -> `SendBatch` path.
 
 **PR 4 — batches wired in.** Per-shard `SendBatch` flush on the shared socket (§3.2). Small once
 PR 1 + PR 3 exist; the measured 1.74×/39× lever is collected here.

@@ -14,6 +14,9 @@ than for kernel-grade SCTP.
 - Reliability: T3-rtx with RFC 6298-style RTT estimation, fast retransmit, peer a_rwnd respected,
   fragmentation/reassembly (B/E flags) for messages beyond the DTLS MTU, ordered delivery per
   stream SSN, unordered (U=1) bypass.
+- Outgoing chunks acknowledged by a SACK or skipped by a FORWARD-TSN are removed by an in-place
+  compaction (`RemoveOutgoingThrough`) that keeps survivor order and the TSN index, so neither
+  chunk allocates a delegate.
 - DCEP: DATA_CHANNEL_OPEN/ACK with the full channel-type matrix (reliable/partial-reliable ×
   ordered/unordered), label/protocol, and the RFC 8832 stream-parity rule (DTLS client side uses
   even stream ids — wired from the resolved DTLS role, since Keryx is usually the DTLS *server*).
