@@ -70,11 +70,13 @@ public sealed partial class PeerConnection
     private long _fecPacketsRecovered;
 
     /// <summary>
-    /// How many media packets one FEC repair packet protects. A repair packet recovers a single loss per
-    /// group, so smaller groups repair a higher loss rate at more overhead. Kept below the ULPFEC short
-    /// mask width (16) so one repair packet always spans a whole group, and well below the FlexFEC mask.
+    /// The default initial group size: how many media packets one FEC repair packet protects before any
+    /// loss report has moved it. A repair packet recovers a single loss per group, so smaller groups
+    /// repair a higher loss rate at more overhead. Kept below the ULPFEC short mask width (16) so one
+    /// repair packet always spans a whole group, and well below the FlexFEC mask. The live value comes
+    /// from <see cref="FecProtectionOptions.InitialGroupSize"/> and adapts to reported loss.
     /// </summary>
-    internal const int FecProtectionGroupSize = 10;
+    internal const int FecProtectionGroupSize = FecProtectionOptions.DefaultInitialGroupSize;
 
     /// <summary>The <c>a=extmap</c> id offered for the transport-wide congestion-control extension.</summary>
     private const int TransportCcExtensionId = 3;
@@ -1223,14 +1225,25 @@ public sealed partial class PeerConnection
 
                 if (transceiver.Kind == MediaKind.Video)
                 {
+                    // Decide the FEC scheme before sizing the media payload: a repair packet is the media
+                    // packet plus the FEC header (and, for ULPFEC, the RED byte) plus the repair's own
+                    // transport-cc extension, so reserving that from the media payload is what keeps a
+                    // repair inside the same datagram budget as the packet it repairs.
+                    var fecScheme = SelectFecScheme(sender, negotiated);
                     var videoMaxPayload = maxPayload;
+                    if (fecScheme != FecScheme.None)
+                    {
+                        videoMaxPayload -= FecEmitter.MediaPayloadReserve(fecScheme == FecScheme.FlexFec, transportCcId);
+                    }
+
                     RtxRetransmitter? rtx = null;
 
                     if (_config.EnableRetransmission && negotiated.RtxPayloadType is { } rtxPayloadType)
                     {
                         // An RTX packet is the original packet plus the two-octet OSN (RFC 4588 §4), so the
-                        // media stream gives those two bytes back to keep repairs inside the same MTU.
-                        videoMaxPayload = maxPayload - RtxPacket.OriginalSequenceNumberLength;
+                        // media stream gives those two bytes back to keep repairs inside the same MTU. Both
+                        // reserves apply when FEC and RTX are on together.
+                        videoMaxPayload -= RtxPacket.OriginalSequenceNumberLength;
                         var history = new RtpSendHistory(
                             RtpHeader.FixedLength + extensionReserve + videoMaxPayload,
                             _config.RetransmissionHistory);
@@ -1282,6 +1295,38 @@ public sealed partial class PeerConnection
     }
 
     /// <summary>
+    /// Selects the FEC scheme a sending video track will use from what the answer settled on, or
+    /// <see cref="FecScheme.None"/> when neither flag is set or the matching codecs were not kept.
+    /// FlexFEC wins when both are available.
+    /// </summary>
+    private FecScheme SelectFecScheme(RtpSender sender, NegotiatedTrack negotiated)
+    {
+        if (_config.EnableFlexFec
+            && negotiated.FlexFecPayloadType is not null
+            && sender.FlexFecSsrcRaw != 0)
+        {
+            return FecScheme.FlexFec;
+        }
+
+        if (_config.EnableUlpfec
+            && negotiated.RedPayloadType is not null
+            && negotiated.UlpfecPayloadType is not null)
+        {
+            return FecScheme.Ulpfec;
+        }
+
+        return FecScheme.None;
+    }
+
+    /// <summary>Which forward-error-correction scheme a sending video track uses, if any.</summary>
+    private enum FecScheme
+    {
+        None,
+        Ulpfec,
+        FlexFec,
+    }
+
+    /// <summary>
     /// Builds the FEC emitter for a sending video track from what the answer settled on: a FlexFEC (RFC
     /// 8627) emitter on the sender's dedicated FlexFEC SSRC when FlexFEC was kept, else an RFC 5109 ULPFEC
     /// emitter (RED-wrapped, RFC 2198) on a private repair SSRC when red/ulpfec were kept. FlexFEC wins.
@@ -1290,33 +1335,59 @@ public sealed partial class PeerConnection
     /// </summary>
     private FecEmitter? BuildFecEmitter(RtpSender sender, NegotiatedTrack negotiated, int datagram, int srtpOverhead)
     {
-        if (_config.EnableFlexFec
-            && negotiated.FlexFecPayloadType is { } flexFecPayloadType
-            && sender.FlexFecSsrcRaw != 0)
+        var scheme = SelectFecScheme(sender, negotiated);
+        if (scheme == FecScheme.None)
         {
+            return null;
+        }
+
+        // One controller per emitter: the group size is per sending track. Each is driven by the RTCP
+        // receive loop's loss reports and publishes its size to this track's send path.
+        var controller = new FecProtectionController(_config.FecProtection);
+        var adaptive = _config.FecProtection.AdaptiveGroupSize;
+
+        if (scheme == FecScheme.FlexFec)
+        {
+            var flexFecPayloadType = negotiated.FlexFecPayloadType!.Value;
             var generator = new FlexFecGenerator(sender.Ssrc, datagram);
             var fecStream = new RtpStreamSender(sender.FlexFecSsrcRaw, flexFecPayloadType, negotiated.ClockRate, logger: _logger);
             _logger.Log(
                 KeryxLogLevel.Info,
                 $"FlexFEC enabled: pt {flexFecPayloadType}, ssrc 0x{sender.FlexFecSsrcRaw:x8}, "
-                + $"protecting media ssrc 0x{sender.Ssrc:x8} in groups of {FecProtectionGroupSize}.");
-            return FecEmitter.ForFlexFec(generator, fecStream, FecProtectionGroupSize, srtpOverhead, SendRtp, _logger);
+                + $"protecting media ssrc 0x{sender.Ssrc:x8}; initial group size {controller.GroupSize}, "
+                + $"adaptive group size {(adaptive ? "on" : "off")}.");
+            return FecEmitter.ForFlexFec(
+                generator,
+                fecStream,
+                controller,
+                srtpOverhead,
+                SendRtp,
+                _logger,
+                _sendTransportCcExtensionId,
+                NextTransportWideSequenceNumber,
+                OnTransportRtpSent);
         }
 
-        if (_config.EnableUlpfec
-            && negotiated.RedPayloadType is { } redPayloadType
-            && negotiated.UlpfecPayloadType is { } ulpfecPayloadType)
-        {
-            var generator = new UlpFecGenerator(datagram);
-            var fecStream = new RtpStreamSender(NewSsrc(), redPayloadType, negotiated.ClockRate, logger: _logger);
-            _logger.Log(
-                KeryxLogLevel.Info,
-                $"ULPFEC enabled: red pt {redPayloadType}, ulpfec pt {ulpfecPayloadType}, ssrc 0x{fecStream.Ssrc:x8}, "
-                + $"protecting media ssrc 0x{sender.Ssrc:x8} in groups of {FecProtectionGroupSize}.");
-            return FecEmitter.ForUlpfec(generator, ulpfecPayloadType, fecStream, FecProtectionGroupSize, srtpOverhead, SendRtp, _logger);
-        }
-
-        return null;
+        var redPayloadType = negotiated.RedPayloadType!.Value;
+        var ulpfecPayloadType = negotiated.UlpfecPayloadType!.Value;
+        var ulpGenerator = new UlpFecGenerator(datagram);
+        var ulpStream = new RtpStreamSender(NewSsrc(), redPayloadType, negotiated.ClockRate, logger: _logger);
+        _logger.Log(
+            KeryxLogLevel.Info,
+            $"ULPFEC enabled: red pt {redPayloadType}, ulpfec pt {ulpfecPayloadType}, ssrc 0x{ulpStream.Ssrc:x8}, "
+            + $"protecting media ssrc 0x{sender.Ssrc:x8}; initial group size {controller.GroupSize}, "
+            + $"adaptive group size {(adaptive ? "on" : "off")}.");
+        return FecEmitter.ForUlpfec(
+            ulpGenerator,
+            ulpfecPayloadType,
+            ulpStream,
+            controller,
+            srtpOverhead,
+            SendRtp,
+            _logger,
+            _sendTransportCcExtensionId,
+            NextTransportWideSequenceNumber,
+            OnTransportRtpSent);
     }
 
     /// <summary>
@@ -2439,6 +2510,25 @@ public sealed partial class PeerConnection
 
             sender.Quality = quality;
 
+            // Feed the media stream's reception-report loss to its FEC protection controller. The RR for
+            // the media SSRC is the pre-recovery loss of exactly the packets FEC protects, whereas
+            // transport-cc loss (which drives the congestion controller) mixes in audio, RTX repairs and
+            // the repair packets themselves, so it is the wrong signal for sizing the group. The RTX
+            // filter above already excludes the repair stream, and FEC SSRCs are not in the owner map.
+            if (video && sender.Track?.Fec is { } fec && fec.OnReportedLoss(quality.FractionLost))
+            {
+                var groupSize = fec.GroupSize;
+                var overhead = 1.0 / (groupSize + 1);
+                var smoothed = fec.SmoothedLoss;
+                _logger.Log(
+                    KeryxLogLevel.Info,
+                    $"FEC protection group size changed to {groupSize} for media ssrc 0x{block.SourceSsrc:x8} "
+                    + $"(nominal overhead {overhead:F3} of packets, smoothed loss {smoothed:F4}).");
+                FecProtectionChanged?.Invoke(
+                    this,
+                    new FecProtectionChangedEventArgs(sender.Negotiated?.Mid ?? string.Empty, groupSize, overhead, smoothed));
+            }
+
             // Feed reception-report loss to the loss-based estimator. Video carries the bitrate the
             // estimator is protecting, so prefer it; fall back to audio only when no video is sent.
             if (video || FirstSender(MediaKind.Video)?.Negotiated is null)
@@ -3087,36 +3177,63 @@ public sealed partial class PeerConnection
         private readonly FlexFecGenerator? _flexfec;
         private readonly byte _ulpfecPayloadType;
         private readonly RtpStreamSender _stream;
-        private readonly int _groupSize;
+        private readonly FecProtectionController _controller;
         private readonly Action<byte[], int> _send;
         private readonly IKeryxLogger _logger;
         private readonly byte[] _payloadScratch;
         private readonly byte[]? _redScratch;
         private readonly byte[] _packetBuffer;
 
+        // Transport-wide-cc stamping. Active only when all three are non-null: the negotiated extmap id
+        // to write, the shared sequence-number allocator (under _sendLock), and the send-history hook.
+        // Without all three the repair packet is emitted exactly as before this change.
+        private readonly byte? _transportCcExtensionId;
+        private readonly Func<ushort>? _nextTransportSequenceNumber;
+        private readonly Action<ushort, int>? _onTransportPacketSent;
+
+        // Published to the send path from the RTCP receive loop, so both are volatile: the controller
+        // itself is single-threaded and belongs to the receive loop only.
+        private int _groupSize;
+        private double _smoothedLoss;
+
+        // Written under _sendLock (the send path) and read from anywhere for stats, hence atomics.
+        private long _repairPacketsSent;
+        private long _repairBytesSent;
+
         private FecEmitter(
             UlpFecGenerator? ulpfec,
             FlexFecGenerator? flexfec,
             byte ulpfecPayloadType,
             RtpStreamSender stream,
-            int groupSize,
+            FecProtectionController controller,
             int srtpOverhead,
             Action<byte[], int> send,
-            IKeryxLogger logger)
+            IKeryxLogger logger,
+            byte? transportCcExtensionId,
+            Func<ushort>? nextTransportSequenceNumber,
+            Action<ushort, int>? onTransportPacketSent)
         {
             _ulpfec = ulpfec;
             _flexfec = flexfec;
             _ulpfecPayloadType = ulpfecPayloadType;
             _stream = stream;
-            _groupSize = groupSize;
+            _controller = controller;
+            _groupSize = controller.GroupSize;
             _send = send;
             _logger = logger;
+            _transportCcExtensionId = transportCcExtensionId;
+            _nextTransportSequenceNumber = nextTransportSequenceNumber;
+            _onTransportPacketSent = onTransportPacketSent;
 
             var maxFecPayload = ulpfec?.MaxFecPayloadSize ?? flexfec!.MaxFecPayloadSize;
             _payloadScratch = new byte[maxFecPayload];
             _redScratch = ulpfec is null ? null : new byte[RedPacket.PrimaryHeaderLength + maxFecPayload];
             var redOverhead = ulpfec is null ? 0 : RedPacket.PrimaryHeaderLength;
-            _packetBuffer = new byte[RtpHeader.FixedLength + redOverhead + maxFecPayload + srtpOverhead];
+
+            // The repair packet carries its own transport-cc extension when TWCC was negotiated, so the
+            // reusable buffer has room for it in addition to the header, RED byte and protected span.
+            var extensionOverhead = TrackSender.HeaderExtensionOverhead(transportCcExtensionId, null);
+            _packetBuffer = new byte[RtpHeader.FixedLength + redOverhead + maxFecPayload + srtpOverhead + extensionOverhead];
         }
 
         /// <summary>Builds an RFC 5109 ULPFEC emitter that RED-wraps each repair packet under <paramref name="ulpfecPayloadType"/>.</summary>
@@ -3124,21 +3241,102 @@ public sealed partial class PeerConnection
             UlpFecGenerator generator,
             byte ulpfecPayloadType,
             RtpStreamSender stream,
-            int groupSize,
+            FecProtectionController controller,
             int srtpOverhead,
             Action<byte[], int> send,
-            IKeryxLogger logger) =>
-            new(generator, null, ulpfecPayloadType, stream, groupSize, srtpOverhead, send, logger);
+            IKeryxLogger logger,
+            byte? transportCcExtensionId = null,
+            Func<ushort>? nextTransportSequenceNumber = null,
+            Action<ushort, int>? onTransportPacketSent = null) =>
+            new(
+                generator,
+                null,
+                ulpfecPayloadType,
+                stream,
+                controller,
+                srtpOverhead,
+                send,
+                logger,
+                transportCcExtensionId,
+                nextTransportSequenceNumber,
+                onTransportPacketSent);
 
         /// <summary>Builds an RFC 8627 FlexFEC emitter that sends each repair packet on its own SSRC.</summary>
         internal static FecEmitter ForFlexFec(
             FlexFecGenerator generator,
             RtpStreamSender stream,
-            int groupSize,
+            FecProtectionController controller,
             int srtpOverhead,
             Action<byte[], int> send,
-            IKeryxLogger logger) =>
-            new(null, generator, 0, stream, groupSize, srtpOverhead, send, logger);
+            IKeryxLogger logger,
+            byte? transportCcExtensionId = null,
+            Func<ushort>? nextTransportSequenceNumber = null,
+            Action<ushort, int>? onTransportPacketSent = null) =>
+            new(
+                null,
+                generator,
+                0,
+                stream,
+                controller,
+                srtpOverhead,
+                send,
+                logger,
+                transportCcExtensionId,
+                nextTransportSequenceNumber,
+                onTransportPacketSent);
+
+        /// <summary>The current protection group size: media packets per repair packet.</summary>
+        internal int GroupSize => Volatile.Read(ref _groupSize);
+
+        /// <summary>The protection controller's smoothed loss fraction.</summary>
+        internal double SmoothedLoss => Volatile.Read(ref _smoothedLoss);
+
+        /// <summary>The repair packets emitted so far.</summary>
+        internal long RepairPacketsSent => Interlocked.Read(ref _repairPacketsSent);
+
+        /// <summary>The total bytes of repair packets emitted so far.</summary>
+        internal long RepairBytesSent => Interlocked.Read(ref _repairBytesSent);
+
+        /// <summary>
+        /// The number of bytes a repair packet adds to the media packet it protects: the repair's own
+        /// header extension (when TWCC is stamped) plus the FEC header (and, for ULPFEC, the RED
+        /// primary-block header). Reserving this from the media payload budget keeps every repair inside
+        /// the same datagram budget as the media packet.
+        /// </summary>
+        /// <param name="flexFec">True for FlexFEC, false for ULPFEC.</param>
+        /// <param name="transportCcExtensionId">The negotiated transport-cc extmap id, or null.</param>
+        /// <returns>The byte reserve to subtract from the media payload budget.</returns>
+        internal static int MediaPayloadReserve(bool flexFec, byte? transportCcExtensionId)
+        {
+            var reserve = TrackSender.HeaderExtensionOverhead(transportCcExtensionId, null);
+            reserve += flexFec
+                ? FlexFecPacket.MaxHeaderLength
+                : RedPacket.PrimaryHeaderLength + UlpFecPacket.HeaderLength;
+            return reserve;
+        }
+
+        /// <summary>
+        /// Folds one reception report's loss fraction into the protection controller and, when the group
+        /// size moves, publishes the new size to the send path.
+        /// </summary>
+        /// <remarks>
+        /// Called only from the RTCP receive loop. The send path picks the new size up at its next media
+        /// packet; a group already holding at least the new size is closed by the very next media packet
+        /// (<see cref="AddMediaPacket"/> compares the count against the published value).
+        /// </remarks>
+        /// <param name="fractionLost">The report block's lost-packet fraction, 0 to 1.</param>
+        /// <returns><see langword="true"/> when the group size changed.</returns>
+        internal bool OnReportedLoss(double fractionLost)
+        {
+            var changed = _controller.OnReportedLoss(fractionLost);
+            Volatile.Write(ref _smoothedLoss, _controller.SmoothedLoss);
+            if (changed)
+            {
+                Volatile.Write(ref _groupSize, _controller.GroupSize);
+            }
+
+            return changed;
+        }
 
         /// <summary>
         /// Folds one just-assembled media packet (header, extensions and payload — the exact plaintext the
@@ -3158,7 +3356,7 @@ public sealed partial class PeerConnection
                 TryAdd(mediaPacket);
             }
 
-            return Count >= _groupSize;
+            return Count >= Volatile.Read(ref _groupSize);
         }
 
         /// <summary>
@@ -3182,10 +3380,51 @@ public sealed partial class PeerConnection
                 return;
             }
 
+            var stamping = _transportCcExtensionId is not null
+                && _nextTransportSequenceNumber is not null
+                && _onTransportPacketSent is not null;
+
             int packetLength;
+            ushort transportSequenceNumber = 0;
             try
             {
-                if (_ulpfec is not null)
+                if (stamping)
+                {
+                    // Draw the transport-wide sequence number only after TryProduce succeeded, so a group
+                    // that cannot be repaired never burns a number. The repair carries transport-cc only
+                    // (no abs-send-time), encoded exactly as TrackSender.EmitPacket does it.
+                    transportSequenceNumber = _nextTransportSequenceNumber!();
+                    Span<byte> extensionBuffer = stackalloc byte[TransportCcExtension.OneByteBodyLength];
+                    var writer = new RtpOneByteExtensionWriter(extensionBuffer);
+                    Span<byte> seqBytes = stackalloc byte[2];
+                    BinaryPrimitives.WriteUInt16BigEndian(seqBytes, transportSequenceNumber);
+                    writer.TryAppend(_transportCcExtensionId!.Value, seqBytes);
+                    writer.Finish();
+
+                    if (_ulpfec is not null)
+                    {
+                        var redLength = RedPacket.WritePrimaryOnly(
+                            _ulpfecPayloadType, _payloadScratch.AsSpan(0, payloadLength), _redScratch);
+                        packetLength = _stream.WritePacket(
+                            _redScratch.AsSpan(0, redLength),
+                            marker: false,
+                            timestamp,
+                            RtpHeaderExtension.OneByteProfile,
+                            writer.Written,
+                            _packetBuffer);
+                    }
+                    else
+                    {
+                        packetLength = _stream.WritePacket(
+                            _payloadScratch.AsSpan(0, payloadLength),
+                            marker: false,
+                            timestamp,
+                            RtpHeaderExtension.OneByteProfile,
+                            writer.Written,
+                            _packetBuffer);
+                    }
+                }
+                else if (_ulpfec is not null)
                 {
                     // RFC 2198: wrap the ULPFEC payload as the single primary block of a RED payload under
                     // the negotiated ulpfec payload type, then send it as an ordinary RTP packet stamped
@@ -3204,13 +3443,24 @@ public sealed partial class PeerConnection
             catch (ByteBufferException ex)
             {
                 // The repair buffer was sized for a whole datagram of protected octets, so this cannot
-                // happen for a well-formed group; drop the repair rather than fault the send path.
+                // happen for a well-formed group; drop the repair rather than fault the send path. A
+                // transport-wide sequence number drawn before the throw is simply left as a gap, which is
+                // harmless and already tolerated elsewhere.
                 _logger.Log(KeryxLogLevel.Warning, "Dropping an outbound FEC packet that did not fit its buffer.", ex);
                 Reset();
                 return;
             }
 
+            if (stamping)
+            {
+                // Record the repair in the congestion controller's send history before it reaches the
+                // wire: it shares the transport-wide space with media and RTX.
+                _onTransportPacketSent!(transportSequenceNumber, packetLength);
+            }
+
             _send(_packetBuffer, packetLength);
+            Interlocked.Increment(ref _repairPacketsSent);
+            Interlocked.Add(ref _repairBytesSent, packetLength);
             Reset();
         }
 
@@ -3316,6 +3566,9 @@ public sealed partial class PeerConnection
 
         /// <summary>The repair stream, or null when the answer kept no rtx codec.</summary>
         internal RtxRetransmitter? Retransmitter { get; }
+
+        /// <summary>The FEC emitter protecting this stream, or null when no FEC scheme is active.</summary>
+        internal FecEmitter? Fec => _fec;
 
         /// <summary>How this track measures an audio payload's duration, resolved from the negotiated codec.</summary>
         internal AudioPayloadTiming AudioTiming => _audioTiming;
