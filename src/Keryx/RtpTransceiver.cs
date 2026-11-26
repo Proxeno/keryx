@@ -136,6 +136,11 @@ public sealed class RtpSender : IRtpForwarder
 {
     private readonly PeerConnection _owner;
 
+    // Subscribers to OnRtpPacketSent. Published copy-on-write under the connection's _packetSentGate and
+    // read lock-free by the send path; Volatile.Read/Write is used because the send path never takes
+    // that gate. Touched only through PeerConnection.ChangePacketSentSubscription.
+    private RtpPacketSentHandler? _packetSent;
+
     internal RtpSender(PeerConnection owner, MediaKind kind, uint ssrc, uint rtxSsrc, string trackId, uint flexFecSsrc = 0)
     {
         _owner = owner;
@@ -212,12 +217,50 @@ public sealed class RtpSender : IRtpForwarder
     /// the wire and starts a new output generation. See <see cref="PeerConnection.CutOutboundAudio"/>
     /// for the full semantics — the sequence space is rewound, any history for the discarded numbers is
     /// purged, and the next packet carries the marker bit with a wall-clock-rebased timestamp.
+    /// The returned <see cref="OutboundCutResult.Generation"/> names the output generation the cut starts,
+    /// and <see cref="OutboundCutResult.SamplesDiscarded"/>/<see cref="OutboundCutResult.DurationDiscarded"/>
+    /// are codec-aware (see <see cref="OutboundCutResult"/>).
     /// </summary>
     /// <returns>What was discarded; default when no track is streaming on this sender yet.</returns>
     /// <exception cref="NotSupportedException">
     /// This sender is not audio; a video cut would need a keyframe-aware generation.
     /// </exception>
     public OutboundCutResult CutOutbound() => _owner.CutOutboundOnSender(this);
+
+    /// <summary>
+    /// Raised once for every RTP packet of THIS sender's media SSRC that was handed to the transport,
+    /// after pacing and SRTP protection.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// RTX retransmissions and FEC repair packets travel on their own SSRCs and are not reported. A packet
+    /// discarded by a cut is never reported. A packet whose transport send failed is not reported.
+    /// </para>
+    /// <para>
+    /// Raised on the thread that sent the packet (the caller of <see cref="SendFrame"/> or
+    /// <see cref="TryForwardRtp"/> when congestion control is off, the pacer's timer thread when it is on),
+    /// while the connection's send lock is held, so events for one connection arrive in wire order and
+    /// never concurrently. The handler must return quickly, must not block, and must not call
+    /// <see cref="SendFrame"/>, <see cref="TryForwardRtp"/>, <see cref="CutOutbound"/> or any other send on
+    /// the connection. Subscribing or unsubscribing from inside the handler is allowed. An exception
+    /// thrown by a handler is caught and logged; it does not affect sending.
+    /// </para>
+    /// <para>
+    /// May be subscribed before the connection is up. Costs nothing per packet while no sender on the
+    /// connection has a subscriber.
+    /// </para>
+    /// </remarks>
+    public event RtpPacketSentHandler? OnRtpPacketSent
+    {
+        add => _owner.ChangePacketSentSubscription(this, value, subscribe: true);
+        remove => _owner.ChangePacketSentSubscription(this, value, subscribe: false);
+    }
+
+    /// <summary>The current handler list, read lock-free by the send path.</summary>
+    internal RtpPacketSentHandler? PacketSentHandler => Volatile.Read(ref _packetSent);
+
+    /// <summary>The handler field itself, so the connection can combine/remove it under its gate.</summary>
+    internal ref RtpPacketSentHandler? PacketSentHandlerRef => ref _packetSent;
 
     /// <summary>
     /// Forwards one already-packetized RTP payload verbatim onto this sender's SSRC and sequence space
