@@ -1799,9 +1799,15 @@ public sealed partial class PeerConnection
             return;
         }
 
+        // The datagram receive path holds no timestamp of its own (HandleRtp unprotects and demuxes
+        // without one), so stamp arrival here — the first point shared by directly received, RTX- and
+        // FEC-recovered packets. Take it once per datagram so every branch below reports the same instant.
+        var arrival = _config.TimeProvider.GetTimestamp();
+
         if (!_config.EnableReceiveJitterBuffer)
         {
-            // Arrival-order delivery: fire immediately, exactly as the receive path always has.
+            // Arrival-order delivery: fire immediately, exactly as the receive path always has. Loss is
+            // not tracked on this path, so LostBefore stays at its zero ("not tracked") default.
             var info = new RtpPacketInfo(
                 route.Kind == MediaKind.Unknown ? null : route.Mid,
                 route.Kind,
@@ -1810,7 +1816,10 @@ public sealed partial class PeerConnection
                 packet.Header.SequenceNumber,
                 packet.Header.Timestamp,
                 packet.Header.Marker,
-                rid);
+                rid)
+            {
+                ArrivalTimestamp = arrival,
+            };
 
             handler(in info, packet.Payload);
             return;
@@ -1832,7 +1841,10 @@ public sealed partial class PeerConnection
                 packet.Header.SequenceNumber,
                 packet.Header.Timestamp,
                 packet.Header.Marker,
-                rid);
+                rid)
+            {
+                ArrivalTimestamp = arrival,
+            };
 
             handler(in arrivalInfo, packet.Payload);
             return;
@@ -1850,7 +1862,8 @@ public sealed partial class PeerConnection
             packet.Header.Timestamp,
             packet.Header.Marker,
             payloadType,
-            packet.Payload);
+            packet.Payload,
+            arrival);
 
         DrainReceiveStream(packet.Header.Ssrc, stream, routes, handler);
     }
@@ -1896,7 +1909,14 @@ public sealed partial class PeerConnection
                 released.SequenceNumber,
                 released.Timestamp,
                 released.Marker,
-                route.Kind == MediaKind.Video ? stream.Rid : null);
+                route.Kind == MediaKind.Video ? stream.Rid : null)
+            {
+                // The jitter buffer preserved the packet's original arrival instant and counted the
+                // sequence numbers it declared lost immediately before this one.
+                ArrivalTimestamp = released.ArrivalTimestamp,
+                LostBefore = released.LostBefore,
+                LossTracked = true,
+            };
 
             handler(in info, released.Payload);
         }

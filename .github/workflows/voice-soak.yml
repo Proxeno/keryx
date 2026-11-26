@@ -1,0 +1,62 @@
+name: voice-soak
+
+# The long voice-call soak: one sendrecv Opus audio m-line plus a reliable ordered control channel,
+# held against a real browser for twenty minutes by default. It is intentionally NOT triggered by
+# pull_request or push — PR CI runs the same test at its 60 s default, which is enough to catch a
+# regression without spending twenty minutes per browser. Run it by hand
+# (workflow_dispatch, optionally with a different soak_seconds) or let the daily schedule do it.
+on:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: "Voice soak duration in seconds (clamped by the test to 10..3600)"
+        required: false
+        default: "1200"
+  schedule:
+    - cron: "17 7 * * *"
+
+jobs:
+  voice-soak-chrome:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+      - run: dotnet build Keryx.slnx --configuration Release
+      # KERYX_REQUIRE_CHROME=1 turns a missing or unlaunchable browser into a failure rather than a
+      # graceful skip. The test itself clamps KERYX_VOICE_SOAK_SECONDS to 10..3600; the workflow's
+      # twenty-minute default is what makes this a soak rather than a smoke test.
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=ChromeInterop&FullyQualifiedName~VoiceSessionInteropTests"
+        env:
+          KERYX_REQUIRE_CHROME: "1"
+          KERYX_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          KERYX_VOICE_SOAK_SECONDS: ${{ inputs.soak_seconds || '1200' }}
+
+  voice-soak-firefox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-firefox@v1
+        id: setup-firefox
+        with:
+          firefox-version: latest
+      # No OpenH264 GMP warm-up here: the voice session sends Opus, which Firefox implements
+      # natively. Only the video interop lanes need the downloadable H.264 plugin.
+      - run: dotnet build Keryx.slnx --configuration Release
+      # The Firefox voice test binds IPAddress.Any (see TestSupport.NewConfig) so Firefox can meet
+      # Keryx on the interface it chooses; no STUN, TURN or mDNS is involved.
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=FirefoxInterop&FullyQualifiedName~VoiceSessionInteropTests"
+        env:
+          KERYX_REQUIRE_FIREFOX: "1"
+          KERYX_FIREFOX_PATH: ${{ steps.setup-firefox.outputs.firefox-path }}
+          KERYX_VOICE_SOAK_SECONDS: ${{ inputs.soak_seconds || '1200' }}

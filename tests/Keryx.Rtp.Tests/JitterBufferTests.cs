@@ -251,4 +251,147 @@ public class JitterBufferTests
         var tooBig = () => new JitterBuffer(new JitterBufferOptions { Capacity = 40_000 });
         tooBig.Should().Throw<ArgumentOutOfRangeException>();
     }
+
+    // ---------------------------------------------------------------- arrival time + loss-before surface
+
+    private static (ushort SequenceNumber, long ArrivalTimestamp, int LostBefore) Next(JitterBuffer buffer)
+    {
+        buffer.TryGetNext(out var packet).Should().BeTrue();
+        return (packet.SequenceNumber, packet.ArrivalTimestamp, packet.LostBefore);
+    }
+
+    [Fact]
+    public void In_order_stream_reports_no_loss_and_the_arrival_timestamp_it_was_inserted_with()
+    {
+        var buffer = new JitterBuffer(new JitterBufferOptions { Capacity = 16 }, new TestTimeProvider());
+
+        for (ushort seq = 100; seq < 110; seq++)
+        {
+            var arrival = 1_000L + seq;
+            buffer.Insert(seq, timestamp: seq * 960u, marker: false, payloadType: 111, Payload, arrival)
+                .Should().Be(JitterBufferInsertResult.Buffered);
+
+            var released = Next(buffer);
+            released.SequenceNumber.Should().Be(seq);
+            released.LostBefore.Should().Be(0);
+            released.ArrivalTimestamp.Should().Be(arrival);
+        }
+
+        buffer.PacketsLost.Should().Be(0);
+    }
+
+    [Fact]
+    public void A_single_missing_packet_stamps_LostBefore_on_the_packet_that_follows_it()
+    {
+        var time = new TestTimeProvider();
+        var buffer = new JitterBuffer(
+            new JitterBufferOptions { Capacity = 16, MaxWait = TimeSpan.FromMilliseconds(100) },
+            time);
+
+        Insert(buffer, 10);
+        Next(buffer);
+
+        Insert(buffer, 12);
+        Insert(buffer, 13);
+        buffer.TryGetNext(out _).Should().BeFalse();
+
+        time.Advance(TimeSpan.FromMilliseconds(150));
+
+        var first = Next(buffer);
+        first.SequenceNumber.Should().Be(12);
+        first.LostBefore.Should().Be(1);
+
+        var second = Next(buffer);
+        second.SequenceNumber.Should().Be(13);
+        second.LostBefore.Should().Be(0);
+    }
+
+    [Fact]
+    public void Three_consecutive_missing_packets_stamp_LostBefore_three()
+    {
+        var time = new TestTimeProvider();
+        var buffer = new JitterBuffer(
+            new JitterBufferOptions { Capacity = 16, MaxWait = TimeSpan.FromMilliseconds(100) },
+            time);
+
+        Insert(buffer, 10);
+        Next(buffer);
+
+        // 11, 12 and 13 never arrive; 14 is buffered behind the hole.
+        Insert(buffer, 14);
+        time.Advance(TimeSpan.FromMilliseconds(150));
+
+        var released = Next(buffer);
+        released.SequenceNumber.Should().Be(14);
+        released.LostBefore.Should().Be(3);
+        buffer.PacketsLost.Should().Be(3);
+    }
+
+    [Fact]
+    public void Fast_forward_reports_the_whole_skipped_span_as_LostBefore()
+    {
+        var time = new TestTimeProvider();
+        var buffer = new JitterBuffer(
+            new JitterBufferOptions { Capacity = 8, MaxWait = TimeSpan.FromMilliseconds(100) },
+            time);
+
+        Insert(buffer, 100);
+        Next(buffer);
+
+        // A packet far beyond the 8-slot window forces the cursor forward at insert time; the packet
+        // then waits out its window at the head of the new range before release.
+        Insert(buffer, 1000).Should().Be(JitterBufferInsertResult.Buffered);
+        buffer.PacketsLost.Should().BeGreaterThan(0);
+
+        time.Advance(TimeSpan.FromMilliseconds(150));
+
+        var released = Next(buffer);
+        released.SequenceNumber.Should().Be(1000);
+
+        // 101 through 999 inclusive were all declared lost before 1000 played out.
+        released.LostBefore.Should().Be(899);
+        buffer.PacketsLost.Should().Be(899);
+    }
+
+    [Fact]
+    public void A_reordered_packet_that_fills_the_gap_before_the_wait_stamps_no_loss()
+    {
+        var time = new TestTimeProvider();
+        var buffer = new JitterBuffer(
+            new JitterBufferOptions { Capacity = 16, MaxWait = TimeSpan.FromMilliseconds(100) },
+            time);
+
+        Insert(buffer, 100);
+        Next(buffer);
+
+        Insert(buffer, 102);
+        Insert(buffer, 103);
+        buffer.TryGetNext(out _).Should().BeFalse();
+
+        time.Advance(TimeSpan.FromMilliseconds(50));
+        Insert(buffer, 101);
+
+        var one = Next(buffer);
+        var two = Next(buffer);
+        var three = Next(buffer);
+        new[] { one, two, three }.Select(static r => r.SequenceNumber).Should().Equal((ushort)101, 102, 103);
+        new[] { one, two, three }.Select(static r => r.LostBefore).Should().OnlyContain(static lost => lost == 0);
+        buffer.PacketsLost.Should().Be(0);
+    }
+
+    [Fact]
+    public void The_five_argument_Insert_stamps_arrival_from_the_time_provider()
+    {
+        var time = new TestTimeProvider();
+        time.Advance(TimeSpan.FromMilliseconds(123));
+        var expected = time.GetTimestamp();
+
+        var buffer = new JitterBuffer(new JitterBufferOptions { Capacity = 8 }, time);
+        buffer.Insert(7, timestamp: 0, marker: false, payloadType: 111, Payload)
+            .Should().Be(JitterBufferInsertResult.Buffered);
+
+        var released = Next(buffer);
+        released.SequenceNumber.Should().Be(7);
+        released.ArrivalTimestamp.Should().Be(expected);
+    }
 }

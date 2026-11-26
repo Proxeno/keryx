@@ -327,6 +327,63 @@ public class SctpAssociationTests : IDisposable
         WaitFor(() => _harness.B.Errors.Count == 1).Should().BeTrue();
     }
 
+    /// <summary>
+    /// Simultaneous open, where both endpoints send INIT — the shape a browser drives when it both
+    /// offers and creates the data channel. Establishing through the peer's COOKIE ECHO must also
+    /// disarm this side's own INIT handshake timer. Without that, the timer keeps re-sending a stale
+    /// COOKIE ECHO and after <see cref="SctpAssociationConfig.MaxRetransmitAttempts"/> fails an
+    /// otherwise healthy association with "SCTP handshake timed out".
+    /// </summary>
+    [Fact]
+    public async Task SimultaneousOpen_StaysEstablishedPastInitRetransmitLimit()
+    {
+        var time = new TestTimeProvider();
+        using var harness = new Harness(time, simultaneousOpen: true);
+        var channelA = harness.A.CreateChannel("control");
+
+        // Both directions call ConnectAsync up front, so both send INIT before either can finish.
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await Task.WhenAll(
+            harness.A.Association.ConnectAsync(timeout.Token),
+            harness.B.Association.ConnectAsync(timeout.Token));
+
+        harness.A.Association.State.Should().Be(SctpAssociationState.Established);
+        harness.B.Association.State.Should().Be(SctpAssociationState.Established);
+        WaitFor(() => harness.B.Channels.ContainsKey("control")).Should().BeTrue();
+        WaitFor(() => channelA.State == DataChannelState.Open).Should().BeTrue();
+        Quiesce();
+
+        // Drive the periodic Tick well past every INIT retransmission the test config allows. The RTO
+        // doubles from 100 ms up to the 60 s ceiling and MaxRetransmitAttempts is 8, so eleven 61 s
+        // jumps (~11 min of fake time) clear the 8 x 60 s bound with room to spare. Each jump lets one
+        // Tick observe the expired deadline; with the bug, the stale COOKIE ECHO is re-sent and
+        // attempt 9 fails the association.
+        for (var i = 0; i < 11; i++)
+        {
+            time.Advance(TimeSpan.FromSeconds(61));
+            Thread.Sleep(20);
+        }
+
+        harness.A.Association.State.Should().Be(
+            SctpAssociationState.Established,
+            "the INIT handshake timer must be disarmed once simultaneous open establishes");
+        harness.B.Association.State.Should().Be(SctpAssociationState.Established);
+        harness.A.Errors.Should().BeEmpty("a healthy simultaneous open must never raise a failure");
+        harness.B.Errors.Should().BeEmpty();
+        harness.A.Closed.Should().BeFalse();
+        harness.B.Closed.Should().BeFalse();
+
+        // The association still carries data in both directions after the old timer deadline passed.
+        channelA.SendText("still here");
+        WaitFor(() => harness.B.Messages.Count == 1).Should().BeTrue();
+        Encoding.UTF8.GetString(harness.B.Messages.Single().Payload).Should().Be("still here");
+
+        var channelB = harness.B.Channels["control"];
+        channelB.SendText("and back");
+        WaitFor(() => harness.A.Messages.Count == 1).Should().BeTrue();
+        Encoding.UTF8.GetString(harness.A.Messages.Single().Payload).Should().Be("and back");
+    }
+
     [Fact]
     public async Task OversizedMessageIsRejected()
     {
@@ -426,11 +483,15 @@ public class SctpAssociationTests : IDisposable
         private readonly LoopbackTransport _transportA;
         private readonly LoopbackTransport _transportB;
 
-        public Harness(TimeProvider? timeProviderA = null)
+        public Harness(TimeProvider? timeProviderA = null, bool simultaneousOpen = false)
         {
             (_transportA, _transportB) = LoopbackTransport.CreatePair();
             A = new Endpoint(_transportA, isInitiator: true, usesEvenStreamIds: true, timeProviderA);
-            B = new Endpoint(_transportB, isInitiator: false, usesEvenStreamIds: false);
+            B = new Endpoint(
+                _transportB,
+                isInitiator: simultaneousOpen,
+                usesEvenStreamIds: false,
+                timeProvider: simultaneousOpen ? timeProviderA : null);
         }
 
         public Endpoint A { get; }

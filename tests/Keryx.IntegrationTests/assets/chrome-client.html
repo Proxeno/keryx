@@ -22,14 +22,25 @@
                       -> { type: "answer", sdp }   (Keryx's sendonly answer)
         Keryx forwards RTP with TryForwardRtp(); the browser reports what it received.
 
+    ?role=voice       the browser offers one sendrecv Opus audio m-line plus a reliable,
+                      ordered "control" data channel, and plays Keryx's audio back.
+        POST /offer   <- { type: "offer",  sdp }   (browser offer, ICE embedded)
+                      -> { type: "answer", sdp }   (Keryx's answer, in the response)
+        Audio comes from the microphone, or from a WebAudio oscillator when no capture
+        device is available (recorded in state.audioSource). The browser reports the
+        inbound-audio counters (packets received/lost, jitter, samples, concealment) and
+        the outbound audio packets it sent.
+
   In every role the browser POSTs periodic JSON status snapshots to /report that the
-  test asserts on. Data channels Keryx opens ("controller", "telemetry") are echoed:
-  every "ping:N" comes back as "echo:N".
+  test asserts on. Data channels are echoed: every "ping:N" comes back as "echo:N".
+  Keryx opens "controller" and "telemetry" in the media-server roles; in role=voice the
+  browser itself creates "control" and wires the same echo logic to it.
 -->
 <html>
 <head><meta charset="utf-8"><title>keryx interop</title></head>
 <body>
 <video id="v" autoplay muted playsinline></video>
+<audio id="a" autoplay></audio>
 <script>
 "use strict";
 const role = new URLSearchParams(location.search).get("role") || "answer";
@@ -42,13 +53,17 @@ const state = {
   signalingState: "stable",
   track: { audio: false, video: false },
   channels: {},           // label -> { readyState, received, echoed }
+  audioSource: "none",    // "microphone" or "oscillator" in role=voice
   stats: { framesDecoded: 0, framesReceived: 0, bytesReceived: 0, audioBytesReceived: 0,
            frameWidth: 0, frameHeight: 0, packetsReceived: 0, packetsLost: 0,
            pliCount: 0, nackCount: 0, keyFramesDecoded: 0, decoderImplementation: "",
            framesPerSecond: 0, jitter: 0, freezeCount: 0, ssrc: 0,
            retransmittedPacketsReceived: 0, retransmittedBytesReceived: 0,
-           // Outbound counters, meaningful when the browser is the sender (offer-send).
-           packetsSent: 0, bytesSent: 0, framesEncoded: 0 },
+           // Inbound-audio counters, meaningful when the browser is receiving (role=voice).
+           audioPacketsReceived: 0, audioPacketsLost: 0, audioJitter: 0,
+           totalSamplesReceived: 0, concealedSamples: 0, concealmentEvents: 0,
+           // Outbound counters, meaningful when the browser is the sender (offer-send and voice).
+           packetsSent: 0, bytesSent: 0, framesEncoded: 0, audioPacketsSent: 0 },
   // A rolling trajectory, so the test can see decoding keep up rather than only its end state.
   samples: [],
   videoElement: { width: 0, height: 0, readyState: 0 },
@@ -129,11 +144,20 @@ async function pollStats(pc) {
     }
     if (r.type === "inbound-rtp" && r.kind === "audio") {
       state.stats.audioBytesReceived = r.bytesReceived ?? 0;
+      state.stats.audioPacketsReceived = r.packetsReceived ?? 0;
+      state.stats.audioPacketsLost = r.packetsLost ?? 0;
+      state.stats.audioJitter = r.jitter ?? 0;
+      state.stats.totalSamplesReceived = r.totalSamplesReceived ?? 0;
+      state.stats.concealedSamples = r.concealedSamples ?? 0;
+      state.stats.concealmentEvents = r.concealmentEvents ?? 0;
     }
     if (r.type === "outbound-rtp" && r.kind === "video") {
       state.stats.packetsSent = r.packetsSent ?? 0;
       state.stats.bytesSent = r.bytesSent ?? 0;
       state.stats.framesEncoded = r.framesEncoded ?? 0;
+    }
+    if (r.type === "outbound-rtp" && r.kind === "audio") {
+      state.stats.audioPacketsSent = r.packetsSent ?? 0;
     }
   }
   const v = document.getElementById("v");
@@ -167,15 +191,9 @@ async function runAnswerer(pc) {
   state.phase = "negotiated";
 }
 
-// role=offer-send / offer-recv: the browser is the offerer (the SFU shapes). It POSTs the
-// offer with ICE embedded and Keryx returns its answer in the same response.
-async function runOfferer(pc, direction) {
-  if (direction === "sendonly") {
-    const track = makeSyntheticVideoTrack();
-    pc.addTransceiver(track, { direction: "sendonly" });
-  } else {
-    pc.addTransceiver("video", { direction: "recvonly" });
-  }
+// role=offer-send / offer-recv / voice: the browser is the offerer. It POSTs the offer with
+// ICE embedded and Keryx returns its answer in the same response.
+async function createOfferAndExchange(pc) {
   state.phase = "creating-offer";
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
@@ -190,6 +208,45 @@ async function runOfferer(pc, direction) {
   state.phase = "negotiated";
 }
 
+async function runOfferer(pc, direction) {
+  if (direction === "sendonly") {
+    const track = makeSyntheticVideoTrack();
+    pc.addTransceiver(track, { direction: "sendonly" });
+  } else {
+    pc.addTransceiver("video", { direction: "recvonly" });
+  }
+  await createOfferAndExchange(pc);
+}
+
+// role=voice: one sendrecv Opus audio m-line plus the reliable, ordered "control" channel,
+// the voice-agent session shape. Audio comes from the microphone, falling back to a
+// WebAudio oscillator so a headless run with no capture device still sends real Opus.
+async function getVoiceTrack() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.audioSource = "microphone";
+    return stream.getAudioTracks()[0];
+  } catch (e) {
+    state.audioSource = "oscillator";
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    const osc = ctx.createOscillator();
+    const destination = ctx.createMediaStreamDestination();
+    osc.frequency.value = 440;
+    osc.connect(destination);
+    osc.start();
+    return destination.stream.getAudioTracks()[0];
+  }
+}
+
+async function runVoiceOfferer(pc) {
+  const track = await getVoiceTrack();
+  pc.addTransceiver(track, { direction: "sendrecv" });
+  const dc = pc.createDataChannel("control");
+  wireChannel(dc);
+  await createOfferAndExchange(pc);
+}
+
 async function main() {
   const pc = new RTCPeerConnection();
   pc.onconnectionstatechange = () => { state.connectionState = pc.connectionState; };
@@ -200,6 +257,8 @@ async function main() {
     state.track[e.track.kind] = true;
     if (e.track.kind === "video") {
       document.getElementById("v").srcObject = new MediaStream([e.track]);
+    } else if (e.track.kind === "audio") {
+      document.getElementById("a").srcObject = new MediaStream([e.track]);
     }
   };
 
@@ -207,6 +266,8 @@ async function main() {
     await runOfferer(pc, "sendonly");
   } else if (role === "offer-recv") {
     await runOfferer(pc, "recvonly");
+  } else if (role === "voice") {
+    await runVoiceOfferer(pc);
   } else {
     await runAnswerer(pc);
   }

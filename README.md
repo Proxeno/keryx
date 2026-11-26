@@ -197,7 +197,14 @@ allocate the document they build or parse and are not on the per-packet path.
 BUNDLE/rtcp-mux, trickle ICE (in and out), DTLS 1.2 both roles with fingerprint pinning, SRTP
 AES-CM and AES-GCM, bidirectional data channels with partial reliability, typed RTCP feedback
 in both directions, RFC 4588 RTX retransmission driven by inbound NACKs, sender-side loss/jitter/RTT
-statistics from reception reports, a minimal recvonly answerer, and a raw RTP receive surface.
+statistics from reception reports, an answerer that can send as well as receive, renegotiation and
+ICE restart, and an opt-in per-SSRC receive jitter buffer (`EnableReceiveJitterBuffer`). The inbound
+audio surface delivers each Opus RTP packet with its RTP timestamp, its datagram arrival time
+(`RtpPacketInfo.ArrivalTimestamp`) and, when the jitter buffer released it, the number of packets the
+buffer declared lost immediately before it (`RtpPacketInfo.LostBefore`, with `LossTracked` true) so an
+application can run its decoder's packet-loss concealment and Opus in-band FEC. Keryx does not decode
+Opus itself. The audio-only `sendrecv` Opus plus reliable ordered data-channel voice session shape is
+proven against both Chrome and Firefox.
 Recent additions: `a=extmap` with outbound transport-wide-cc (TWCC) sequence numbers; TURN
 relay-candidate gathering (allocations, permissions, channel binding); and dual-stack IPv6 host /
 server-reflexive gathering with address-family-correct pairing.
@@ -208,9 +215,8 @@ transport primitives (RID / `a=simulcast` negotiation and ingest demux are compl
 forwarding is scaffolded).
 
 **Not implemented (yet, honestly):** ULPFEC and RED, REMB generation, regular (non-aggressive)
-nomination, renegotiation and ICE restart, IPv6 *relay* allocation,
-jitter buffering on the receive surface, audio receive processing. Per-layer simplifications are
-documented in [docs/layers/](docs/layers).
+nomination, and IPv6 *relay* allocation. Per-layer simplifications are documented in
+[docs/layers/](docs/layers).
 
 ## Security
 

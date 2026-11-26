@@ -26,7 +26,7 @@ public sealed class JitterBufferOptions
     public TimeSpan MaxWait { get; set; } = TimeSpan.FromMilliseconds(120);
 }
 
-/// <summary>How an <see cref="JitterBuffer.Insert"/> was resolved.</summary>
+/// <summary>How an <see cref="JitterBuffer.Insert(ushort, uint, bool, byte, System.ReadOnlySpan{byte}, long)"/> was resolved.</summary>
 public enum JitterBufferInsertResult
 {
     /// <summary>The packet was accepted and is awaiting playout.</summary>
@@ -47,7 +47,7 @@ public enum JitterBufferInsertResult
 /// </summary>
 /// <remarks>
 /// <see cref="Payload"/> aliases storage inside the buffer and is valid only until the next
-/// <see cref="JitterBuffer.Insert"/> or <see cref="JitterBuffer.TryGetNext"/> on the same buffer;
+/// <see cref="JitterBuffer.Insert(ushort, uint, bool, byte, System.ReadOnlySpan{byte}, long)"/> or <see cref="JitterBuffer.TryGetNext"/> on the same buffer;
 /// copy it, or consume it, before calling either again.
 /// </remarks>
 public readonly ref struct JitterBufferPacket
@@ -57,13 +57,17 @@ public readonly ref struct JitterBufferPacket
         uint timestamp,
         bool marker,
         byte payloadType,
-        ReadOnlySpan<byte> payload)
+        ReadOnlySpan<byte> payload,
+        long arrivalTimestamp,
+        int lostBefore)
     {
         SequenceNumber = sequenceNumber;
         Timestamp = timestamp;
         Marker = marker;
         PayloadType = payloadType;
         Payload = payload;
+        ArrivalTimestamp = arrivalTimestamp;
+        LostBefore = lostBefore;
     }
 
     /// <summary>The RTP sequence number.</summary>
@@ -80,6 +84,23 @@ public readonly ref struct JitterBufferPacket
 
     /// <summary>The RTP payload, RFC 3550 §5.1 padding already stripped by the caller that inserted it.</summary>
     public ReadOnlySpan<byte> Payload { get; }
+
+    /// <summary>
+    /// When the packet was inserted, in the buffer's <see cref="TimeProvider.GetTimestamp"/> units —
+    /// the datagram's arrival time at this endpoint, not its later release time. The
+    /// <see cref="JitterBuffer.Insert(ushort, uint, bool, byte, System.ReadOnlySpan{byte})"/> overload,
+    /// which does not take an arrival timestamp, stamps the buffer's own
+    /// <see cref="TimeProvider"/> at insert time.
+    /// </summary>
+    public long ArrivalTimestamp { get; }
+
+    /// <summary>
+    /// The number of sequence numbers this buffer declared lost and stepped over since the previous
+    /// released packet — that is, the gap immediately before this packet in playout order. Zero when
+    /// this packet directly follows the previous released one, and zero for the first release.
+    /// Saturates at <see cref="int.MaxValue"/> rather than wrapping.
+    /// </summary>
+    public int LostBefore { get; }
 }
 
 /// <summary>
@@ -95,7 +116,7 @@ public readonly ref struct JitterBufferPacket
 /// packet with sequence number <c>s</c> lives in slot <c>s &amp; (Capacity - 1)</c>, exactly as
 /// <see cref="RtpSendHistory"/> keys its ring, so steady in-order operation reuses slots without
 /// allocating. A release cursor names the next sequence number owed to playout.
-/// <see cref="Insert"/> places a packet; <see cref="TryGetNext"/> pops the cursor's packet when it is
+/// <see cref="Insert(ushort, uint, bool, byte, System.ReadOnlySpan{byte}, long)"/> places a packet; <see cref="TryGetNext"/> pops the cursor's packet when it is
 /// present, and the caller loops it after every insert (and may poll it on a timer) to drain every
 /// packet that has become ready.
 /// </para>
@@ -132,6 +153,10 @@ public sealed class JitterBuffer
     private long _duplicatesDropped;
     private long _latePacketsDropped;
     private long _packetsLost;
+
+    // Loss declared and stepped over since the last packet was released, copied onto that packet as
+    // its LostBefore and then zeroed. Saturates rather than wrapping over a pathological gap.
+    private int _lostSinceRelease;
 
     /// <summary>Creates a jitter buffer.</summary>
     /// <param name="options">Depth and wait bounds; defaults are used when null.</param>
@@ -194,13 +219,37 @@ public sealed class JitterBuffer
         uint timestamp,
         bool marker,
         byte payloadType,
-        ReadOnlySpan<byte> payload)
+        ReadOnlySpan<byte> payload) =>
+        Insert(sequenceNumber, timestamp, marker, payloadType, payload, _time.GetTimestamp());
+
+    /// <summary>
+    /// Inserts one received packet, recording the instant the datagram reached this endpoint.
+    /// </summary>
+    /// <param name="sequenceNumber">The packet's RTP sequence number.</param>
+    /// <param name="timestamp">The packet's RTP timestamp.</param>
+    /// <param name="marker">The packet's marker bit.</param>
+    /// <param name="payloadType">The packet's RTP payload type.</param>
+    /// <param name="payload">The RTP payload; it is copied into the buffer, so the caller may reuse it.</param>
+    /// <param name="arrivalTimestamp">
+    /// When the datagram carrying this packet arrived, in this buffer's
+    /// <see cref="TimeProvider.GetTimestamp"/> units. It is surfaced verbatim as
+    /// <see cref="JitterBufferPacket.ArrivalTimestamp"/> when the packet is released, so a consumer can
+    /// measure the packet's true network age rather than its release time.
+    /// </param>
+    /// <returns>Whether the packet was buffered, was a duplicate, or arrived too late.</returns>
+    public JitterBufferInsertResult Insert(
+        ushort sequenceNumber,
+        uint timestamp,
+        bool marker,
+        byte payloadType,
+        ReadOnlySpan<byte> payload,
+        long arrivalTimestamp)
     {
         if (!_started)
         {
             _started = true;
             _cursor = sequenceNumber;
-            Store(sequenceNumber, timestamp, marker, payloadType, payload);
+            Store(sequenceNumber, timestamp, marker, payloadType, payload, arrivalTimestamp);
             _count++;
             _packetsBuffered++;
             return JitterBufferInsertResult.Buffered;
@@ -234,7 +283,7 @@ public sealed class JitterBuffer
             _count--;
         }
 
-        Store(sequenceNumber, timestamp, marker, payloadType, payload);
+        Store(sequenceNumber, timestamp, marker, payloadType, payload, arrivalTimestamp);
         _count++;
         _packetsBuffered++;
 
@@ -249,7 +298,7 @@ public sealed class JitterBuffer
     /// </summary>
     /// <param name="packet">
     /// On success, the released packet. Its <see cref="JitterBufferPacket.Payload"/> aliases buffer
-    /// storage and is valid only until the next <see cref="Insert"/> or <see cref="TryGetNext"/>.
+    /// storage and is valid only until the next <see cref="Insert(ushort, uint, bool, byte, System.ReadOnlySpan{byte}, long)"/> or <see cref="TryGetNext"/>.
     /// </param>
     /// <returns>
     /// <see langword="true"/> when a packet was released; <see langword="false"/> when the buffer is
@@ -274,11 +323,14 @@ public sealed class JitterBuffer
                     slot.Timestamp,
                     slot.Marker,
                     slot.PayloadType,
-                    slot.Buffer.AsSpan(0, slot.Length));
+                    slot.Buffer.AsSpan(0, slot.Length),
+                    slot.ArrivalTimestamp,
+                    _lostSinceRelease);
                 slot.Occupied = false;
                 _count--;
                 _cursor++;
                 _waiting = false;
+                _lostSinceRelease = 0;
                 return true;
             }
 
@@ -304,6 +356,7 @@ public sealed class JitterBuffer
             // next missing one — all consecutive holes collapse in this same call.
             _cursor++;
             _packetsLost++;
+            RecordLost();
         }
     }
 
@@ -316,6 +369,7 @@ public sealed class JitterBuffer
         _waiting = false;
         _cursor = 0;
         _waitStart = 0;
+        _lostSinceRelease = 0;
     }
 
     private void ArmWaitIfBlocked(long now)
@@ -345,13 +399,29 @@ public sealed class JitterBuffer
             }
 
             _packetsLost++;
+            RecordLost();
             _cursor++;
         }
 
         _waiting = false;
     }
 
-    private void Store(ushort sequenceNumber, uint timestamp, bool marker, byte payloadType, ReadOnlySpan<byte> payload)
+    /// <summary>Counts one sequence number skipped at playout, saturating at <see cref="int.MaxValue"/>.</summary>
+    private void RecordLost()
+    {
+        if (_lostSinceRelease < int.MaxValue)
+        {
+            _lostSinceRelease++;
+        }
+    }
+
+    private void Store(
+        ushort sequenceNumber,
+        uint timestamp,
+        bool marker,
+        byte payloadType,
+        ReadOnlySpan<byte> payload,
+        long arrivalTimestamp)
     {
         ref var slot = ref _slots[sequenceNumber & _mask];
         if (slot.Buffer is null || slot.Buffer.Length < payload.Length)
@@ -365,6 +435,7 @@ public sealed class JitterBuffer
         slot.Timestamp = timestamp;
         slot.Marker = marker;
         slot.PayloadType = payloadType;
+        slot.ArrivalTimestamp = arrivalTimestamp;
         slot.Occupied = true;
     }
 
@@ -374,6 +445,7 @@ public sealed class JitterBuffer
         public int Length;
         public ushort SequenceNumber;
         public uint Timestamp;
+        public long ArrivalTimestamp;
         public byte PayloadType;
         public bool Marker;
         public bool Occupied;
