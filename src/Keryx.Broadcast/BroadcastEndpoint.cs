@@ -142,6 +142,27 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// A point-in-time snapshot of every socket-pool shard's counters: one entry per shard, in shard-index
+    /// order, so <c>Count == <see cref="SocketPoolSize"/></c>. Each counter is monotonic for the endpoint's
+    /// lifetime. The snapshot is not atomic across shards — a shard's counters are read independently, so a
+    /// concurrent flush can be visible in one shard and not another — but every value is individually
+    /// coherent. Safe to call from any thread, including after the endpoint is disposed (it then returns the
+    /// final counters). The returned array is a fresh allocation per call; this is a diagnostics API, not a
+    /// hot-path one.
+    /// </summary>
+    /// <returns>One <see cref="BroadcastShardStatistics"/> per shard, in shard-index order.</returns>
+    public IReadOnlyList<BroadcastShardStatistics> GetShardStatistics()
+    {
+        var statistics = new BroadcastShardStatistics[_shards.Length];
+        for (var i = 0; i < _shards.Length; i++)
+        {
+            statistics[i] = _shards[i].Snapshot();
+        }
+
+        return statistics;
+    }
+
     /// <summary>True when the pool's batched send path uses the native <c>sendmmsg(2)</c> fast path; false
     /// when the managed one-syscall-per-datagram fallback is in use (non-Linux, or the native symbol was
     /// unavailable).</summary>
@@ -471,15 +492,24 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
     // Pin a destination to a shard by a stable hash of its 5-tuple. IPEndPoint.GetHashCode combines the
     // address and port and is stable within the process, so a given viewer always maps to the same shard —
     // keeping that viewer's outbound (media + control) on one socket and preserving its per-viewer ordering.
-    private int ShardFor(EndPoint destination)
+    private int ShardFor(EndPoint destination) => ShardIndexFor(destination, _shards.Length);
+
+    // The pure shard-pinning function, exposed to tests. IPEndPoint.GetHashCode() is address ^ port, so the
+    // raw value's low bits alone would feed the modulo; mixing first spreads every input bit across the bits
+    // the modulo keeps, so sequential ports or addresses land on different shards instead of clustering.
+    internal static int ShardIndexFor(EndPoint destination, int shardCount)
     {
-        if (_shards.Length == 1)
+        if (shardCount == 1)
         {
             return 0;
         }
 
-        var hash = destination is IPEndPoint ip ? ip.GetHashCode() : 0;
-        return (int)((uint)hash % (uint)_shards.Length);
+        var hash = destination is IPEndPoint ip ? (uint)ip.GetHashCode() : 0u;
+
+        // Fibonacci (multiplicative) mixing so every input bit reaches the bits the modulo keeps.
+        hash *= 2654435769u;
+        hash ^= hash >> 16;
+        return (int)(hash % (uint)shardCount);
     }
 
     // The mirror of Normalize on the way out: a dual-stack v6 socket cannot send to a native IPv4
@@ -610,6 +640,10 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
         private int _stagedCount;
         private int _lastSent;
         private long _dropped;
+        private long _sent;
+        private long _flushes;
+        private long _controlSent;
+        private long _received;
 
         private Task? _receiveLoop;
 
@@ -646,6 +680,14 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
         public bool UsesNativeBatchSend => _sender.UsesNativeBatchSend;
 
         public long Dropped => Interlocked.Read(ref _dropped);
+
+        public BroadcastShardStatistics Snapshot() => new(
+            Index,
+            Interlocked.Read(ref _sent),
+            Interlocked.Read(ref _dropped),
+            Interlocked.Read(ref _flushes),
+            Interlocked.Read(ref _controlSent),
+            Interlocked.Read(ref _received));
 
         public void StartReceiveLoop(CancellationToken cancellationToken)
             => _receiveLoop = Task.Run(() => ReceiveLoopAsync(cancellationToken), CancellationToken.None);
@@ -709,6 +751,7 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
                 try
                 {
                     _socket.SendTo(datagram, SocketFlags.None, destination);
+                    Interlocked.Increment(ref _controlSent);
                 }
                 catch (SocketException ex)
                 {
@@ -811,6 +854,12 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
                 // The endpoint was disposed while a flush was in flight.
             }
 
+            if (count > 0)
+            {
+                Interlocked.Add(ref _sent, total);
+                Interlocked.Increment(ref _flushes);
+            }
+
             if (total < count)
             {
                 Interlocked.Add(ref _dropped, count - total);
@@ -856,6 +905,7 @@ public sealed class BroadcastEndpoint : IAsyncDisposable
                     continue;
                 }
 
+                Interlocked.Increment(ref _received);
                 _owner.Dispatch(buffer.AsSpan(0, result.ReceivedBytes), Normalize(from));
             }
         }
