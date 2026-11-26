@@ -14,6 +14,21 @@ permissions:
   contents: read
   id-token: write # mint the GitHub OIDC token nuget.org exchanges for a short-lived key
 
+env:
+  # Dependency order, derived from ProjectReferences under src/. Update when a package is added.
+  PACKAGE_ORDER: >-
+    Proxeno.Keryx.Core
+    Proxeno.Keryx.Stun
+    Proxeno.Keryx.Turn
+    Proxeno.Keryx.Sdp
+    Proxeno.Keryx.Rtp
+    Proxeno.Keryx.Dtls
+    Proxeno.Keryx.Srtp
+    Proxeno.Keryx.Sctp
+    Proxeno.Keryx.Ice
+    Proxeno.Keryx
+    Proxeno.Keryx.Broadcast
+
 jobs:
   pack-publish:
     runs-on: ubuntu-latest
@@ -25,9 +40,48 @@ jobs:
       - name: Derive version from tag
         run: echo "KERYX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Pack
-        run: dotnet pack Keryx.slnx --configuration Release -p:Version=$KERYX_VERSION -o artifacts/packages
+        run: dotnet pack Keryx.slnx --configuration Release -p:Version="$KERYX_VERSION" -o artifacts/packages
         env:
           CI: "true"
+      # Fail before the OIDC exchange and the push if packing produced a package
+      # the ordered list does not know about, or a listed package is missing.
+      - name: Check package list
+        run: |
+          set -euo pipefail
+          read -r -a ids <<< "$PACKAGE_ORDER"
+
+          for f in artifacts/packages/*.nupkg; do
+            if [ ! -e "$f" ]; then
+              echo "::error::dotnet pack produced no .nupkg files in artifacts/packages." >&2
+              exit 1
+            fi
+            name=${f##*/}
+            suffix=".$KERYX_VERSION.nupkg"
+            id=${name%"$suffix"}
+            if [ "$id" = "$name" ]; then
+              echo "::error::Cannot derive a package id from '$name' (expected <id>.$KERYX_VERSION.nupkg)." >&2
+              exit 1
+            fi
+            is_listed=0
+            for known in "${ids[@]}"; do
+              if [ "$known" = "$id" ]; then
+                is_listed=1
+                break
+              fi
+            done
+            if [ "$is_listed" -eq 0 ]; then
+              echo "::error::Package '$id' was produced but is not in PACKAGE_ORDER. Add it in dependency order." >&2
+              exit 1
+            fi
+          done
+
+          for id in "${ids[@]}"; do
+            if [ ! -e "artifacts/packages/$id.$KERYX_VERSION.nupkg" ]; then
+              echo "::error::Package '$id' is in PACKAGE_ORDER but no '$id.$KERYX_VERSION.nupkg' was produced." >&2
+              exit 1
+            fi
+          done
+          echo "Package list OK: ${#ids[@]} package(s) at $KERYX_VERSION."
       # Exchange the GitHub OIDC token for a short-lived nuget.org API key (~1h).
       # Request it immediately before the push so it can't expire first.
       - name: NuGet login (OIDC -> short-lived API key)
@@ -36,12 +90,27 @@ jobs:
         with:
           user: retrotom
       - name: Push to nuget.org
-        # Push both packages and their symbol packages. A bare *.nupkg glob never
-        # matches .snupkg, so symbols would be silently dropped — iterate both.
+        # Push in dependency order, each .nupkg immediately followed by its .snupkg.
+        # (A bare *.nupkg glob never matches .snupkg, so symbols must be named explicitly.)
         run: |
-          for f in artifacts/packages/*.nupkg artifacts/packages/*.snupkg; do
-            dotnet nuget push "$f" \
+          set -euo pipefail
+          read -r -a ids <<< "$PACKAGE_ORDER"
+          for id in "${ids[@]}"; do
+            dotnet nuget push "artifacts/packages/$id.$KERYX_VERSION.nupkg" \
               --source "https://api.nuget.org/v3/index.json" \
               --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
               --skip-duplicate
+            symbol="artifacts/packages/$id.$KERYX_VERSION.snupkg"
+            if [ -f "$symbol" ]; then
+              dotnet nuget push "$symbol" \
+                --source "https://api.nuget.org/v3/index.json" \
+                --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+                --skip-duplicate
+            fi
           done
+      - name: Wait for nuget.org indexing
+        # A successful push does not mean the version is restorable yet.
+        run: |
+          set -euo pipefail
+          read -r -a ids <<< "$PACKAGE_ORDER"
+          .github/scripts/wait-nuget-index.sh "$KERYX_VERSION" "${ids[@]}"
