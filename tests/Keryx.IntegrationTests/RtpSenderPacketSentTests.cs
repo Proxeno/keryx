@@ -595,6 +595,151 @@ public sealed class RtpSenderPacketSentTests
         (withSubscriber - withoutSubscriber).Should().BeLessThan(2000 * 16);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task CuttingFromInsideTheHandlerThrowsInsteadOfDeadlocking(bool congestionControl)
+    {
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var pair = await ConnectAsync(congestionControl, shutdown.Token);
+        await using var offerer = pair.Offerer;
+        await using var answerer = pair.Answerer;
+
+        var audioSsrc = offerer.GetLocalSsrc(MediaKind.Audio);
+        var wire = new ConcurrentQueue<WirePacket>();
+        offerer.RtpWireObserverForTest = (rtp, ticks) => Record(rtp, ticks, wire);
+
+        var sender = AudioSender(offerer);
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Exception? caught = null;
+        var returnedNormally = false;
+        var first = 1;
+
+        sender.OnRtpPacketSent += (RtpSender s, in RtpPacketSentInfo info) =>
+        {
+            if (Interlocked.Exchange(ref first, 0) == 1)
+            {
+                try
+                {
+                    s.CutOutbound();
+                    returnedNormally = true;
+                }
+                catch (Exception ex)
+                {
+                    caught = ex;
+                }
+                finally
+                {
+                    completed.TrySetResult();
+                }
+            }
+        };
+
+        for (var i = 0; i < 3; i++)
+        {
+            offerer.SendAudioFrame(Tone(), (uint)(i * AudioSampleIncrement)).Should().Be(1);
+        }
+
+        // A re-entrant cut would deadlock; a hang must fail the test rather than stall the run.
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(10), shutdown.Token);
+
+        caught.Should().BeOfType<InvalidOperationException>();
+        returnedNormally.Should().BeFalse("the in-handler cut must be rejected");
+        (await TestSupport.WaitForAsync(() => AudioCount(wire, audioSsrc) >= 3)).Should().BeTrue();
+        AudioCount(wire, audioSsrc).Should().Be(3, "the rejected cut must not drop the audio");
+
+        // The rejected cut did not start a generation, so this is the first real one.
+        offerer.CutOutboundAudio().Generation.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task SendingFromInsideTheHandlerThrows()
+    {
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var pair = await ConnectAsync(congestionControl: false, shutdown.Token);
+        await using var offerer = pair.Offerer;
+        await using var answerer = pair.Answerer;
+
+        var audioSsrc = offerer.GetLocalSsrc(MediaKind.Audio);
+        var wire = new ConcurrentQueue<WirePacket>();
+        offerer.RtpWireObserverForTest = (rtp, ticks) => Record(rtp, ticks, wire);
+
+        var sender = AudioSender(offerer);
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Exception? senderException = null;
+        Exception? peerException = null;
+        var first = 1;
+
+        sender.OnRtpPacketSent += (RtpSender s, in RtpPacketSentInfo info) =>
+        {
+            if (Interlocked.Exchange(ref first, 0) == 1)
+            {
+                try
+                {
+                    s.SendFrame(Tone(), 0);
+                }
+                catch (Exception ex)
+                {
+                    senderException = ex;
+                }
+
+                try
+                {
+                    offerer.SendAudioFrame(Tone(), 0);
+                }
+                catch (Exception ex)
+                {
+                    peerException = ex;
+                }
+
+                completed.TrySetResult();
+            }
+        };
+
+        for (var i = 0; i < 3; i++)
+        {
+            offerer.SendAudioFrame(Tone(), (uint)(i * AudioSampleIncrement)).Should().Be(1);
+        }
+
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(10), shutdown.Token);
+
+        senderException.Should().BeOfType<InvalidOperationException>();
+        peerException.Should().BeOfType<InvalidOperationException>();
+
+        (await TestSupport.WaitForAsync(() => AudioCount(wire, audioSsrc) >= 3)).Should().BeTrue();
+        AudioCount(wire, audioSsrc).Should().Be(3,
+            "the rejected in-handler sends must not put extra packets on the wire");
+    }
+
+    [Fact]
+    public async Task TheGuardIsClearedAfterTheHandlerReturnsEvenWhenItThrows()
+    {
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var pair = await ConnectAsync(congestionControl: false, shutdown.Token);
+        await using var offerer = pair.Offerer;
+        await using var answerer = pair.Answerer;
+
+        var sender = AudioSender(offerer);
+        var first = 1;
+        sender.OnRtpPacketSent += (RtpSender _, in RtpPacketSentInfo _) =>
+        {
+            if (Interlocked.Exchange(ref first, 0) == 1)
+            {
+                throw new InvalidOperationException("simulated handler failure");
+            }
+        };
+
+        offerer.SendAudioFrame(Tone(), 0).Should().Be(1);
+
+        Action sendAgain = () => offerer.SendAudioFrame(Tone(), AudioSampleIncrement);
+        sendAgain.Should().NotThrow("the handler's thread-static guard must be reset in a finally");
+
+        OutboundCutResult cut = default;
+        Action cutAgain = () => cut = offerer.CutOutboundAudio();
+        cutAgain.Should().NotThrow("the handler's thread-static guard must be reset in a finally");
+        cut.Generation.Should().Be(1);
+    }
+
     private static void CountSentPacket(RtpSender sender, in RtpPacketSentInfo info) =>
         Interlocked.Increment(ref _handlerCalls);
 

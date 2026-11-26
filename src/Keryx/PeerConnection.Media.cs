@@ -180,6 +180,29 @@ public sealed partial class PeerConnection
     // length check.
     private volatile RtpSender[] _packetSentSenders = [];
 
+    // True on a thread that is currently inside an OnRtpPacketSent handler (of any connection). The guard
+    // is deliberately thread-wide rather than per-connection: calling a DIFFERENT connection's send from
+    // inside a handler would take that connection's locks while holding this one's, which can deadlock the
+    // two transports against each other just as surely as a self-call. A handler cannot nest — every entry
+    // point it might call back into throws — so a plain bool is enough.
+    [ThreadStatic]
+    private static bool t_inPacketSentHandler;
+
+    /// <summary>
+    /// Throws when the calling thread is inside an <see cref="RtpSender.OnRtpPacketSent"/> handler, so a
+    /// handler that re-enters a send or cut fails loudly instead of corrupting the track buffer or
+    /// deadlocking the connection's lock order.
+    /// </summary>
+    private static void ThrowIfInPacketSentHandler()
+    {
+        if (t_inPacketSentHandler)
+        {
+            throw new InvalidOperationException(
+                "This call is not allowed from inside an RtpSender.OnRtpPacketSent handler: the handler runs inside the "
+                + "connection's send path. Return from the handler and make the call from another thread or task.");
+        }
+    }
+
     private long _videoFramesDropped;
     private long _audioFramesDropped;
     private long _rtpReceived;
@@ -207,6 +230,9 @@ public sealed partial class PeerConnection
     /// <see cref="PeerConnectionState.Connected"/> or no video track was negotiated — in which case
     /// the frame is dropped silently and counted in <see cref="GetStats"/>.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     public int SendVideoFrame(ReadOnlySpan<byte> annexBAccessUnit, uint rtpTimestamp90k) =>
         FirstSender(MediaKind.Video) is { } sender
             ? sender.SendFrame(annexBAccessUnit, rtpTimestamp90k)
@@ -222,6 +248,9 @@ public sealed partial class PeerConnection
     /// 1 when the packet was sent, 0 when it was dropped because the connection is not yet
     /// <see cref="PeerConnectionState.Connected"/> or no audio track was negotiated.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     public int SendAudioFrame(ReadOnlySpan<byte> opusPacket, uint rtpTimestamp48k) =>
         FirstSender(MediaKind.Audio) is { } sender
             ? sender.SendFrame(opusPacket, rtpTimestamp48k)
@@ -246,6 +275,9 @@ public sealed partial class PeerConnection
     /// (see <see cref="OutboundCutResult"/>).
     /// </remarks>
     /// <returns>What was discarded; default when no audio track is streaming yet.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     public OutboundCutResult CutOutboundAudio() =>
         FirstSender(MediaKind.Audio) is { } sender ? CutOutboundOnSender(sender) : default;
 
@@ -258,6 +290,8 @@ public sealed partial class PeerConnection
     /// <exception cref="NotSupportedException"><paramref name="sender"/> is not audio.</exception>
     internal OutboundCutResult CutOutboundOnSender(RtpSender sender)
     {
+        ThrowIfInPacketSentHandler();
+
         if (sender.Kind != MediaKind.Audio)
         {
             throw new NotSupportedException(
@@ -331,6 +365,8 @@ public sealed partial class PeerConnection
     /// </summary>
     internal int SendFrameOnSender(RtpSender sender, ReadOnlySpan<byte> frame, uint rtpTimestamp)
     {
+        ThrowIfInPacketSentHandler();
+
         var track = sender.Track;
         if (track is null || State != PeerConnectionState.Connected)
         {
@@ -362,6 +398,8 @@ public sealed partial class PeerConnection
         bool marker,
         byte payloadType)
     {
+        ThrowIfInPacketSentHandler();
+
         var track = sender.Track;
         if (track is null || State != PeerConnectionState.Connected)
         {
@@ -473,10 +511,14 @@ public sealed partial class PeerConnection
     /// <param name="payloadType">The payload type this subscriber negotiated for <paramref name="kind"/>.</param>
     /// <returns>
     /// True when the packet was assembled, protected and handed to the send path. False — never an
-    /// exception — when the connection is not <see cref="PeerConnectionState.Connected"/>, has no
-    /// negotiated send track for <paramref name="kind"/>, is closing, or the payload will not fit the
-    /// negotiated MTU. A false return lets one dead subscriber never break a fan-out loop.
+    /// exception, except when called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler — when
+    /// the connection is not <see cref="PeerConnectionState.Connected"/>, has no negotiated send track for
+    /// <paramref name="kind"/>, is closing, or the payload will not fit the negotiated MTU. A false return
+    /// lets one dead subscriber never break a fan-out loop.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     /// <remarks>
     /// Keryx assigns the SSRC (the local send SSRC for <paramref name="kind"/>) and a monotonic
     /// sequence number, and records the emitted packet in the per-subscriber send history keyed by that
@@ -2837,11 +2879,19 @@ public sealed partial class PeerConnection
                 sender.Track?.Generation ?? 0);
             try
             {
+                // Mark this thread as inside a handler so a re-entrant send or cut throws instead of
+                // corrupting the packet buffer mid-send or inverting the send lock order. A handler
+                // cannot nest: every guarded entry point it might call throws, so a plain bool is enough.
+                t_inPacketSentHandler = true;
                 handler(sender, in info);
             }
             catch (Exception ex)
             {
                 _logger.Log(KeryxLogLevel.Warning, "An OnRtpPacketSent handler threw.", ex);
+            }
+            finally
+            {
+                t_inPacketSentHandler = false;
             }
 
             return;

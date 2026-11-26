@@ -209,6 +209,9 @@ public sealed class RtpSender : IRtpForwarder
     /// The number of RTP packets sent, or 0 when the connection is not yet
     /// <see cref="PeerConnectionState.Connected"/> or no send codec was negotiated for this transceiver.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="OnRtpPacketSent"/> handler.
+    /// </exception>
     public int SendFrame(ReadOnlySpan<byte> frame, uint rtpTimestamp) =>
         _owner.SendFrameOnSender(this, frame, rtpTimestamp);
 
@@ -225,6 +228,9 @@ public sealed class RtpSender : IRtpForwarder
     /// <exception cref="NotSupportedException">
     /// This sender is not audio; a video cut would need a keyframe-aware generation.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="OnRtpPacketSent"/> handler.
+    /// </exception>
     public OutboundCutResult CutOutbound() => _owner.CutOutboundOnSender(this);
 
     /// <summary>
@@ -240,10 +246,16 @@ public sealed class RtpSender : IRtpForwarder
     /// Raised on the thread that sent the packet (the caller of <see cref="SendFrame"/> or
     /// <see cref="TryForwardRtp"/> when congestion control is off, the pacer's timer thread when it is on),
     /// while the connection's send lock is held, so events for one connection arrive in wire order and
-    /// never concurrently. The handler must return quickly, must not block, and must not call
-    /// <see cref="SendFrame"/>, <see cref="TryForwardRtp"/>, <see cref="CutOutbound"/> or any other send on
-    /// the connection. Subscribing or unsubscribing from inside the handler is allowed. An exception
-    /// thrown by a handler is caught and logged; it does not affect sending.
+    /// never concurrently. Handlers must be fast and non-blocking and must NOT call back into the sender or
+    /// its <see cref="PeerConnection"/> (or any other <see cref="PeerConnection"/>). Calling
+    /// <see cref="SendFrame"/>, <see cref="TryForwardRtp"/>, <see cref="CutOutbound"/>,
+    /// <see cref="PeerConnection.SendAudioFrame"/>, <see cref="PeerConnection.SendVideoFrame"/> or
+    /// <see cref="PeerConnection.CutOutboundAudio"/> from inside a handler throws
+    /// <see cref="InvalidOperationException"/>; other calls into the connection (close, data channel sends,
+    /// renegotiation) are not guarded and can deadlock. Hand the data to another thread or queue instead.
+    /// A slow handler stalls every send on the connection. Subscribing or unsubscribing from inside the
+    /// handler is allowed. An exception thrown by a handler is caught and logged; it does not affect
+    /// sending.
     /// </para>
     /// <para>
     /// May be subscribed before the connection is up. Costs nothing per packet while no sender on the
@@ -265,13 +277,17 @@ public sealed class RtpSender : IRtpForwarder
     /// <summary>
     /// Forwards one already-packetized RTP payload verbatim onto this sender's SSRC and sequence space
     /// — the SFU subscriber-egress path. See <see cref="PeerConnection.TryForwardRtp"/> for the exact
-    /// semantics; this never throws and returns false when the sender is not ready.
+    /// semantics; this never throws, except when called from inside an <see cref="OnRtpPacketSent"/>
+    /// handler, and returns false when the sender is not ready.
     /// </summary>
     /// <param name="payload">The RTP payload, written verbatim; never re-packetized.</param>
     /// <param name="rtpTimestamp">The RTP timestamp to stamp on the packet.</param>
     /// <param name="marker">The marker bit.</param>
     /// <param name="payloadType">The payload type this subscriber negotiated.</param>
     /// <returns>True when the packet reached the send path; false when the sender is not ready.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="OnRtpPacketSent"/> handler.
+    /// </exception>
     public bool TryForwardRtp(ReadOnlySpan<byte> payload, uint rtpTimestamp, bool marker, byte payloadType) =>
         _owner.ForwardRtpOnSender(this, payload, rtpTimestamp, marker, payloadType);
 }
