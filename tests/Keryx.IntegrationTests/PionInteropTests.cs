@@ -58,9 +58,62 @@ public sealed class PionInteropTests
         void Log(string message) => _output.WriteLine($"[{stopwatch.Elapsed:mm\\:ss\\.f}] {message}");
 
         using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(DeadlineSeconds));
-        var cancellationToken = shutdown.Token;
 
         await using var peer = new PeerConnection(TestSupport.NewConfig());
+
+        await RunPionSessionAsync(peerPath, peer, shutdown, Log);
+    }
+
+    [Fact]
+    [Trait("Category", "SharedPortPionInterop")]
+    public async Task PionAnswersKeryxOnSharedBroadcastPort_VideoAndDataChannelsRoundTrip()
+    {
+        var peerPath = PionPeer.Require(_output.WriteLine);
+        if (peerPath is null)
+        {
+            _output.WriteLine("SKIPPED: Go toolchain / pion peer not available (set KERYX_PION_PEER or install Go to enable).");
+            return;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        void Log(string message) => _output.WriteLine($"[{stopwatch.Elapsed:mm\\:ss\\.f}] {message}");
+
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(DeadlineSeconds));
+        var cancellationToken = shutdown.Token;
+
+        await using var endpoint = SharedPortInteropSupport.CreateEndpoint(wildcard: false);
+        SharedPortInteropSupport.AssertPoolShape(endpoint);
+        Log($"endpoint={endpoint.LocalEndPoint} poolSize={endpoint.SocketPoolSize}");
+
+        var companion = await SharedPortInteropSupport.ConnectCompanionAsync(endpoint, wildcard: false, cancellationToken);
+        try
+        {
+            // The endpoint owns the session's connection; RunPionSessionAsync never disposes it.
+            var session = endpoint.AddViewer(TestSupport.NewConfig());
+            await RunPionSessionAsync(peerPath, session.Connection, shutdown, Log);
+
+            session.BoundEndPoints.Count.Should().BeGreaterThanOrEqualTo(1, "pion's 5-tuple must bind on the shared port");
+            endpoint.ViewerCount.Should().Be(2, "the companion and pion share the endpoint");
+
+            // RunPionSessionAsync cancels the shared deadline when it finishes; the companion proof gets
+            // its own bounded budget.
+            using var companionDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await SharedPortInteropSupport.AssertCompanionStillReceivesAsync(companion, 20, companionDeadline.Token);
+        }
+        finally
+        {
+            await companion.DisposeAsync();
+        }
+    }
+
+    private async Task RunPionSessionAsync(
+        string peerPath,
+        PeerConnection peer,
+        CancellationTokenSource shutdown,
+        Action<string> log)
+    {
+        void Log(string message) => log(message);
+        var cancellationToken = shutdown.Token;
 
         // Keryx-side progress: log every connection-state transition with the ICE/DTLS state at the
         // time, so a stall shows exactly how far the handshake got.

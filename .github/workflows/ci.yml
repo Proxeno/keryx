@@ -18,7 +18,7 @@ jobs:
       # silently go missing.
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
-      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=TurnRelayInterop&Category!=Soak"
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=TurnRelayInterop&Category!=SharedPortChromeInterop&Category!=SharedPortFirefoxInterop&Category!=SharedPortPionInterop&Category!=Soak"
         env:
           KERYX_REQUIRE_COTURN: "1"
 
@@ -88,36 +88,7 @@ jobs:
       # download at SDP time. Best effort: the tests' prefs also enable Firefox's own on-demand fetch as
       # a fallback, so a slow warm-up does not fail the job outright.
       - name: Warm up OpenH264 GMP
-        run: |
-          FF="${{ steps.setup-firefox.outputs.firefox-path }}"
-          PROFILE="$HOME/keryx-ff-gmp"
-          mkdir -p "$PROFILE"
-          cat > "$PROFILE/user.js" <<'EOF'
-          user_pref("media.gmp-gmpopenh264.enabled", true);
-          user_pref("media.gmp-gmpopenh264.autoupdate", true);
-          user_pref("media.gmp-manager.updateEnabled", true);
-          user_pref("toolkit.telemetry.enabled", false);
-          user_pref("datareporting.policy.dataSubmissionEnabled", false);
-          user_pref("app.update.enabled", false);
-          EOF
-          "$FF" --headless --no-remote --new-instance --profile "$PROFILE" about:blank &
-          FF_PID=$!
-          # Wait for the plugin file AND the registration pref: Firefox only loads a GMP whose version
-          # is recorded in prefs.js, and that write lands after the download, so killing on the file
-          # alone leaves a profile that ignores the plugin (BrowserLauncher copies prefs.js to register
-          # it in each test profile). Require both before killing.
-          for i in $(seq 1 40); do
-            if ls "$PROFILE"/gmp-gmpopenh264/*/libgmpopenh264.* >/dev/null 2>&1 \
-               && grep -q 'gmp-gmpopenh264.version' "$PROFILE/prefs.js" 2>/dev/null; then
-              echo "OpenH264 GMP downloaded and registered."
-              break
-            fi
-            sleep 2
-          done
-          sleep 2
-          kill "$FF_PID" 2>/dev/null || true
-          echo "KERYX_FIREFOX_GMP_DIR=$PROFILE" >> "$GITHUB_ENV"
-          grep 'gmp-gmpopenh264.version' "$PROFILE/prefs.js" 2>/dev/null || echo "OpenH264 GMP not registered after warm-up (tests will fetch on demand)"
+        run: tests/interop/firefox-warm-gmp.sh "${{ steps.setup-firefox.outputs.firefox-path }}"
       - run: dotnet build Keryx.slnx --configuration Release
       # The DTLS-SRTP/ICE path uses host candidates only — no STUN, TURN or mDNS — so it runs headless.
       # It is not loopback-only: headless Firefox gathers just its real interface address and binds its
@@ -208,5 +179,89 @@ jobs:
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=TurnRelayInterop"
         env:
           KERYX_REQUIRE_TURN_RELAY: "1"
+          KERYX_REQUIRE_PION: "1"
+          KERYX_PION_PEER: ${{ github.workspace }}/tests/interop/pion/pion-peer
+
+  # Shared-port interop, CI-enforced. A stock Chrome / Firefox / pion peer connects to the shared
+  # BroadcastEndpoint port (a 2-socket SO_REUSEPORT pool on this Linux runner) alongside another Keryx
+  # viewer, and receives media: on the per-connection path (TryForwardRtp) and, for the browsers, on
+  # the bridged fan-out path (ViewerBroadcastBridge + SendBatch). The other viewer must keep receiving
+  # undisturbed. The SharedPort* tests are excluded from build-test above, so this job MUST run them.
+  # KERYX_REQUIRE_CHROME=1 turns a missing or unlaunchable browser into a failure instead of a skip.
+  shared-port-chrome-interop:
+    runs-on: ubuntu-latest
+    # Safety bound: each test carries a 90 s hard deadline and the lane has 2 tests, so a healthy run is
+    # a few minutes including the build; 8 minutes can never hang for the six-hour GitHub default.
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+      - run: dotnet build Keryx.slnx --configuration Release
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=SharedPortChromeInterop"
+        env:
+          KERYX_REQUIRE_CHROME: "1"
+          KERYX_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+  # Shared-port interop against Firefox, CI-enforced: a stock Firefox connects to the shared
+  # BroadcastEndpoint port (a 2-socket SO_REUSEPORT pool on this Linux runner, wildcard-bound and
+  # advertising the default-route address because headless Firefox binds its real interface) alongside
+  # another Keryx viewer, and receives media on both the per-connection path and the bridged fan-out
+  # path. Setup mirrors firefox-interop (OpenH264 GMP warm-up included).
+  # KERYX_REQUIRE_FIREFOX=1 turns a missing or unlaunchable browser into a failure instead of a skip.
+  shared-port-firefox-interop:
+    runs-on: ubuntu-latest
+    # Safety bound: each test carries a 90 s hard deadline and the lane has 2 tests, so a healthy run is
+    # a few minutes including the build and the GMP warm-up; 10 minutes leaves room for the warm-up.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: browser-actions/setup-firefox@v1
+        id: setup-firefox
+        with:
+          firefox-version: latest
+      # See firefox-interop for why the OpenH264 GMP is warmed into a template profile.
+      - name: Warm up OpenH264 GMP
+        run: tests/interop/firefox-warm-gmp.sh "${{ steps.setup-firefox.outputs.firefox-path }}"
+      - run: dotnet build Keryx.slnx --configuration Release
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=SharedPortFirefoxInterop"
+        env:
+          KERYX_REQUIRE_FIREFOX: "1"
+          KERYX_FIREFOX_PATH: ${{ steps.setup-firefox.outputs.firefox-path }}
+
+  # Shared-port interop against pion, CI-enforced: the pion (Go WebRTC) peer connects to the shared
+  # BroadcastEndpoint port (a 2-socket SO_REUSEPORT pool on this Linux runner) alongside another Keryx
+  # viewer, decodes Keryx's H.264 and round-trips both data channels. The other viewer must keep
+  # receiving undisturbed. KERYX_REQUIRE_PION=1 turns a missing Go toolchain or unbuildable peer into a
+  # failure instead of a skip.
+  shared-port-pion-interop:
+    runs-on: ubuntu-latest
+    # Safety bound: the test carries a 75 s hard deadline and the lane has 1 test, so a healthy run is a
+    # few minutes including the build.
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Build pion peer
+        working-directory: tests/interop/pion
+        run: |
+          go mod tidy
+          go build -o pion-peer .
+      - run: dotnet build Keryx.slnx --configuration Release
+      - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category=SharedPortPionInterop"
+        env:
           KERYX_REQUIRE_PION: "1"
           KERYX_PION_PEER: ${{ github.workspace }}/tests/interop/pion/pion-peer
