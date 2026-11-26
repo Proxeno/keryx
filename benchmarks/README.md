@@ -70,6 +70,9 @@ ramping the viewer count until the box saturates. Three arms, both egress paths,
   flushes the N datagrams in one `sendmmsg(2)` (Linux). N real loopback+SRTP sinks receive and decrypt.
 - **Arm C — fan-out ceiling, shared-key encrypt-once path.** One SRTP encrypt per ingest packet, then
   N byte-identical datagrams through the same batched send — the O(N)→O(1) crypto collapse of §5.
+- **Arm P — socket-pool sweep.** A fixed viewer count on the per-viewer path, sweeping the socket pool
+  over 1/2/4/8 (`SocketPoolSize`, Linux `SO_REUSEPORT`), showing fan-out throughput spread across cores.
+  Prints the effective pool and each shard's sent/dropped split per row.
 
 The rig auto-reports the machine specs, whether native `sendmmsg` is active, and — honestly — what a
 true multi-box rig would still add that a single box cannot show (the NIC wall).
@@ -79,6 +82,9 @@ Run (native `sendmmsg` needs Linux; use the Dockerfile on macOS):
 ```bash
 dotnet run -c Release --project benchmarks/Keryx.BroadcastLoadTest -- --arms A,B,C --duration 5
 # options: --profile 480p  --pc-viewers 100,250,500  --viewers 1000,5000,10000  --workers 16
+
+# Arm P: socket-pool sweep at a fixed viewer count.
+dotnet run -c Release --project benchmarks/Keryx.BroadcastLoadTest -- --arms P --pool-sizes 1,2,4,8 --pool-viewers 2000
 
 docker build -f benchmarks/Keryx.BroadcastLoadTest/loadtest-linux.Dockerfile -t keryx-loadtest .
 docker run --rm --ulimit nofile=1048576:1048576 -v "$PWD":/work -w /work keryx-loadtest \
