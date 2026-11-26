@@ -31,6 +31,7 @@ const state = {
   oldAfterNew: false,
   serverCutEpoch: null,
   cutSignalEpoch: null,
+  concealStartEpoch: null,
   jb: { lifetimeMs: null, recentMs: null },
   statsAtCut: null,
   statsAfter: null,
@@ -127,6 +128,8 @@ async function audioStats(pc) {
         packetsReceived: r.packetsReceived ?? 0,
         packetsLost: r.packetsLost ?? 0,
         concealedSamples: r.concealedSamples ?? 0,
+        silentConcealedSamples: r.silentConcealedSamples ?? 0,
+        concealmentEvents: r.concealmentEvents ?? 0,
         totalSamplesReceived: r.totalSamplesReceived ?? 0,
         lastPacketReceivedTimestamp: r.lastPacketReceivedTimestamp ?? 0,
       };
@@ -220,9 +223,29 @@ async function snapshotAtCut(pc) {
     }
   }
 
+  // 350 ms after the cut signal: the new generation does not start until 400 ms, so this snapshot
+  // contains only old-generation playout plus concealment, never new content.
   setTimeout(async () => {
     state.statsAfter = await audioStats(pc);
-  }, 500);
+  }, 350);
+
+  // During the same window, find when the jitter buffer first ran dry and NetEq started concealing.
+  const pollStart = performance.now();
+  const baseConcealed = atCut ? atCut.concealedSamples : null;
+  if (baseConcealed !== null) {
+    const timer = setInterval(async () => {
+      if (performance.now() - pollStart >= 350) {
+        clearInterval(timer);
+        return;
+      }
+
+      const snapshot = await audioStats(pc);
+      if (snapshot && state.concealStartEpoch === null && snapshot.concealedSamples > baseConcealed) {
+        state.concealStartEpoch = performance.timeOrigin + performance.now();
+        clearInterval(timer);
+      }
+    }, 20);
+  }
 }
 
 async function setupAudio(pc, track) {

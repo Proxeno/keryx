@@ -19,8 +19,20 @@ namespace Keryx.IntegrationTests;
 /// decoder concealed after the new generation arrived.
 /// </summary>
 /// <remarks>
+/// <para>
+/// The measured stop is reported in three parts. (a) The server cut to the last wire packet is what
+/// Keryx controls: <c>cutToLastOldWireMs</c>. (b) The jitter-buffer residue is real buffered packets:
+/// <c>jitterResidueLifetimeMs</c>/<c>jitterResidueRecentMs</c>, and the samples those packets actually
+/// play after the cut are <c>realPlayoutAfterCutMs</c>. The rest of the audible tail is a PLC tail:
+/// audio Chrome NetEq synthesises (concealment/expand) after the buffer runs dry. That is stale audio,
+/// not live packets. Only a local playout stop in the browser adapter (mute or gain 0 when the cut
+/// signal arrives) removes it, which is why <c>staleAfterSignalMs</c> is reported alongside
+/// <c>concealStartMs</c>, <c>plcTailMs</c> and the concealed-sample deltas.
+/// </para>
+/// <para>
 /// Excluded from CI (<c>Category=ChromeInterop</c>): it needs Google Chrome on the machine. The browser
 /// path can be overridden with <c>KERYX_CHROME_PATH</c>.
+/// </para>
 /// </remarks>
 public sealed class ChromeBargeInInteropTests
 {
@@ -257,6 +269,25 @@ public sealed class ChromeBargeInInteropTests
             var lostDelta = ReadStatsDouble(root, "statsAfter", "packetsLost")
                 - ReadStatsDouble(root, "statsAtCut", "packetsLost");
 
+            // Split the audible stop into real playout of buffered packets versus NetEq synthesised
+            // concealment. totalSamplesReceived counts both real and concealed samples, so subtracting
+            // the concealed total leaves what came from real packets.
+            var totalCut = ReadStatsDouble(root, "statsAtCut", "totalSamplesReceived");
+            var concealedCut = ReadStatsDouble(root, "statsAtCut", "concealedSamples");
+            var silentCut = ReadStatsDouble(root, "statsAtCut", "silentConcealedSamples");
+            var totalAfter = ReadStatsDouble(root, "statsAfter", "totalSamplesReceived");
+            var concealedAfter = ReadStatsDouble(root, "statsAfter", "concealedSamples");
+            var silentAfter = ReadStatsDouble(root, "statsAfter", "silentConcealedSamples");
+
+            var realPlayoutAfterCutMs = ((totalAfter - concealedAfter) - (totalCut - concealedCut)) / 48.0;
+            var concealedAfterCutMs = (concealedAfter - concealedCut) / 48.0;
+            var silentConcealedAfterCutMs = (silentAfter - silentCut) / 48.0;
+            var concealStartEpoch = ReadNullableDouble(root, "concealStartEpoch");
+            var concealStartMs = concealStartEpoch is { } startEpoch ? startEpoch - serverCutEpoch : -1.0;
+            double? plcTailMs = audibleStopMs is { } stop && concealStartMs >= 0
+                ? stop - concealStartMs
+                : null;
+
             var measurement =
                 MeasurementPrefix
                 + $"cutCallUs={cutCallUs.ToString("F0", CultureInfo.InvariantCulture)}"
@@ -269,7 +300,12 @@ public sealed class ChromeBargeInInteropTests
                 + $" staleAfterSignalMs={Format(staleAfterSignalMs)}"
                 + $" oldAfterNew={oldAfterNew.ToString().ToLowerInvariant()}"
                 + $" newGenConcealedDelta={Format(concealedDelta)}"
-                + $" packetsLostDelta={Format(lostDelta)}";
+                + $" packetsLostDelta={Format(lostDelta)}"
+                + $" realPlayoutAfterCutMs={Format(realPlayoutAfterCutMs)}"
+                + $" concealedAfterCutMs={Format(concealedAfterCutMs)}"
+                + $" silentConcealedAfterCutMs={Format(silentConcealedAfterCutMs)}"
+                + $" concealStartMs={Format(concealStartMs)}"
+                + $" plcTailMs={Format(plcTailMs)}";
             _output.WriteLine(measurement);
             Console.WriteLine(measurement);
 
