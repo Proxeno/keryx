@@ -44,4 +44,27 @@ internal static class VoiceTestSupport
         a.OnLocalIceCandidate += (_, e) => b.AddIceCandidate(e.Candidate, e.SdpMid);
         b.OnLocalIceCandidate += (_, e) => a.AddIceCandidate(e.Candidate, e.SdpMid);
     }
+
+    /// <summary>
+    /// Runs one voice offer/answer exchange over trickle ICE: the offerer makes its audio m-line
+    /// sendrecv, the answerer does the same after applying the offer (binding a legacy transceiver
+    /// resets its direction), and both descriptions are applied. The caller waits for connection.
+    /// </summary>
+    /// <param name="offerer">The side building the offer.</param>
+    /// <param name="answerer">The side building the answer.</param>
+    /// <param name="cancellationToken">Cancels the exchange.</param>
+    /// <returns>The offer and answer SDP strings.</returns>
+    internal static async Task<(string Offer, string Answer)> NegotiateVoiceAsync(
+        PeerConnection offerer,
+        PeerConnection answerer,
+        CancellationToken cancellationToken)
+    {
+        MakeAudioSendRecv(offerer);
+        var offer = await offerer.CreateOfferAsync(cancellationToken);
+        await answerer.SetRemoteDescriptionAsync(offer, SdpType.Offer, cancellationToken);
+        MakeAudioSendRecv(answerer);
+        var answer = await answerer.CreateAnswerAsync(cancellationToken);
+        await offerer.SetRemoteDescriptionAsync(answer, SdpType.Answer, cancellationToken);
+        return (offer, answer);
+    }
 }
