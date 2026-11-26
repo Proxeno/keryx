@@ -22,6 +22,9 @@ jobs:
   # (excluded from build-test above) MUST actually run here. KERYX_REQUIRE_CHROME=1 turns a missing
   # or unlaunchable browser into a failure instead of the graceful skip local dev gets, so an
   # interop regression fails the build rather than silently passing.
+  #
+  # The voice session soak (VoiceSessionInteropTests) runs here too, at its 60 s default: PR CI keeps
+  # each browser under a minute. The full 20-minute soak runs in voice-soak.yml on schedule.
   browser-interop:
     runs-on: ubuntu-latest
     steps:
@@ -58,9 +61,13 @@ jobs:
   firefox-interop:
     runs-on: ubuntu-latest
     # Safety bound: the FirefoxInterop tests each carry their own ~90s deadline and run serially, so a
-    # healthy run finishes in a few minutes. This ceiling guarantees a future regression can never hang
-    # the job for the six-hour GitHub default and burn CI minutes.
-    timeout-minutes: 12
+    # healthy run finishes in a few minutes. The voice session soak adds one more roughly 3-minute test
+    # (60 s of call plus browser start-up and negotiation), so the ceiling is 15 minutes. This guarantees
+    # a future regression can never hang the job for the six-hour GitHub default and burn CI minutes.
+    #
+    # Like the Chrome lane, the voice soak runs at its 60 s default on PRs; the full 20-minute soak runs
+    # in voice-soak.yml on schedule.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4

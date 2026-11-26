@@ -165,6 +165,10 @@ internal static class BrowserLauncher
     /// Chrome: <c>--no-sandbox</c> and <c>--disable-dev-shm-usage</c> are what let headless Chrome
     /// start inside a CI container (a restricted user namespace and a tiny <c>/dev/shm</c> would
     /// otherwise abort launch); both are harmless in the throwaway test profile locally.
+    /// <c>--use-fake-ui-for-media-stream</c> and <c>--use-fake-device-for-media-stream</c> grant
+    /// <c>getUserMedia({audio:true})</c> without a permission prompt and feed it a synthetic capture
+    /// device, so the voice lane can send a real Opus stream headless; the other lanes never call
+    /// <c>getUserMedia</c>, so the flags are inert for them.
     /// </para>
     /// <para>
     /// Firefox takes the page as a positional argument under <c>--headless</c>, with
@@ -188,6 +192,8 @@ internal static class BrowserLauncher
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--autoplay-policy=no-user-gesture-required",
+            "--use-fake-ui-for-media-stream",
+            "--use-fake-device-for-media-stream",
             $"--user-data-dir={profileDir}",
             url,
         ],
@@ -218,6 +224,11 @@ internal static class BrowserLauncher
     /// with its sandbox disabled in a headless CI environment (see <see cref="Launch"/>) and only when
     /// the copied profile registers it (see <see cref="CopyWarmedGmp"/>); when both hold, video flows in
     /// both directions.</item>
+    /// <item><c>media.navigator.streams.fake=true</c> gives <c>getUserMedia({audio:true})</c> a synthetic
+    /// capture device, <c>media.navigator.permission.disabled</c> skips the permission prompt, and
+    /// <c>media.autoplay.default=0</c> plus <c>media.autoplay.block-webaudio=false</c> let the voice lane
+    /// play audio back headless. The other lanes never request capture or play audio, so they are
+    /// unaffected.</item>
     /// </list>
     /// The remaining prefs silence first-run, telemetry and update chatter that would otherwise add
     /// latency and network noise to a headless CI launch.
@@ -249,8 +260,10 @@ internal static class BrowserLauncher
             Pref("media.gmp-gmpopenh264.autoupdate", true),
             Pref("media.gmp-manager.updateEnabled", true),
             Pref("media.navigator.permission.disabled", true),
+            Pref("media.navigator.streams.fake", true),
             Pref("media.autoplay.default", 0),
             Pref("media.autoplay.blocking_policy", 0),
+            Pref("media.autoplay.block-webaudio", false),
             // ---- headless hygiene: no first-run, telemetry, or update traffic ----
             Pref("browser.shell.checkDefaultBrowser", false),
             Pref("browser.startup.homepage_override.mstone", "ignore"),
