@@ -99,6 +99,68 @@ concealment for that many frames before decoding this packet. For Opus with in-b
 `LostBefore == 1` it may first decode this packet's LBRR data (`decode_fec=1`) for the single missing
 frame. Keryx does not decode Opus itself; this surface is what a decoder downstream needs.
 
+## Answering a voice-agent offer (sendrecv)
+
+A voice-agent session is one `sendrecv` Opus audio m-line at 48 kHz plus one ordered, reliable
+`control` data channel created by the offerer; the answerer receives that channel through
+`OnDataChannel`. The config has no video codecs at all, which is what keeps the session audio-only.
+
+The legacy audio transceiver is built `SendOnly`, and binding it while applying a remote offer
+resets its `Direction` to the complement of what was offered. So an answerer that wants to send and
+receive audio MUST set `Direction = MediaDirection.SendRecv` on its audio transceiver **after**
+`SetRemoteDescriptionAsync` and **before** `CreateAnswerAsync`; otherwise the answer does not send
+audio. (The offerer sets it before `CreateOfferAsync`.) A `recvonly` offer is answered `sendonly`.
+
+```csharp
+var config = new PeerConnectionConfig();
+config.VideoCodecs.Clear(); // audio-only shape: no video codecs
+await using var answerer = new PeerConnection(config);
+
+// Your signalling: forward e.Candidate and e.SdpMid to the offerer as they are gathered.
+answerer.OnLocalIceCandidate += (_, e) => { /* send e.Candidate / e.SdpMid */ };
+
+// Opus packets arrive decrypted; see "Inbound audio frames" above.
+answerer.OnRtpPacketReceived += (in RtpPacketInfo info, ReadOnlySpan<byte> payload) =>
+{
+    _ = payload;
+    if (info.Kind == MediaKind.Audio)
+    {
+        // Decode the Opus payload here.
+    }
+};
+
+// The offerer creates the ordered "control" channel; the answerer receives it here.
+answerer.OnDataChannel += (_, channel) =>
+{
+    if (channel.Label == "control")
+    {
+        channel.SendText("{\"type\":\"ready\"}");
+    }
+};
+
+await answerer.SetRemoteDescriptionAsync(offerSdp, SdpType.Offer, ct);
+
+// MUST be after applying the offer and before building the answer.
+answerer.Transceivers.Single(t => t.Kind == MediaKind.Audio).Direction = MediaDirection.SendRecv;
+
+var answerSdp = await answerer.CreateAnswerAsync(ct);
+// Send answerSdp to the offerer through your signalling channel.
+
+// Candidates trickled from the offerer.
+answerer.AddIceCandidate(candidate, sdpMid);
+
+if (!await answerer.WaitForConnectedAsync(TimeSpan.FromSeconds(10), ct))
+{
+    throw new InvalidOperationException("peer connection did not connect");
+}
+
+// 20 ms Opus frames on the 48 kHz RTP clock; the offerer's frames arrive above.
+answerer.SendAudioFrame(opusPacket, rtpTimestamp48k);
+```
+
+The offerer-side tests use a helper, `MakeAudioSendRecv`, that performs the same `Direction` flip
+before building the offer.
+
 ## Honest limitations (current)
 
 - No ULPFEC or RED, and no retransmission for audio.
