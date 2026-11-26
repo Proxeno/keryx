@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using Keryx.Core;
 using Keryx.Dtls;
@@ -171,6 +172,37 @@ public sealed partial class PeerConnection
     // whole removal/retraction sequence).
     private readonly List<PacedRtpSender.RemovedPacket> _cutScratch = [];
 
+    // Gate protecting the subscription bookkeeping and the copy-on-write sender array below.
+    private readonly object _packetSentGate = new();
+
+    // Senders with at least one OnRtpPacketSent handler. Copy-on-write, replaced under _packetSentGate,
+    // read lock-free on the send path: with no subscribers the per-packet cost is this one read and a
+    // length check.
+    private volatile RtpSender[] _packetSentSenders = [];
+
+    // True on a thread that is currently inside an OnRtpPacketSent handler (of any connection). The guard
+    // is deliberately thread-wide rather than per-connection: calling a DIFFERENT connection's send from
+    // inside a handler would take that connection's locks while holding this one's, which can deadlock the
+    // two transports against each other just as surely as a self-call. A handler cannot nest — every entry
+    // point it might call back into throws — so a plain bool is enough.
+    [ThreadStatic]
+    private static bool t_inPacketSentHandler;
+
+    /// <summary>
+    /// Throws when the calling thread is inside an <see cref="RtpSender.OnRtpPacketSent"/> handler, so a
+    /// handler that re-enters a send or cut fails loudly instead of corrupting the track buffer or
+    /// deadlocking the connection's lock order.
+    /// </summary>
+    private static void ThrowIfInPacketSentHandler()
+    {
+        if (t_inPacketSentHandler)
+        {
+            throw new InvalidOperationException(
+                "This call is not allowed from inside an RtpSender.OnRtpPacketSent handler: the handler runs inside the "
+                + "connection's send path. Return from the handler and make the call from another thread or task.");
+        }
+    }
+
     private long _videoFramesDropped;
     private long _audioFramesDropped;
     private long _rtpReceived;
@@ -198,6 +230,9 @@ public sealed partial class PeerConnection
     /// <see cref="PeerConnectionState.Connected"/> or no video track was negotiated — in which case
     /// the frame is dropped silently and counted in <see cref="GetStats"/>.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     public int SendVideoFrame(ReadOnlySpan<byte> annexBAccessUnit, uint rtpTimestamp90k) =>
         FirstSender(MediaKind.Video) is { } sender
             ? sender.SendFrame(annexBAccessUnit, rtpTimestamp90k)
@@ -213,6 +248,9 @@ public sealed partial class PeerConnection
     /// 1 when the packet was sent, 0 when it was dropped because the connection is not yet
     /// <see cref="PeerConnectionState.Connected"/> or no audio track was negotiated.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     public int SendAudioFrame(ReadOnlySpan<byte> opusPacket, uint rtpTimestamp48k) =>
         FirstSender(MediaKind.Audio) is { } sender
             ? sender.SendFrame(opusPacket, rtpTimestamp48k)
@@ -232,8 +270,14 @@ public sealed partial class PeerConnection
     /// The next audio packet sent after a cut (implicitly — there is no BeginGeneration call) carries the marker bit and an
     /// RTP timestamp equal to where the kept audio ended plus the wall-clock time elapsed since the cut; the offset from the
     /// caller's timestamps persists until the next cut, so timestamps never go backwards or repeat.
+    /// The returned <see cref="OutboundCutResult.Generation"/> names the output generation the cut starts, and
+    /// <see cref="OutboundCutResult.SamplesDiscarded"/>/<see cref="OutboundCutResult.DurationDiscarded"/> are codec-aware
+    /// (see <see cref="OutboundCutResult"/>).
     /// </remarks>
     /// <returns>What was discarded; default when no audio track is streaming yet.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     public OutboundCutResult CutOutboundAudio() =>
         FirstSender(MediaKind.Audio) is { } sender ? CutOutboundOnSender(sender) : default;
 
@@ -246,6 +290,8 @@ public sealed partial class PeerConnection
     /// <exception cref="NotSupportedException"><paramref name="sender"/> is not audio.</exception>
     internal OutboundCutResult CutOutboundOnSender(RtpSender sender)
     {
+        ThrowIfInPacketSentHandler();
+
         if (sender.Kind != MediaKind.Audio)
         {
             throw new NotSupportedException(
@@ -285,7 +331,7 @@ public sealed partial class PeerConnection
             lock (_sendLock)
             {
                 _cutScratch.Clear();
-                paced.RemoveQueued(track.Stream.Ssrc, _cutScratch);
+                paced.RemoveQueued(track.Stream.Ssrc, track.AudioTiming, _cutScratch);
                 result = track.Cut(_cutScratch);
             }
         });
@@ -319,6 +365,8 @@ public sealed partial class PeerConnection
     /// </summary>
     internal int SendFrameOnSender(RtpSender sender, ReadOnlySpan<byte> frame, uint rtpTimestamp)
     {
+        ThrowIfInPacketSentHandler();
+
         var track = sender.Track;
         if (track is null || State != PeerConnectionState.Connected)
         {
@@ -350,6 +398,8 @@ public sealed partial class PeerConnection
         bool marker,
         byte payloadType)
     {
+        ThrowIfInPacketSentHandler();
+
         var track = sender.Track;
         if (track is null || State != PeerConnectionState.Connected)
         {
@@ -461,10 +511,14 @@ public sealed partial class PeerConnection
     /// <param name="payloadType">The payload type this subscriber negotiated for <paramref name="kind"/>.</param>
     /// <returns>
     /// True when the packet was assembled, protected and handed to the send path. False — never an
-    /// exception — when the connection is not <see cref="PeerConnectionState.Connected"/>, has no
-    /// negotiated send track for <paramref name="kind"/>, is closing, or the payload will not fit the
-    /// negotiated MTU. A false return lets one dead subscriber never break a fan-out loop.
+    /// exception, except when called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler — when
+    /// the connection is not <see cref="PeerConnectionState.Connected"/>, has no negotiated send track for
+    /// <paramref name="kind"/>, is closing, or the payload will not fit the negotiated MTU. A false return
+    /// lets one dead subscriber never break a fan-out loop.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Called from inside an <see cref="RtpSender.OnRtpPacketSent"/> handler.
+    /// </exception>
     /// <remarks>
     /// Keryx assigns the SSRC (the local send SSRC for <paramref name="kind"/>) and a monotonic
     /// sequence number, and records the emitted packet in the per-subscriber send history keyed by that
@@ -1220,7 +1274,8 @@ public sealed partial class PeerConnection
                         maxPayload,
                         profile.RtpOverhead,
                         transportCcId,
-                        absSendTimeId);
+                        absSendTimeId,
+                        audioTiming: AudioPayloadTiming.FromCodec(negotiated.EncodingName, negotiated.ClockRate));
                 }
             }
         }
@@ -2760,6 +2815,20 @@ public sealed partial class PeerConnection
         // in-place SRTP protection below. Costs one null check on the production hot path.
         RtpWireObserverForTest?.Invoke(buffer.AsSpan(0, length), System.Diagnostics.Stopwatch.GetTimestamp());
 
+        // One volatile read decides whether any sender on this connection wants the packet reported.
+        var observers = _packetSentSenders;
+        uint ssrc = 0;
+        uint rtpTimestamp = 0;
+        ushort sequenceNumber = 0;
+        var notify = observers.Length != 0 && length >= RtpHeader.FixedLength;
+        if (notify)
+        {
+            // Read the clear header before SRTP protects the buffer in place.
+            sequenceNumber = BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2, 2));
+            rtpTimestamp = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(4, 4));
+            ssrc = BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(8, 4));
+        }
+
         var protectedLength = srtp.Outbound.ProtectRtp(buffer.AsSpan(0, length), buffer);
         try
         {
@@ -2767,7 +2836,117 @@ public sealed partial class PeerConnection
         }
         catch (InvalidOperationException)
         {
-            // The transport went away between the state check and the send.
+            // The transport went away between the state check and the send: not sent, so not reported.
+            return;
+        }
+
+        if (notify)
+        {
+            NotifyPacketSent(observers, ssrc, sequenceNumber, rtpTimestamp);
+        }
+    }
+
+    /// <summary>
+    /// Raises <see cref="RtpSender.OnRtpPacketSent"/> on the sender that owns <paramref name="ssrc"/>.
+    /// </summary>
+    /// <remarks>
+    /// Kept out of line so the no-subscriber send path stays tiny. <see cref="SendProtectedRtp"/> always
+    /// runs under <c>_sendLock</c>, and <see cref="TrackSender.Cut"/> runs under <c>_sendLock</c> after
+    /// removing every queued packet of the stream with drains excluded, so the track's current generation
+    /// IS the generation of the packet being sent — queued packets need no per-packet generation tag.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void NotifyPacketSent(RtpSender[] observers, uint ssrc, ushort sequenceNumber, uint rtpTimestamp)
+    {
+        for (var i = 0; i < observers.Length; i++)
+        {
+            var sender = observers[i];
+            if (sender.Ssrc != ssrc)
+            {
+                continue;
+            }
+
+            var handler = sender.PacketSentHandler;
+            if (handler is null)
+            {
+                return;
+            }
+
+            var info = new RtpPacketSentInfo(
+                sequenceNumber,
+                rtpTimestamp,
+                _time.GetTimestamp(),
+                sender.Track?.Generation ?? 0);
+            try
+            {
+                // Mark this thread as inside a handler so a re-entrant send or cut throws instead of
+                // corrupting the packet buffer mid-send or inverting the send lock order. A handler
+                // cannot nest: every guarded entry point it might call throws, so a plain bool is enough.
+                t_inPacketSentHandler = true;
+                handler(sender, in info);
+            }
+            catch (Exception ex)
+            {
+                _logger.Log(KeryxLogLevel.Warning, "An OnRtpPacketSent handler threw.", ex);
+            }
+            finally
+            {
+                t_inPacketSentHandler = false;
+            }
+
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Adds or removes one <see cref="RtpSender.OnRtpPacketSent"/> handler and keeps the lock-free
+    /// sender array in step with which senders have reached one.
+    /// </summary>
+    /// <param name="sender">The sender whose event is changing.</param>
+    /// <param name="handler">The handler to add or remove; null is a no-op.</param>
+    /// <param name="subscribe">True to add, false to remove.</param>
+    /// <remarks>
+    /// Lock order: <c>_sendLock</c> may be held when this runs (unsubscribing inside a handler);
+    /// <c>_packetSentGate</c> never takes any other lock.
+    /// </remarks>
+    internal void ChangePacketSentSubscription(RtpSender sender, RtpPacketSentHandler? handler, bool subscribe)
+    {
+        if (handler is null)
+        {
+            return;
+        }
+
+        lock (_packetSentGate)
+        {
+            ref var current = ref sender.PacketSentHandlerRef;
+            var updated = subscribe
+                ? Delegate.Combine(Volatile.Read(ref current), handler) as RtpPacketSentHandler
+                : Delegate.Remove(Volatile.Read(ref current), handler) as RtpPacketSentHandler;
+            Volatile.Write(ref current, updated);
+
+            var senders = _packetSentSenders;
+            var inArray = Array.IndexOf(senders, sender) >= 0;
+            if (updated is not null && !inArray)
+            {
+                var next = new RtpSender[senders.Length + 1];
+                Array.Copy(senders, next, senders.Length);
+                next[^1] = sender;
+                _packetSentSenders = next;
+            }
+            else if (updated is null && inArray)
+            {
+                var next = new RtpSender[senders.Length - 1];
+                var kept = 0;
+                for (var i = 0; i < senders.Length; i++)
+                {
+                    if (!ReferenceEquals(senders[i], sender))
+                    {
+                        next[kept++] = senders[i];
+                    }
+                }
+
+                _packetSentSenders = next;
+            }
         }
     }
 
@@ -3063,14 +3242,23 @@ public sealed partial class PeerConnection
         private readonly byte? _transportCcExtensionId;
         private readonly byte? _absSendTimeExtensionId;
         private readonly FecEmitter? _fec;
+        private readonly AudioPayloadTiming _audioTiming;
         private uint _timestamp;
         private long _packets;
         private long _bytes;
         private long _frames;
 
+        // The output generation: 0 until the first cut, then +1 for every Cut call. Touched only under
+        // the owner's _sendLock, like every other field here.
+        private int _generation;
+
+        // The last RTP timestamp emitted on an audio packet, used to infer the packet spacing for a codec
+        // whose payload carries no duration we can read. Touched only under the owner's _sendLock.
+        private uint _lastAudioTimestamp;
+
         // Where the next audio packet's media timestamp would land if the caller's clock kept running
-        // (the last emitted timestamp plus that packet's Opus duration). A cut anchors the new
-        // generation here. Touched only under the owner's _sendLock.
+        // (the last emitted timestamp plus that packet's duration). A cut anchors the new generation
+        // here. Touched only under the owner's _sendLock.
         private uint _nextExpectedTimestamp;
         private bool _hasEmitted;
 
@@ -3095,7 +3283,8 @@ public sealed partial class PeerConnection
             byte? transportCcExtensionId = null,
             byte? absSendTimeExtensionId = null,
             RtxRetransmitter? retransmitter = null,
-            FecEmitter? fec = null)
+            FecEmitter? fec = null,
+            AudioPayloadTiming audioTiming = default)
         {
             _owner = owner;
             _payloadizer = payloadizer;
@@ -3103,6 +3292,7 @@ public sealed partial class PeerConnection
             _transportCcExtensionId = transportCcExtensionId;
             _absSendTimeExtensionId = absSendTimeExtensionId;
             _fec = fec;
+            _audioTiming = audioTiming;
 
             // Reserve the fixed header plus, when negotiated, the one-byte header extension holding the
             // transport-cc sequence number and/or the abs-send-time timestamp, so the payloadizer writes
@@ -3126,6 +3316,12 @@ public sealed partial class PeerConnection
 
         /// <summary>The repair stream, or null when the answer kept no rtx codec.</summary>
         internal RtxRetransmitter? Retransmitter { get; }
+
+        /// <summary>How this track measures an audio payload's duration, resolved from the negotiated codec.</summary>
+        internal AudioPayloadTiming AudioTiming => _audioTiming;
+
+        /// <summary>The current output generation: 0 until the first cut, then +1 per <see cref="Cut"/>.</summary>
+        internal int Generation => _generation;
 
         public Span<byte> GetPayloadBuffer(int sizeHint) => _buffer.AsSpan(_headerReserve, _maxPayload);
 
@@ -3179,7 +3375,9 @@ public sealed partial class PeerConnection
         /// rewind or the timestamp anchor.
         /// </summary>
         /// <param name="removed">The packets the pacer dropped for this stream, in queue (sequence) order.</param>
-        /// <returns>The packets and samples discarded.</returns>
+        /// <returns>
+        /// The packets and samples discarded, the codec's sample rate, and the new output generation.
+        /// </returns>
         internal OutboundCutResult Cut(List<PeerConnection.PacedRtpSender.RemovedPacket> removed)
         {
             uint anchorTimestamp;
@@ -3222,7 +3420,19 @@ public sealed partial class PeerConnection
                 _generationAnchorTicks = _owner._time.GetTimestamp();
             }
 
-            return new OutboundCutResult(removed.Count, samples);
+            // A cut that discarded packets the codec cannot measure reports the sentinel, never a guess.
+            if (removed.Count > 0 && !AudioTiming.IsKnown)
+            {
+                samples = OutboundCutResult.UnknownSamples;
+            }
+
+            // Every cut starts a new generation, including one that queued and discarded nothing.
+            _generation++;
+            return new OutboundCutResult(removed.Count, samples)
+            {
+                SampleRate = AudioTiming.SampleRate,
+                Generation = _generation,
+            };
         }
 
         /// <summary>
@@ -3318,10 +3528,24 @@ public sealed partial class PeerConnection
             }
 
             // Read the audio duration from the plaintext now: the direct send path below protects the
-            // packet in place, which would turn the TOC byte into ciphertext.
-            var audioIncrement = Kind == MediaKind.Audio
-                ? (uint)(OpusPacketizer.GetDurationMicroseconds(payload) * OpusPacketizer.OpusClockRate / 1_000_000)
-                : 0;
+            // packet in place, which would turn a readable payload header into ciphertext.
+            uint audioIncrement = 0;
+            if (Kind == MediaKind.Audio)
+            {
+                if (AudioTiming.TryGetRtpTicks(payload, out var ticks))
+                {
+                    audioIncrement = ticks;
+                }
+                else
+                {
+                    // The codec's payload carries no duration we can read (or the codec is not one we
+                    // measure), so fall back to the previous inter-packet timestamp delta: the
+                    // constant-ptime assumption. _hasEmitted and the non-zero/clock-rate guard keep a
+                    // post-cut first packet from repeating the last timestamp and reject nonsense.
+                    var delta = unchecked(timestamp - _lastAudioTimestamp);
+                    audioIncrement = _hasEmitted && delta != 0 && delta <= Stream.ClockRate ? delta : 0;
+                }
+            }
 
             _owner.SendRtp(_buffer, packetLength);
             _packets++;
@@ -3338,6 +3562,7 @@ public sealed partial class PeerConnection
             {
                 // Remember where the caller's clock would continue; a later cut anchors here.
                 _nextExpectedTimestamp = unchecked(timestamp + audioIncrement);
+                _lastAudioTimestamp = timestamp;
                 _hasEmitted = true;
             }
         }
@@ -3505,7 +3730,10 @@ public sealed partial class PeerConnection
         /// <param name="SequenceNumber">The RTP sequence number the packet carried; it is about to be reused.</param>
         /// <param name="Timestamp">The RTP timestamp the packet carried.</param>
         /// <param name="PayloadLength">The RTP payload length in bytes.</param>
-        /// <param name="PayloadSamples">The packet's duration in 48 kHz samples, read from its Opus TOC byte.</param>
+        /// <param name="PayloadSamples">
+        /// The packet's duration in audio samples at the codec's sample rate, -1 when the codec cannot be
+        /// measured.
+        /// </param>
         internal readonly record struct RemovedPacket(
             ushort SequenceNumber,
             uint Timestamp,
@@ -3540,6 +3768,7 @@ public sealed partial class PeerConnection
         /// untouched and in order.
         /// </summary>
         /// <param name="ssrc">The stream whose queued packets are discarded.</param>
+        /// <param name="timing">How to measure each removed packet's duration for the codec in use.</param>
         /// <param name="removed">Receives the removed packets, in queue order. The caller clears it.</param>
         /// <returns>The number of packets removed.</returns>
         /// <remarks>
@@ -3549,7 +3778,7 @@ public sealed partial class PeerConnection
         /// violate their isolation (and corrupt FEC-protected ones), and GCC tolerates the gap because it
         /// skips not-received entries and takes loss from the per-media-SSRC receiver report instead.
         /// </remarks>
-        internal int RemoveQueued(uint ssrc, List<RemovedPacket> removed)
+        internal int RemoveQueued(uint ssrc, AudioPayloadTiming timing, List<RemovedPacket> removed)
         {
             lock (_gate)
             {
@@ -3560,7 +3789,7 @@ public sealed partial class PeerConnection
                     var queued = _queue.Dequeue();
                     if (ReadSsrc(queued.Buffer, queued.Length) == ssrc)
                     {
-                        removed.Add(CreateRemoved(queued.Buffer, queued.Length));
+                        removed.Add(CreateRemoved(queued.Buffer, queued.Length, timing));
                         ArrayPool<byte>.Shared.Return(queued.Buffer);
                     }
                     else
@@ -3581,7 +3810,7 @@ public sealed partial class PeerConnection
         private static uint ReadSsrc(byte[] buffer, int length) =>
             length >= RtpHeader.FixedLength ? BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(8, 4)) : 0;
 
-        private static RemovedPacket CreateRemoved(byte[] buffer, int length)
+        private static RemovedPacket CreateRemoved(byte[] buffer, int length, AudioPayloadTiming timing)
         {
             ushort sequenceNumber;
             uint timestamp;
@@ -3593,8 +3822,8 @@ public sealed partial class PeerConnection
                 timestamp = packet.Header.Timestamp;
                 payloadLength = packet.Payload.Length;
 
-                // Audio only: the duration comes from the Opus TOC byte (RFC 6716 §3.1).
-                samples = OpusPacketizer.GetDurationMicroseconds(packet.Payload) * OpusPacketizer.OpusClockRate / 1_000_000;
+                // The codec resolves one payload into a sample count; -1 when it cannot be measured.
+                samples = timing.GetSamples(packet.Payload);
             }
             else
             {

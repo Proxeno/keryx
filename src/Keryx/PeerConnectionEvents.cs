@@ -344,3 +344,51 @@ public readonly record struct RtpPacketInfo(
 /// feed it straight to a depacketizer, before returning.
 /// </param>
 public delegate void RtpPacketReceivedHandler(in RtpPacketInfo info, ReadOnlySpan<byte> payload);
+
+/// <summary>One RTP packet of an <see cref="RtpSender"/>'s media stream, as it actually left for the wire.</summary>
+public readonly record struct RtpPacketSentInfo
+{
+    internal RtpPacketSentInfo(ushort sequenceNumber, uint rtpTimestamp, long sentAtTimestamp, int generation)
+    {
+        SequenceNumber = sequenceNumber;
+        RtpTimestamp = rtpTimestamp;
+        SentAtTimestamp = sentAtTimestamp;
+        Generation = generation;
+    }
+
+    /// <summary>
+    /// The RTP sequence number exactly as it appears in the wire header — after pacing, and after any
+    /// <see cref="RtpSender.CutOutbound"/> sequence rewind. Not the value the application supplied.
+    /// </summary>
+    public ushort SequenceNumber { get; }
+
+    /// <summary>
+    /// The RTP timestamp exactly as it appears in the wire header — after pacing, and after any
+    /// <see cref="RtpSender.CutOutbound"/> timestamp rebase. Not the timestamp the application passed to
+    /// <see cref="RtpSender.SendFrame"/>.
+    /// </summary>
+    public uint RtpTimestamp { get; }
+
+    /// <summary>
+    /// When the packet was handed to the transport,
+    /// in <see cref="PeerConnectionConfig.TimeProvider"/>'s <see cref="System.TimeProvider.GetTimestamp"/>
+    /// units. Convert with <see cref="System.TimeProvider.GetElapsedTime(long)"/> or
+    /// <see cref="System.TimeProvider.TimestampFrequency"/>. With the default
+    /// <see cref="System.TimeProvider.System"/> it is directly comparable to
+    /// <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/>.
+    /// </summary>
+    public long SentAtTimestamp { get; }
+
+    /// <summary>
+    /// The sender's output generation: 0 until the first cut, then +1 for every
+    /// <see cref="RtpSender.CutOutbound"/> on this sender; equals the
+    /// <see cref="OutboundCutResult.Generation"/> of the cut that started it. Once a cut returns
+    /// generation G, no packet with a generation below G is reported or sent afterwards.
+    /// </summary>
+    public int Generation { get; }
+}
+
+/// <summary>Receives one outbound RTP packet as it leaves for the wire.</summary>
+/// <param name="sender">The sender whose media stream carried the packet.</param>
+/// <param name="info">The packet's wire header values, send time and output generation.</param>
+public delegate void RtpPacketSentHandler(RtpSender sender, in RtpPacketSentInfo info);

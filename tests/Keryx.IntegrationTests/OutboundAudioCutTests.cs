@@ -64,7 +64,8 @@ public sealed class OutboundAudioCutTests
 
         var removed = new List<PeerConnection.PacedRtpSender.RemovedPacket>();
         var count = 0;
-        sender.RunWithDrainsExcluded(() => count = sender.RemoveQueued(aSsrc, removed));
+        sender.RunWithDrainsExcluded(
+            () => count = sender.RemoveQueued(aSsrc, AudioPayloadTiming.FromCodec("opus", 48_000), removed));
 
         count.Should().Be(5);
         removed.Select(r => r.SequenceNumber).Should().Equal(new ushort[] { 1, 2, 3, 4, 5 });
@@ -90,10 +91,45 @@ public sealed class OutboundAudioCutTests
         using var sender = new PeerConnection.PacedRtpSender(pacer, time, srtpOverhead: 0, (_, _) => { }, NullLogger.Instance);
 
         var removed = new List<PeerConnection.PacedRtpSender.RemovedPacket>();
-        var count = sender.RemoveQueued(0x1234, removed);
+        var count = sender.RemoveQueued(0x1234, AudioPayloadTiming.FromCodec("opus", 48_000), removed);
 
         count.Should().Be(0);
         removed.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData("PCMU", 8000, 160, 160)]
+    [InlineData("PCMA", 8000, 160, 160)]
+    [InlineData("G722", 8000, 160, 320)]
+    [InlineData("opus", 48000, 80, 960)]
+    [InlineData("L16", 44100, 160, -1)]
+    public void RemoveQueuedCountsSamplesByCodec(string encodingName, uint clockRate, int payloadLength, long expected)
+    {
+        var time = new FakeTimerTimeProvider();
+        var pacer = new PacketPacer(100_000_000, time);
+        using var sender = new PeerConnection.PacedRtpSender(pacer, time, srtpOverhead: 0, (_, _) => { }, NullLogger.Instance);
+
+        var ssrc = 0xAAAA_AAA1u;
+        var stream = new RtpStreamSender(ssrc, 111, clockRate, initialSequenceNumber: 1, initialTimestamp: 0);
+        var payload = encodingName == "opus" ? Tone() : new byte[payloadLength];
+        var buffer = new byte[256];
+
+        for (var i = 0; i < 3; i++)
+        {
+            var length = stream.WritePacket(payload, marker: false, buffer);
+            sender.Enqueue(buffer.AsSpan(0, length));
+        }
+
+        var removed = new List<PeerConnection.PacedRtpSender.RemovedPacket>();
+        var count = 0;
+        sender.RunWithDrainsExcluded(
+            () => count = sender.RemoveQueued(
+                ssrc,
+                AudioPayloadTiming.FromCodec(encodingName, clockRate),
+                removed));
+
+        count.Should().Be(3);
+        removed.Should().OnlyContain(r => r.PayloadSamples == expected);
     }
 
     // ---------------------------------------------------------------- part 2: loopback
@@ -129,6 +165,9 @@ public sealed class OutboundAudioCutTests
         var cut = offerer.CutOutboundAudio();
         cut.PacketsDiscarded.Should().Be(10);
         cut.SamplesDiscarded.Should().Be(10L * AudioSampleIncrement);
+        cut.SampleRate.Should().Be(48_000);
+        cut.DurationDiscarded.Should().Be(TimeSpan.FromMilliseconds(200));
+        cut.Generation.Should().Be(1);
 
         paced.HoldDrainForTest = false;
         await Task.Delay(200, shutdown.Token);
@@ -322,7 +361,8 @@ public sealed class OutboundAudioCutTests
         var rtx = new RtxRetransmitter(0x9999_0001, 97, 48_000, history);
         var stream = new RtpStreamSender(0x9999_0002, 111, 48_000, initialSequenceNumber: 500, initialTimestamp: 0);
         var track = new PeerConnection.TrackSender(
-            peer, "0", MediaKind.Audio, stream, new OpusPacketizer(), maxPayload: 1000, srtpOverhead: 0, retransmitter: rtx);
+            peer, "0", MediaKind.Audio, stream, new OpusPacketizer(), maxPayload: 1000, srtpOverhead: 0,
+            retransmitter: rtx, audioTiming: AudioPayloadTiming.FromCodec("opus", 48_000));
 
         track.SendFrame(Tone(), 0).Should().Be(1);
         track.SendFrame(Tone(), 960).Should().Be(1);
