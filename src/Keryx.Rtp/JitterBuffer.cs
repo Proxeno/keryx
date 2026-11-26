@@ -87,8 +87,10 @@ public readonly ref struct JitterBufferPacket
 
     /// <summary>
     /// When the packet was inserted, in the buffer's <see cref="TimeProvider.GetTimestamp"/> units —
-    /// the datagram's arrival time at this endpoint, not its later release time. Zero for a packet
-    /// inserted through the overload that does not take an arrival timestamp.
+    /// the datagram's arrival time at this endpoint, not its later release time. The
+    /// <see cref="JitterBuffer.Insert(ushort, uint, bool, byte, System.ReadOnlySpan{byte})"/> overload,
+    /// which does not take an arrival timestamp, stamps the buffer's own
+    /// <see cref="TimeProvider"/> at insert time.
     /// </summary>
     public long ArrivalTimestamp { get; }
 
