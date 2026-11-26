@@ -116,6 +116,11 @@ internal static class FanoutCeilingArm
             Console.WriteLine(
                 $"   {pool,8} | {result.EffectivePoolSize,8} | {result.PassesPerSec,10:N0} | {result.DeliveredPps,16:N0} | "
                 + $"{gbps,6:F2} Gb | {dropPct,5:F1}% | {result.Delta.CpuCores,10:F1} | {decode}");
+
+            var perShard = string.Join(
+                "  ",
+                result.Shards.Select(s => $"{s.ShardIndex}={s.SentDatagrams:N0}/{s.DroppedDatagrams:N0}"));
+            Console.WriteLine($"             shards sent/dropped: {perShard}");
         }
 
         if (!OperatingSystem.IsLinux())
@@ -246,7 +251,8 @@ internal static class FanoutCeilingArm
                 decrypted,
                 decryptFail,
                 foreign,
-                endpoint.SocketPoolSize);
+                endpoint.SocketPoolSize,
+                endpoint.GetShardStatistics());
         }
         finally
         {
@@ -321,7 +327,8 @@ internal static class FanoutCeilingArm
         long Decrypted,
         long DecryptFailures,
         long ForeignSsrc,
-        int EffectivePoolSize);
+        int EffectivePoolSize,
+        IReadOnlyList<BroadcastShardStatistics> Shards);
 
     // ---------------------------------------------------------------------------------------------
     // Fan-out engines: the per-pass work under measurement, behind one interface so the level runner is
