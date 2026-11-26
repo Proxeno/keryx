@@ -288,7 +288,54 @@ public readonly record struct RtpPacketInfo(
     ushort SequenceNumber,
     uint Timestamp,
     bool Marker,
-    string? Rid = null);
+    string? Rid = null)
+{
+    /// <summary>
+    /// When Keryx received the datagram carrying this packet, in
+    /// <see cref="PeerConnectionConfig.TimeProvider"/>'s <see cref="System.TimeProvider.GetTimestamp"/>
+    /// units. Compute its age with <c>config.TimeProvider.GetElapsedTime(info.ArrivalTimestamp)</c>.
+    /// </summary>
+    /// <remarks>
+    /// With <see cref="PeerConnectionConfig.EnableReceiveJitterBuffer"/> on, this is the packet's
+    /// original arrival time, not the later time the jitter buffer released it, so a consumer can
+    /// measure true network age. A packet recovered from RTX or FEC is stamped with the time of its
+    /// recovery instead. Zero when no arrival time was recorded.
+    /// </remarks>
+    public long ArrivalTimestamp { get; init; }
+
+    /// <summary>
+    /// The number of packets of this SSRC the receive jitter buffer declared lost immediately before
+    /// this one in playout order.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The value is meaningful only when <see cref="LossTracked"/> is <see langword="true"/>. When
+    /// <see cref="LossTracked"/> is <see langword="false"/> it is always zero, and that means "not
+    /// tracked", <b>not</b> "no loss": the consumer must compare <see cref="SequenceNumber"/> itself.
+    /// </para>
+    /// <para>
+    /// When <see cref="LossTracked"/> is <see langword="true"/> and this value is greater than zero, a
+    /// consumer should run its decoder's packet-loss concealment for that many frames before decoding
+    /// this packet. For Opus with in-band FEC, when this value is exactly one, it may first decode this
+    /// packet's LBRR data (<c>decode_fec=1</c>) to reconstruct the single missing frame, then decode the
+    /// packet normally.
+    /// </para>
+    /// </remarks>
+    public int LostBefore { get; init; }
+
+    /// <summary>
+    /// True only when this packet was released by the per-SSRC receive jitter buffer
+    /// (<see cref="PeerConnectionConfig.EnableReceiveJitterBuffer"/> is on and the source is within the
+    /// <see cref="PeerConnectionConfig.MaxReceiveSources"/> cap). In that case <see cref="LostBefore"/>
+    /// is authoritative.
+    /// </summary>
+    /// <remarks>
+    /// It is <see langword="false"/> for arrival-order delivery — the buffer is off, or the source cap
+    /// fell back to arrival-order delivery — where <see cref="LostBefore"/> is always zero and means
+    /// "not tracked", not "no loss"; compare <see cref="SequenceNumber"/> yourself in that case.
+    /// </remarks>
+    public bool LossTracked { get; init; }
+}
 
 /// <summary>Receives one decrypted, validated inbound RTP packet.</summary>
 /// <param name="info">The packet's header fields and the m-section it resolved to.</param>
