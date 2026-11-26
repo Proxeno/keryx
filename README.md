@@ -111,7 +111,7 @@ raw RTCP parsing in your application:
 
 ## Architecture
 
-![Keryx architecture — the PeerConnection composition root built on Sdp, Rtp, Srtp, Sctp, Dtls, and Ice (over Stun), all resting on Keryx.Core](https://raw.githubusercontent.com/Proxeno/keryx/main/docs/assets/architecture.png)
+![Keryx architecture — Keryx.Broadcast on top of the PeerConnection composition root, built on Sdp, Rtp, Srtp, Sctp, Dtls, Ice and Turn (over Stun), all resting on Keryx.Core](https://raw.githubusercontent.com/Proxeno/keryx/main/docs/assets/architecture.png)
 
 At runtime everything multiplexes over one transport, a UDP socket or a TURN relay over UDP, TCP or
 TLS (BUNDLE + rtcp-mux): ICE consumes STUN,
