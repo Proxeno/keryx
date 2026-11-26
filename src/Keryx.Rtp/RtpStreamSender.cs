@@ -82,6 +82,27 @@ public sealed class RtpStreamSender
     /// <summary>Total payload octets written, for the sender report's octet count. Wraps at 2^32.</summary>
     public uint OctetCount { get; private set; }
 
+    /// <summary>
+    /// Rewinds the stream past packets that were written but never transmitted (for example, discarded from
+    /// a pacing queue before SRTP protected them), so the next packet reuses the first unsent sequence number
+    /// and the sender report counts only what actually went on the wire. Never call this for a packet that
+    /// may have been protected or sent: reusing its sequence number would reuse an SRTP index.
+    /// </summary>
+    /// <param name="firstUnsentSequenceNumber">The sequence number of the oldest discarded packet.</param>
+    /// <param name="packets">How many written packets are being retracted.</param>
+    /// <param name="payloadOctets">Their total payload octets, as counted by WritePacket.</param>
+    public void RetractUnsent(ushort firstUnsentSequenceNumber, uint packets, uint payloadOctets)
+    {
+        if (packets == 0)
+        {
+            return;
+        }
+
+        _sequenceNumber = firstUnsentSequenceNumber;
+        PacketCount = unchecked(PacketCount - packets);
+        OctetCount = unchecked(OctetCount - payloadOctets);
+    }
+
     /// <summary>Advances <see cref="Timestamp"/> by a number of clock ticks, wrapping at 2^32.</summary>
     /// <param name="ticks">Number of ticks of <see cref="ClockRate"/> to advance.</param>
     public void AdvanceTimestamp(uint ticks) => Timestamp = unchecked(Timestamp + ticks);
