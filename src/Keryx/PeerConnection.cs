@@ -368,6 +368,55 @@ public sealed partial class PeerConnection : IAsyncDisposable
     /// </summary>
     public ICongestionController? CongestionController => _congestionController;
 
+    /// <summary>
+    /// The current FEC protection group size of the first video sender: how many media packets one
+    /// repair packet protects. Zero when FEC is not active.
+    /// </summary>
+    /// <remarks>Moves with reported loss when adaptive group sizing is on; see <see cref="FecProtectionChanged"/>.</remarks>
+    public int VideoFecGroupSize => FirstSender(MediaKind.Video)?.Track?.Fec?.GroupSize ?? 0;
+
+    /// <summary>
+    /// The nominal share of the video stream's packets that are FEC repair packets,
+    /// <c>1 / (VideoFecGroupSize + 1)</c>. Zero when FEC is not active.
+    /// </summary>
+    public double VideoFecOverheadFraction
+    {
+        get
+        {
+            var groupSize = VideoFecGroupSize;
+            return groupSize == 0 ? 0 : 1.0 / (groupSize + 1);
+        }
+    }
+
+    /// <summary>
+    /// The share of the congestion controller's transport target left for encoded media after FEC repair
+    /// overhead — what an encoder should be tuned to. Null when congestion control is off.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ICongestionController.TargetBitrateBitsPerSecond"/> is the whole-transport target
+    /// (media plus RTX plus FEC); this subtracts the nominal repair share so the application's encoder
+    /// does not overrun the wire by the FEC overhead.
+    /// </remarks>
+    public long? MediaTargetBitrateBitsPerSecond
+    {
+        get
+        {
+            if (_congestionController is not { } controller)
+            {
+                return null;
+            }
+
+            return (long)(controller.TargetBitrateBitsPerSecond * (1 - VideoFecOverheadFraction));
+        }
+    }
+
+    /// <summary>
+    /// Raised on the RTCP receive loop when the adaptive FEC protection group size changes, carrying the
+    /// new size, its nominal repair overhead and the smoothed loss that drove it. Handlers must not
+    /// block.
+    /// </summary>
+    public event EventHandler<FecProtectionChangedEventArgs>? FecProtectionChanged;
+
     /// <summary>The synchronisation source of the outbound video stream.</summary>
     public uint VideoSsrc => FirstSender(MediaKind.Video)?.Ssrc ?? 0;
 

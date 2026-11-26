@@ -3,6 +3,7 @@ using Keryx.Core;
 using Keryx.Dtls;
 using Keryx.Rtp;
 using Keryx.Rtp.CongestionControl;
+using Keryx.Rtp.Fec;
 using Keryx.Rtp.Rtcp;
 using Keryx.Sdp;
 using Keryx.Stun;
@@ -194,9 +195,10 @@ public sealed class PeerConnectionConfig
     /// Off by default, and opt-in for the same reason the receive jitter buffer, receiver NACK and REMB
     /// are: enabling it changes the wire shape — extra <c>a=rtpmap:… red/</c> and <c>ulpfec/</c> entries
     /// and their payload types in the video <c>m=</c> line — so with the flag off the default golden SDP
-    /// stays byte-identical. FEC also spends steady uplink on repair packets whether or not loss occurs,
-    /// which retransmission does not, so it is the right tool only where the path loses packets and the
-    /// round trip is too long for NACK/RTX to repair in time.
+    /// stays byte-identical. FEC also spends uplink on repair packets whether or not loss occurs (the
+    /// rate adapts to the reported loss within the <see cref="FecProtection"/> bounds, but never drops to
+    /// zero), which retransmission does not, so it is the right tool only where the path loses packets and
+    /// the round trip is too long for NACK/RTX to repair in time.
     /// </para>
     /// <para>
     /// Audio is deliberately excluded, as with retransmission: Opus repairs isolated loss with its own
@@ -221,8 +223,9 @@ public sealed class PeerConnectionConfig
     /// Off by default, and opt-in for the same reason ULPFEC is: enabling it changes the wire shape — an
     /// extra <c>a=rtpmap:… flexfec-03/</c> entry, its payload type in the video <c>m=</c> line, and a
     /// <c>a=ssrc-group:FEC-FR</c> line binding the media SSRC to the FlexFEC repair SSRC — so with the
-    /// flag off the default golden SDP stays byte-identical. Like ULPFEC, it spends steady uplink on
-    /// repair packets whether or not loss occurs. Audio is deliberately excluded: Opus repairs isolated
+    /// flag off the default golden SDP stays byte-identical. Like ULPFEC, it spends uplink on
+    /// repair packets whether or not loss occurs; the rate adapts to the reported loss within the
+    /// <see cref="FecProtection"/> bounds. Audio is deliberately excluded: Opus repairs isolated
     /// loss with its own in-band FEC.
     /// </para>
     /// </remarks>
@@ -347,6 +350,15 @@ public sealed class PeerConnectionConfig
     /// <see cref="EnableFlexFec"/> is set. Null picks the lowest unused dynamic payload type.
     /// </summary>
     public int? FlexFecPayloadType { get; set; }
+
+    /// <summary>
+    /// Tuning for the FEC protection group size. Honoured only when <see cref="EnableUlpfec"/> or
+    /// <see cref="EnableFlexFec"/> is negotiated. Adaptive by default: the group shrinks as the receiver
+    /// reports more loss and relaxes slowly when the path calms. Set
+    /// <see cref="FecProtectionOptions.AdaptiveGroupSize"/> to false for the previous fixed group of
+    /// <see cref="FecProtectionOptions.InitialGroupSize"/>.
+    /// </summary>
+    public FecProtectionOptions FecProtection { get; set; } = new();
 
     /// <summary>
     /// Retention limits for the ring of recently sent video packets a NACK is served from. The

@@ -1,9 +1,9 @@
 # Send-side congestion control (GCC)
 
-Status: scaffold landed. Delay-based estimator + AIMD + loss controller + pacer are
-implemented and unit-tested against synthetic feedback. PeerConnection wiring and send-time
-correlation are deferred to follow-up PRs (they depend on outbound packets being stamped with
-transport-cc sequence numbers, which lands separately).
+Status: landed. The delay-based estimator, AIMD, loss controller, pacer, transport-cc stamping on
+media, RTX and FEC repair packets, and the PeerConnection feedback/send wiring are implemented and
+unit-tested. The encoder-facing target and the adaptive FEC overhead are exposed on
+`PeerConnection`; see [Repair traffic and FEC](#repair-traffic-and-fec-ewi-1386).
 
 ## Goal
 
@@ -96,19 +96,99 @@ unbounded burst. Callers ask `TryConsume(bytes)` before sending and reschedule a
 `TimeUntilNextSend(bytes)` when refused. `SetTargetBitrate` retargets it from the controller's change
 event.
 
-## PeerConnection wiring (deferred — PR2/PR3)
+## PeerConnection wiring (landed)
 
-- **Feedback in** (PR2): in `PeerConnection.Media.cs` `DispatchRtcp`, route
-  `case RtcpTransportCcFeedback` → `OnTransportFeedback`, RR loss (from `IngestReportBlocks`) →
-  `OnReportedLoss`, and add a `case RtcpReceiverEstimatedMaxBitrate` (not currently dispatched) →
-  `OnReceiverEstimatedMaxBitrate`. Expose the controller as a `PeerConnection` property so callers can
-  subscribe to `TargetBitrateChanged`.
-- **Sends out** (PR3): once outbound packets are stamped with transport-cc sequence numbers, call
-  `OnPacketSent(seq, sendTimeMicros, size)` from the send path (`TrackSender.SendFrame`) and gate the
-  send loop through `PacketPacer`.
+- **Feedback in**: in `PeerConnection.Media.cs` `DispatchRtcp`, `RtcpTransportCcFeedback` routes to
+  `OnTransportFeedback`, RR loss (from `IngestReportBlocks`) to `OnReportedLoss`, and
+  `RtcpReceiverEstimatedMaxBitrate` to `OnReceiverEstimatedMaxBitrate`. The controller is exposed as
+  `PeerConnection.CongestionController`, and `TargetBitrateChanged` is forwarded to callers.
+- **Sends out**: outbound packets are stamped with transport-wide sequence numbers and
+  `OnPacketSent(seq, sendTimeMicros, size)` is called from the send path (`TrackSender.EmitPacket`,
+  `TrackSender.Retransmit` and `FecEmitter.EmitPending`); the send loop is gated through
+  `PacketPacer`.
 
-These are split out because they depend on a per-sequence send-time table for outbound packets, which
-lands separately; the estimator and its tests do not block on it.
+The per-sequence send-time table is `SendTimeHistory`; the estimator and its tests no longer wait on
+it.
+
+## Repair traffic and FEC (EWI-1386)
+
+### One transport-wide sequence space
+
+Every outbound RTP packet — media, RFC 4588 RTX repairs and RFC 5109/8627 FEC repair packets —
+shares the connection's single transport-wide sequence space. All three paths draw from
+`NextTransportWideSequenceNumber`, stamp the transport-cc header extension, and record the packet
+through `OnPacketSent` before it reaches the wire. The delay-based estimator's send history, the
+acknowledged-throughput figure and the pacer therefore account for repair traffic too.
+
+Before this change FEC repairs were invisible to congestion control: the target was derived from
+media plus RTX only, while the wire carried up to ~10% more (one repair per ten media packets). The
+estimator now sees the true send rate, including the repairs it caused.
+
+### Encoder budget
+
+`TargetBitrateBitsPerSecond` on the controller is the **whole-transport** target: media plus RTX plus
+FEC. The consumer of the budget is the application's encoder. For a protection group of `N` media
+packets, the nominal repair share is `1 / (N + 1)` of all sent packets, so the budget an encoder
+should be tuned to is
+
+```
+PeerConnection.MediaTargetBitrateBitsPerSecond = target × (1 − 1/(N+1))
+```
+
+`PeerConnection.VideoFecGroupSize` and `VideoFecOverheadFraction` expose the current `N` and its
+overhead; `PeerConnection.FecProtectionChanged` fires on the RTCP receive loop whenever `N` moves, so
+an encoder can retune. There is no bandwidth allocator in Keryx — these properties are the seam.
+
+### Adaptive group size
+
+`FecProtectionOptions` sets the bounds and defaults (`InitialGroupSize` 10, `MinGroupSize` 3,
+`MaxGroupSize` 15, `RelaxAfterReports` 5, adaptive on by default). `FecProtectionController` maps a
+smoothed loss fraction onto a group size:
+
+| smoothed loss | group size |
+| --- | --- |
+| `< 1%` | `MaxGroupSize` (default 15) |
+| `< 3%` | 10 |
+| `< 6%` | 6 |
+| `< 10%` | 4 |
+| `>= 10%` | 3 |
+
+The tier result is clamped to `[MinGroupSize, MaxGroupSize]`. The loss sample is exponentially
+smoothed with a fast attack (`α = 0.5` when the sample is above the estimate) and a slow decay
+(`α = 0.125`), so a burst is reflected at once but a single lucky report does not declare the path
+calm.
+
+Tightening is immediate: a smaller target than the current group is applied on the report that shows
+it, because unprotected loss is already visible. Relaxing is deliberately slow and stepwise: the
+sample must sit a fifth below a threshold (`Tier(loss × 1.25)` must exceed the current size) before
+calm is counted, and `RelaxAfterReports` consecutive calm reports buy exactly one step up the ladder
+`{3, 4, 6, 10, MaxGroupSize}`. That hysteresis stops a path hovering at a threshold from flapping and
+keeps the overhead an encoder reads stable. The controller counts reports, not time, so it is fully
+deterministic.
+
+The input is the reception report for the **media SSRC** (`OutboundStreamQuality.FractionLost`). Its
+loss is the pre-recovery loss of exactly the packets FEC protects. Transport-cc loss is the wrong
+signal: it is transport-wide and mixes in audio, RTX repairs and the repair packets themselves.
+
+The controller runs on the RTCP receive loop and is not thread-safe. It publishes the new group size
+to the send path with a volatile write; the send path reads it per media packet, and a group that
+already holds at least the new size is closed by the very next media packet.
+
+### MTU
+
+A repair packet is the media packet plus the FEC header (and, for ULPFEC, the RED primary-block byte)
+plus the repair's own transport-cc extension. The media payload budget reserves exactly that much
+(`FecEmitter.MediaPayloadReserve`), so a repair never exceeds the datagram budget even when the media
+payload was filled to its maximum. The RTX two-byte reserve applies independently, so both reserves
+are subtracted when FEC and RTX are on together.
+
+### Interaction with the loss-based controller
+
+Above 10% loss the loss-based controller cuts the transport target while FEC is at its most
+protective (group 3, one repair per three media packets, 25% of all packets). The encoder budget
+shrinks on both counts — the target falls and the FEC share rises. That is intended: the two
+mechanisms address different timescales (FEC repairs isolated loss without a round trip; GCC avoids
+persistent congestion), and the floor is `MinGroupSize`, so FEC never escalates without bound.
 
 ## Per-subscriber use in the SFU
 
