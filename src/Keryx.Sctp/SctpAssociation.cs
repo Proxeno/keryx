@@ -863,6 +863,17 @@ public sealed class SctpAssociation : IDisposable
 
     private void Establish()
     {
+        // Simultaneous open (RFC 9260 §5.2.1): both sides send INIT. This side can finish through the
+        // peer's COOKIE ECHO while its own INIT handshake timer is still armed with a pending COOKIE
+        // ECHO for its own handshake. Clearing that state here is required — otherwise the timer keeps
+        // re-sending the stale COOKIE ECHO and, after MaxRetransmitAttempts, fails a perfectly healthy
+        // association with "SCTP handshake timed out", killing its data channels several seconds into
+        // the call. It also covers the ordinary CookieAck path, where these are already cleared.
+        _pendingInit = null;
+        _pendingCookieEcho = null;
+        _initExpiry = 0;
+        _initAttempts = 0;
+
         _state = SctpAssociationState.Established;
         _congestionWindow = InitialCongestionWindow;
         _slowStartThreshold = Math.Max(_peerReceiveWindow, InitialCongestionWindow);
