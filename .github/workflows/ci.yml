@@ -11,10 +11,11 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      # The TURN interop tests drive a real coturn on 127.0.0.1 - UDP on 7995-7999, and TCP + TLS
-      # on 7960-7965. KERYX_REQUIRE_COTURN=1 below turns a missing or unstartable coturn into a
-      # failure instead of the graceful skip local dev gets, so this coverage cannot silently go
-      # missing.
+      # The TURN interop tests drive a real coturn on 127.0.0.1 - UDP on 7700-7704, and TCP + TLS
+      # on 7710-7715, both outside the 7800-7999 range the integration tests bind at random in a
+      # parallel test process. KERYX_REQUIRE_COTURN=1 below turns a missing or unstartable coturn
+      # into a failure instead of the graceful skip local dev gets, so this coverage cannot
+      # silently go missing.
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=TurnRelayInterop&Category!=Soak"

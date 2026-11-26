@@ -10,17 +10,21 @@ using Xunit.Abstractions;
 namespace Keryx.Turn.Tests;
 
 /// <summary>The ports one coturn instance uses. TlsPort null = started with no-tls.</summary>
+/// <remarks>
+/// Both layouts sit outside 7800-7999 on purpose. Keryx.IntegrationTests binds a UDP socket on a
+/// random port in 7900-7999 for every peer connection (its pion peer uses 7800-7899), and
+/// <c>dotnet test Keryx.slnx</c> runs that assembly in parallel with this one. A coturn layout inside
+/// that range - the UDP cases used to be on 7995-7999 - loses the port check to a passing test's
+/// socket every so often, which was a silent skip and is a failure under
+/// <c>KERYX_REQUIRE_COTURN=1</c>.
+/// </remarks>
 internal sealed record CoturnLayout(int ListeningPort, int? TlsPort, int MinRelayPort, int MaxRelayPort)
 {
-    /// <summary>UDP cases: exactly today's layout and config (no-tls).</summary>
-    public static CoturnLayout Udp { get; } = new(7995, null, 7996, 7999);
+    /// <summary>UDP cases: started with no-tls.</summary>
+    public static CoturnLayout Udp { get; } = new(7700, null, 7701, 7704);
 
-    /// <summary>
-    /// TCP/TLS cases: distinct from 7995-7999 (UDP cases) and from 7970-7990
-    /// (<c>Keryx.IntegrationTests TurnRelayInteropTests</c>, which may run in parallel in another
-    /// test process).
-    /// </summary>
-    public static CoturnLayout Stream { get; } = new(7960, 7961, 7962, 7965);
+    /// <summary>TCP/TLS cases: plain TCP (and UDP) on the listening port, TLS on its own port.</summary>
+    public static CoturnLayout Stream { get; } = new(7710, 7711, 7712, 7715);
 }
 
 /// <summary>
