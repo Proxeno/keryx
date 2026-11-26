@@ -11,12 +11,15 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      # The TURN interop tests drive a real coturn on 127.0.0.1:7995-7999. They skip with a
-      # printed reason when the binary is missing, so this step is what turns them into real
-      # coverage rather than a no-op.
+      # The TURN interop tests drive a real coturn on 127.0.0.1 - UDP on 7995-7999, and TCP + TLS
+      # on 7960-7965. KERYX_REQUIRE_COTURN=1 below turns a missing or unstartable coturn into a
+      # failure instead of the graceful skip local dev gets, so this coverage cannot silently go
+      # missing.
       - run: sudo apt-get update && sudo apt-get install -y coturn
       - run: dotnet build Keryx.slnx --configuration Release
       - run: dotnet test Keryx.slnx --configuration Release --no-build --filter "Category!=ChromeInterop&Category!=FirefoxInterop&Category!=PionInterop&Category!=TurnRelayInterop&Category!=Soak"
+        env:
+          KERYX_REQUIRE_COTURN: "1"
 
   # Browser interop, CI-enforced. This job installs a headless Chrome, so the ChromeInterop tests
   # (excluded from build-test above) MUST actually run here. KERYX_REQUIRE_CHROME=1 turns a missing
