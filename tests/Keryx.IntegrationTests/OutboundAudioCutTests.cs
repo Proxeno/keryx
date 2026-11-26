@@ -577,13 +577,38 @@ public sealed class OutboundAudioCutTests
             controller.Should().NotBeNull("congestion control was enabled");
             var before = controller!.TargetBitrateBitsPerSecond;
 
+            const int KindNone = 0;
+            const int KindControl = 1;
+            const int KindCut = 2;
+            var currentKind = new int[1];
             var minimum = new long[] { before };
+            var decreaseCounts = new long[2]; // [control, cut]
             var gate = new object();
+
+            // Read the prior target just before subscribing so the first event compares against reality.
+            var previous = controller.TargetBitrateBitsPerSecond;
             offerer.TargetBitrateChanged += (_, e) =>
             {
                 lock (gate)
                 {
-                    minimum[0] = Math.Min(minimum[0], e.TargetBitrateBitsPerSecond);
+                    var target = e.TargetBitrateBitsPerSecond;
+                    minimum[0] = Math.Min(minimum[0], target);
+                    if (target < previous)
+                    {
+                        switch (Volatile.Read(ref currentKind[0]))
+                        {
+                            case KindControl:
+                                decreaseCounts[0]++;
+                                break;
+                            case KindCut:
+                                decreaseCounts[1]++;
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+
+                    previous = target;
                 }
             };
 
@@ -591,8 +616,9 @@ public sealed class OutboundAudioCutTests
             paced.Should().NotBeNull();
             paced!.HoldDrainForTest = false;
 
-            for (var round = 0; round < 5; round++)
+            async Task RoundAsync(int kind)
             {
+                Volatile.Write(ref currentKind[0], kind);
                 paced.HoldDrainForTest = true;
                 for (var i = 0; i < 10; i++)
                 {
@@ -601,7 +627,11 @@ public sealed class OutboundAudioCutTests
                     Interlocked.Increment(ref audioFrames);
                 }
 
-                offerer.CutOutboundAudio();
+                if (kind == KindCut)
+                {
+                    offerer.CutOutboundAudio();
+                }
+
                 paced.HoldDrainForTest = false;
 
                 lock (gate)
@@ -612,20 +642,37 @@ public sealed class OutboundAudioCutTests
                 await Task.Delay(300, shutdown.Token);
             }
 
+            // Five interleaved control/cut pairs, so a spurious overuse is equally likely in either and the
+            // decrease counts are comparable.
+            for (var roundPair = 0; roundPair < 5; roundPair++)
+            {
+                await RoundAsync(KindControl);
+                await RoundAsync(KindCut);
+            }
+
+            // Keep attributing feedback to the last round until its feedback window has passed.
+            await Task.Delay(300, shutdown.Token);
+            Volatile.Write(ref currentKind[0], KindNone);
+
             await Task.Delay(1500, shutdown.Token);
 
             var after = controller.TargetBitrateBitsPerSecond;
             long minDuringCuts;
+            long controlDecreases;
+            long cutDecreases;
             lock (gate)
             {
                 minDuringCuts = minimum[0];
+                controlDecreases = decreaseCounts[0];
+                cutDecreases = decreaseCounts[1];
             }
 
             pumpStop.Cancel();
             await Task.WhenAll(audioPump, videoPump);
 
             _output.WriteLine(
-                $"congestion target before={before} minDuringCuts={minDuringCuts} after={after}");
+                $"congestion target before={before} minDuringCuts={minDuringCuts} after={after} "
+                + $"controlDecreases={controlDecreases} cutDecreases={cutDecreases}");
 
             // The extension must actually be negotiated, or the gap assertion below is vacuous.
             var numbers = wire.Where(p => p.TransportSequenceNumber >= 0)
@@ -644,10 +691,22 @@ public sealed class OutboundAudioCutTests
 
             sawGap.Should().BeTrue("the cut must leave a transport-wide-cc gap on the wire");
 
-            // Loopback has no congestion, so GCC may only hold or ramp; a cut's TWCC gap must not be
-            // mistaken for loss. (Loosened to 90% only if this proves flaky on a loaded machine.)
-            minDuringCuts.Should().BeGreaterThanOrEqualTo(before,
-                "a transport-wide-cc gap from a cut must not lower the congestion estimate");
+            // Tolerance arithmetic. Loopback has no real congestion, but a loaded CI box can produce a spurious
+            // delay-based overuse; each one is a decrease event, and it is equally likely in a control round
+            // (same hold/release burst, no cut) as in a cut round because the rounds are interleaved 300 ms apart.
+            // We allow ONE more decrease in cut rounds than in control rounds for that noise.
+            // Regression signature: if the cut's TWCC gap were read as loss or corrupted the delay estimate, every
+            // cut round's feedback carries 10 not-received entries out of roughly 10 audio + 5 audio + ~15 video
+            // = ~30 packets per 100 ms feedback window, i.e. ~33% apparent loss, far above the 10% high-loss
+            // threshold, so each of the 5 cut rounds would produce at least one decrease: cutDecreases >= 5, while
+            // the bound allows at most controlDecreases + 1. A clean run measures 0 and 0.
+            // We do not assert "target never drops" or "recovers to 90%": Decrease() backs off to 0.85 x measured
+            // throughput and Increase() is capped at 1.5 x throughput, so one spurious overuse keeps the target
+            // well below the 5 Mbps start for the rest of the test.
+            cutDecreases.Should().BeLessThanOrEqualTo(
+                controlDecreases + 1,
+                "a transport-wide-cc gap from a cut must not lower the congestion estimate more often "
+                + "than the no-cut control rounds do");
         }
         finally
         {

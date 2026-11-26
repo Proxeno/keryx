@@ -20,8 +20,13 @@ namespace Keryx.IntegrationTests;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The measured stop is reported in three parts. (a) The server cut to the last wire packet is what
-/// Keryx controls: <c>cutToLastOldWireMs</c>. (b) The jitter-buffer residue is real buffered packets:
+/// The measured stop is reported in three parts. (a) The wire side is what Keryx controls:
+/// <c>lastOldRelativeToCutMs</c> is the signed time from the start of the cut call to the last
+/// old-generation packet on the wire (negative when the pacer hold got it out before the cut began),
+/// and <c>oldPacketsDuringCut</c>/<c>oldPacketsAfterCut</c> count how many old packets crossed the cut
+/// window and how many escaped after the cut returned. The wire timestamp is taken in
+/// <c>SendProtectedRtp</c> just before SRTP protection and the socket send, so it is the last point
+/// Keryx can observe. (b) The jitter-buffer residue is real buffered packets:
 /// <c>jitterResidueLifetimeMs</c>/<c>jitterResidueRecentMs</c>, and the samples those packets actually
 /// play after the cut are <c>realPlayoutAfterCutMs</c>. The rest of the audible tail is a PLC tail:
 /// audio Chrome NetEq synthesises (concealment/expand) after the buffer runs dry. That is stale audio,
@@ -253,8 +258,11 @@ public sealed class ChromeBargeInInteropTests
             firstNew.Should().NotBeNull("the new generation must have reached the wire");
 
             var lastOldWire = lastOld[^1];
-            var cutToLastOldWireMs = Math.Max(
-                0, (lastOldWire.Ticks - cutStart) * 1000.0 / Stopwatch.Frequency);
+            var lastOldRelativeToCutMs = (lastOldWire.Ticks - cutStart) * 1000.0 / Stopwatch.Frequency;
+            var oldPacketsDuringCut = records.Count(
+                r => r.Generation == 0 && r.Ticks >= cutStart && r.Ticks <= cutEnd);
+            var oldPacketsAfterCut = records.Count(r => r.Generation == 0 && r.Ticks > cutEnd);
+            var timerResolutionNs = 1e9 / Stopwatch.Frequency;
             var cutCallUs = (cutEnd - cutStart) * 1_000_000.0 / Stopwatch.Frequency;
 
             var lifetimeMs = ReadNullableDouble(root, "jb", "lifetimeMs");
@@ -291,7 +299,10 @@ public sealed class ChromeBargeInInteropTests
             var measurement =
                 MeasurementPrefix
                 + $"cutCallUs={cutCallUs.ToString("F0", CultureInfo.InvariantCulture)}"
-                + $" cutToLastOldWireMs={cutToLastOldWireMs.ToString("F1", CultureInfo.InvariantCulture)}"
+                + $" lastOldRelativeToCutMs={lastOldRelativeToCutMs.ToString("F2", CultureInfo.InvariantCulture)}"
+                + $" oldPacketsDuringCut={oldPacketsDuringCut.ToString(CultureInfo.InvariantCulture)}"
+                + $" oldPacketsAfterCut={oldPacketsAfterCut.ToString(CultureInfo.InvariantCulture)}"
+                + $" timerResolutionNs={timerResolutionNs.ToString("F1", CultureInfo.InvariantCulture)}"
                 + $" discardedPackets={cut.PacketsDiscarded.ToString(CultureInfo.InvariantCulture)}"
                 + $" discardedSamples={cut.SamplesDiscarded.ToString(CultureInfo.InvariantCulture)}"
                 + $" jitterResidueLifetimeMs={Format(lifetimeMs)}"
@@ -310,7 +321,8 @@ public sealed class ChromeBargeInInteropTests
             Console.WriteLine(measurement);
 
             firstNewEpoch.Should().NotBeNull("the new generation must be audible at the browser");
-            cutToLastOldWireMs.Should().BeLessThan(50, "a cut must stop old packets reaching the wire almost at once");
+            oldPacketsAfterCut.Should().Be(
+                0, "no old-generation packet may reach the wire after CutOutboundAudio returns");
             oldAfterNew.Should().BeFalse("stale audio must never be counted after the new generation starts");
 
             firstNew!.Value.Marker.Should().BeTrue("the first packet of the new generation marks a talkspurt");
