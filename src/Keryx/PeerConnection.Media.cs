@@ -166,11 +166,10 @@ public sealed partial class PeerConnection
     // CreateTrackSenders once the transport is up; only mutated from there and CloseAsync.
     private PacedRtpSender? _pacedSender;
 
-    // Scratch state for the barge-in outbound-audio cut (CutOutboundOnSender). Both lists are reused
-    // across cuts so a cut on the send path allocates nothing, and both are touched only under _sendLock
-    // (the cut holds it for the whole removal/retraction/renumber sequence).
+    // Scratch state for the barge-in outbound-audio cut (CutOutboundOnSender). Reused across cuts so a
+    // cut on the send path allocates nothing, and touched only under _sendLock (the cut holds it for the
+    // whole removal/retraction sequence).
     private readonly List<PacedRtpSender.RemovedPacket> _cutScratch = [];
-    private readonly List<(ushort NewSeq, int Length)> _cutRenumbered = [];
 
     private long _videoFramesDropped;
     private long _audioFramesDropped;
@@ -274,34 +273,20 @@ public sealed partial class PeerConnection
         // Lock order is _drainLock → _sendLock → _gate. RunWithDrainsExcluded takes _drainLock, this
         // body takes _sendLock, and RemoveQueued takes _gate internally, so no other drain can be part
         // way through a send while the queue is rebuilt.
+        //
+        // The discarded packets already drew transport-wide sequence numbers at enqueue time, so the cut
+        // deliberately leaves a gap in that space rather than rewriting other tracks' queued packets.
+        // That is harmless to our GCC: DelayBasedBandwidthEstimator.ProcessFeedback skips not-received
+        // entries (and send-history misses), while loss comes from the RTCP receiver-report fraction,
+        // which is per media SSRC — and that media sequence space is rewound, so the fraction stays clean.
         OutboundCutResult result = default;
         paced.RunWithDrainsExcluded(() =>
         {
             lock (_sendLock)
             {
                 _cutScratch.Clear();
-                _cutRenumbered.Clear();
-                paced.RemoveQueued(
-                    track.Stream.Ssrc,
-                    _sendTransportCcExtensionId,
-                    _cutScratch,
-                    _cutRenumbered,
-                    out var nextTransportSequenceNumber);
+                paced.RemoveQueued(track.Stream.Ssrc, _cutScratch);
                 result = track.Cut(_cutScratch);
-
-                // The discarded packets' transport-wide sequence numbers are freed; rewind the shared
-                // allocator so the next packet reuses the first one, keeping TWCC gap-free on the wire.
-                if (nextTransportSequenceNumber is { } next)
-                {
-                    _transportWideSequenceNumber = next;
-                }
-
-                // The still-queued packets that followed the cut were renumbered in place; move the
-                // congestion controller's send-time history onto those numbers.
-                for (var i = 0; i < _cutRenumbered.Count; i++)
-                {
-                    OnTransportRtpSent(_cutRenumbered[i].NewSeq, _cutRenumbered[i].Length);
-                }
             }
         });
         return result;
@@ -2662,14 +2647,17 @@ public sealed partial class PeerConnection
 
     /// <summary>
     /// Locates the two-byte transport-wide-cc sequence-number value inside an RFC 8285 one-byte-header
-    /// extension, returning the offset of the first value octet so the caller can rewrite it in place.
+    /// extension, returning the offset of the first value octet.
     /// </summary>
     /// <param name="rtp">The complete plaintext RTP packet.</param>
     /// <param name="extensionId">The negotiated transport-wide-cc extmap id.</param>
     /// <param name="valueOffset">On success, the byte offset of the element's first value octet.</param>
     /// <returns>True when a two-byte element with that id was found; false on anything absent or malformed.</returns>
-    /// <remarks>Used by the barge-in cut to renumber queued transport-wide sequence numbers after freeing
-    /// a span of them, so the extension stays gap-free on the wire.</remarks>
+    /// <remarks>
+    /// Exposed to the test assembly only. The barge-in cut does not rewrite transport-wide sequence
+    /// numbers — it leaves a harmless gap — so this is used solely by tests to read (and prove the
+    /// discontinuity of) the extension on the wire.
+    /// </remarks>
     internal static bool TryLocateTransportCc(Span<byte> rtp, byte extensionId, out int valueOffset)
     {
         valueOffset = 0;
@@ -3498,13 +3486,11 @@ public sealed partial class PeerConnection
         /// <param name="Timestamp">The RTP timestamp the packet carried.</param>
         /// <param name="PayloadLength">The RTP payload length in bytes.</param>
         /// <param name="PayloadSamples">The packet's duration in 48 kHz samples, read from its Opus TOC byte.</param>
-        /// <param name="TransportSequenceNumber">The stamped transport-wide sequence number, or -1 when absent.</param>
         internal readonly record struct RemovedPacket(
             ushort SequenceNumber,
             uint Timestamp,
             int PayloadLength,
-            long PayloadSamples,
-            int TransportSequenceNumber = -1);
+            long PayloadSamples);
 
         /// <summary>
         /// True while a test wants the drain held off; the drain re-arms and dequeues nothing. Test-only.
@@ -3530,44 +3516,21 @@ public sealed partial class PeerConnection
         }
 
         /// <summary>
-        /// Drops every queued packet for <paramref name="ssrc"/> and renumbers the transport-wide
-        /// sequence numbers of the packets that followed them, so the shared TWCC space stays gap-free.
+        /// Drops every queued packet for <paramref name="ssrc"/>, leaving the other streams' queued packets
+        /// untouched and in order.
         /// </summary>
         /// <param name="ssrc">The stream whose queued packets are discarded.</param>
-        /// <param name="transportCcExtensionId">
-        /// The negotiated transport-wide-cc extmap id, or null when the extension is not negotiated.
-        /// </param>
         /// <param name="removed">Receives the removed packets, in queue order. The caller clears it.</param>
-        /// <param name="renumbered">
-        /// Receives the still-queued packets whose TWCC value was rewritten, with their new number and
-        /// plaintext length, so the caller can move the congestion controller's send-time history.
-        /// The caller clears it.
-        /// </param>
-        /// <param name="nextTransportSequenceNumber">
-        /// The next free transport-wide sequence number, or null when nothing was renumbered.
-        /// </param>
         /// <returns>The number of packets removed.</returns>
         /// <remarks>
-        /// <para>
         /// The live queue is rebuilt into a reusable spare and the two are swapped, so a cut on the send
-        /// path allocates nothing. The caller holds <c>_sendLock</c>, so no new transport-wide sequence
-        /// number can be drawn while the space is being rewound.
-        /// </para>
-        /// <para>
-        /// Known caveat: a video packet queued at the cut instant may already have had its FEC parity
-        /// computed over its TWCC bytes. Rewriting those bytes here means an FEC-recovered copy of that
-        /// packet comes out with the old TWCC value; its payload is unaffected. This is rare and only
-        /// touches the congestion-feedback extension.
-        /// </para>
+        /// path allocates nothing. The caller holds <c>_sendLock</c>. The discarded packets' transport-wide
+        /// sequence numbers are left as a gap on purpose: rewriting other tracks' queued packets would
+        /// violate their isolation (and corrupt FEC-protected ones), and GCC tolerates the gap because it
+        /// skips not-received entries and takes loss from the per-media-SSRC receiver report instead.
         /// </remarks>
-        internal int RemoveQueued(
-            uint ssrc,
-            byte? transportCcExtensionId,
-            List<RemovedPacket> removed,
-            List<(ushort NewSeq, int Length)> renumbered,
-            out ushort? nextTransportSequenceNumber)
+        internal int RemoveQueued(uint ssrc, List<RemovedPacket> removed)
         {
-            nextTransportSequenceNumber = null;
             lock (_gate)
             {
                 var kept = _spareQueue;
@@ -3577,7 +3540,7 @@ public sealed partial class PeerConnection
                     var queued = _queue.Dequeue();
                     if (ReadSsrc(queued.Buffer, queued.Length) == ssrc)
                     {
-                        removed.Add(CreateRemoved(queued.Buffer, queued.Length, transportCcExtensionId));
+                        removed.Add(CreateRemoved(queued.Buffer, queued.Length));
                         ArrayPool<byte>.Shared.Return(queued.Buffer);
                     }
                     else
@@ -3591,68 +3554,14 @@ public sealed partial class PeerConnection
                 _queue = kept;
                 _spareQueue = drained;
 
-                if (transportCcExtensionId is { } extensionId)
-                {
-                    nextTransportSequenceNumber = RenumberTransportCc(extensionId, removed, renumbered);
-                }
-
                 return removed.Count;
             }
-        }
-
-        /// <summary>
-        /// Rewinds the transport-wide sequence numbers of the packets still queued after the first removed
-        /// one. Packets queued before it hold smaller numbers and are left alone. Returns the next free
-        /// number, or null when the removed packets carried no TWCC stamp.
-        /// </summary>
-        private ushort? RenumberTransportCc(
-            byte extensionId,
-            List<RemovedPacket> removed,
-            List<(ushort NewSeq, int Length)> renumbered)
-        {
-            var baseTransport = -1;
-            for (var i = 0; i < removed.Count; i++)
-            {
-                if (removed[i].TransportSequenceNumber >= 0)
-                {
-                    baseTransport = removed[i].TransportSequenceNumber;
-                    break;
-                }
-            }
-
-            if (baseTransport < 0)
-            {
-                return null;
-            }
-
-            var baseSequence = (ushort)baseTransport;
-            var k = 0;
-            foreach (var queued in _queue)
-            {
-                if (!PeerConnection.TryLocateTransportCc(queued.Buffer.AsSpan(0, queued.Length), extensionId, out var offset))
-                {
-                    continue;
-                }
-
-                var current = BinaryPrimitives.ReadUInt16BigEndian(queued.Buffer.AsSpan(offset, 2));
-                if (unchecked((short)(current - baseSequence)) <= 0)
-                {
-                    continue;
-                }
-
-                var newSequence = unchecked((ushort)(baseSequence + k));
-                BinaryPrimitives.WriteUInt16BigEndian(queued.Buffer.AsSpan(offset, 2), newSequence);
-                renumbered.Add((newSequence, queued.Length));
-                k++;
-            }
-
-            return unchecked((ushort)(baseSequence + k));
         }
 
         private static uint ReadSsrc(byte[] buffer, int length) =>
             length >= RtpHeader.FixedLength ? BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(8, 4)) : 0;
 
-        private static RemovedPacket CreateRemoved(byte[] buffer, int length, byte? transportCcExtensionId)
+        private static RemovedPacket CreateRemoved(byte[] buffer, int length)
         {
             ushort sequenceNumber;
             uint timestamp;
@@ -3676,14 +3585,7 @@ public sealed partial class PeerConnection
                 samples = 0;
             }
 
-            var transportSequenceNumber = -1;
-            if (transportCcExtensionId is { } extensionId
-                && PeerConnection.TryLocateTransportCc(buffer.AsSpan(0, length), extensionId, out var offset))
-            {
-                transportSequenceNumber = BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(offset, 2));
-            }
-
-            return new RemovedPacket(sequenceNumber, timestamp, payloadLength, samples, transportSequenceNumber);
+            return new RemovedPacket(sequenceNumber, timestamp, payloadLength, samples);
         }
 
         /// <summary>Copies one plaintext RTP packet into the queue and wakes the drain. Called under _sendLock.</summary>

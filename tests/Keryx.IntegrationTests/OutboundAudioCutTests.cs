@@ -9,21 +9,27 @@ using Keryx.Rtp.Packetization;
 using Keryx.Sctp;
 using Keryx.Sdp;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Keryx.IntegrationTests;
 
 /// <summary>
-/// Barge-in outbound-audio cut coverage: the pacer's per-SSRC removal and transport-cc renumbering, the
-/// wire-level sequence/timestamp guarantees across a cut, the retransmission-history purge, and a
-/// concurrent loopback soak proving cuts never deadlock, stall other tracks, or break contiguity.
+/// Barge-in outbound-audio cut coverage: the pacer's per-SSRC removal, the wire-level sequence/timestamp
+/// guarantees across a cut, the retransmission-history purge, the transport-wide-cc gap's effect on the
+/// congestion estimate, and a concurrent loopback soak proving cuts never deadlock or stall other tracks.
 /// </summary>
 public sealed class OutboundAudioCutTests
 {
     private const int AudioSampleIncrement = 960; // 20 ms of Opus at 48 kHz
-    private const int TransportCcBodyLength = 4;
 
     // Keryx offers transport-wide congestion control at extmap 3; a Keryx-to-Keryx answer echoes it.
     private const byte TransportCcExtensionId = 3;
+
+    private readonly ITestOutputHelper _output;
+
+    /// <summary>Captures the xunit output sink for the congestion-measurement test.</summary>
+    /// <param name="output">Where the before/min/after numbers land.</param>
+    public OutboundAudioCutTests(ITestOutputHelper output) => _output = output;
 
     // ---------------------------------------------------------------- part 1: pacer unit tests
 
@@ -57,18 +63,12 @@ public sealed class OutboundAudioCutTests
         sender.Enqueue(OpusPacket(a));
 
         var removed = new List<PeerConnection.PacedRtpSender.RemovedPacket>();
-        var renumbered = new List<(ushort NewSeq, int Length)>();
         var count = 0;
-        sender.RunWithDrainsExcluded(() =>
-        {
-            count = sender.RemoveQueued(aSsrc, null, removed, renumbered, out var next);
-            next.Should().BeNull("no transport-wide sequence numbers were stamped");
-        });
+        sender.RunWithDrainsExcluded(() => count = sender.RemoveQueued(aSsrc, removed));
 
         count.Should().Be(5);
         removed.Select(r => r.SequenceNumber).Should().Equal(new ushort[] { 1, 2, 3, 4, 5 });
         removed.Should().OnlyContain(r => r.PayloadSamples == AudioSampleIncrement);
-        renumbered.Should().BeEmpty();
 
         // Nothing drained yet: only B survives, in its original order.
         sent.Should().BeEmpty();
@@ -90,67 +90,10 @@ public sealed class OutboundAudioCutTests
         using var sender = new PeerConnection.PacedRtpSender(pacer, time, srtpOverhead: 0, (_, _) => { }, NullLogger.Instance);
 
         var removed = new List<PeerConnection.PacedRtpSender.RemovedPacket>();
-        var renumbered = new List<(ushort NewSeq, int Length)>();
-        var count = sender.RemoveQueued(0x1234, null, removed, renumbered, out var next);
+        var count = sender.RemoveQueued(0x1234, removed);
 
         count.Should().Be(0);
         removed.Should().BeEmpty();
-        next.Should().BeNull();
-    }
-
-    [Fact]
-    public void RemoveQueuedRenumbersLaterTransportCcSeqsContiguously()
-    {
-        var time = new FakeTimerTimeProvider();
-        var pacer = new PacketPacer(100_000_000, time);
-        var sent = new ConcurrentQueue<(uint Ssrc, ushort SequenceNumber, int TransportSequenceNumber)>();
-        using var sender = new PeerConnection.PacedRtpSender(pacer, time, srtpOverhead: 0, Capture, NullLogger.Instance);
-
-        void Capture(byte[] buffer, int length)
-        {
-            RtpPacket.TryParse(buffer.AsSpan(0, length), out var packet).Should().BeTrue();
-            var twcc = PeerConnection.TryLocateTransportCc(buffer.AsSpan(0, length), TransportCcExtensionId, out var offset)
-                ? BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(offset, 2))
-                : -1;
-            sent.Enqueue((packet.Header.Ssrc, packet.Header.SequenceNumber, twcc));
-        }
-
-        var aSsrc = 0xAAAA_AAA1u;
-        var bSsrc = 0xBBBB_BBB2u;
-        var a = new RtpStreamSender(aSsrc, 111, 48_000, initialSequenceNumber: 1, initialTimestamp: 0);
-        var b = new RtpStreamSender(bSsrc, 111, 48_000, initialSequenceNumber: 100, initialTimestamp: 0);
-
-        // B99, A100, B101, A102, ... A108, B109. The first A carries the smallest TWCC of the removed set.
-        var queue = new List<(RtpStreamSender Stream, ushort Twcc)>
-        {
-            (b, 99), (a, 100), (b, 101), (a, 102), (b, 103),
-            (a, 104), (b, 105), (a, 106), (b, 107), (a, 108), (b, 109),
-        };
-        foreach (var (stream, twcc) in queue)
-        {
-            sender.Enqueue(OpusPacketWithTransportCc(stream, twcc));
-        }
-
-        var removed = new List<PeerConnection.PacedRtpSender.RemovedPacket>();
-        var renumbered = new List<(ushort NewSeq, int Length)>();
-        ushort? next;
-        var count = sender.RemoveQueued(aSsrc, TransportCcExtensionId, removed, renumbered, out next);
-
-        count.Should().Be(5, "five A packets were queued");
-        removed.Select(r => r.TransportSequenceNumber).Should().Equal(100, 102, 104, 106, 108);
-        next.Should().Be((ushort)105);
-        renumbered.Select(r => r.NewSeq).Should().Equal(new ushort[] { 100, 101, 102, 103, 104 });
-
-        time.Advance(TimeSpan.FromSeconds(1));
-        time.FireDueTimers();
-
-        sent.Should().Equal(
-            (bSsrc, (ushort)100, 99),
-            (bSsrc, (ushort)101, 100),
-            (bSsrc, (ushort)102, 101),
-            (bSsrc, (ushort)103, 102),
-            (bSsrc, (ushort)104, 103),
-            (bSsrc, (ushort)105, 104));
     }
 
     // ---------------------------------------------------------------- part 2: loopback
@@ -260,9 +203,6 @@ public sealed class OutboundAudioCutTests
         Math.Abs(actualGap - expectedGap).Should().BeLessThanOrEqualTo(40 * 48,
             "the new timestamp tracks the wall-clock time since the cut");
         cutEnd.Should().BeGreaterThanOrEqualTo(cutStart);
-
-        // Transport-wide sequence numbers stay gap-free across the cut, for every SSRC.
-        AssertTransportCcContiguous(wire);
     }
 
     [Fact]
@@ -546,18 +486,189 @@ public sealed class OutboundAudioCutTests
         wire.Count(p => p.Ssrc == videoSsrc).Should().BeGreaterThan(200, "video kept flowing during the cuts");
         Interlocked.Read(ref receivedMessages).Should().BeGreaterThanOrEqualTo(
             (long)(Interlocked.Read(ref messagesSent) * 0.9), "the data channel kept flowing during the cuts");
+    }
 
-        AssertTransportCcContiguous(wire);
+    [Fact]
+    public async Task CutTransportCcGapDoesNotDropTheCongestionEstimate()
+    {
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        // A start target well above what the pumps offer: the pacer then never builds a backlog, so the
+        // delay estimate reflects the path rather than pacing, and the target stays stable at the clamp.
+        var pair = await ConnectAsync(
+            congestionControl: true,
+            shutdown.Token,
+            new CongestionControllerOptions
+            {
+                StartBitrateBitsPerSecond = 5_000_000,
+                MinBitrateBitsPerSecond = 100_000,
+                MaxBitrateBitsPerSecond = 20_000_000,
+            });
+        await using var offerer = pair.Offerer;
+        await using var answerer = pair.Answerer;
+
+        var audioSsrc = offerer.GetLocalSsrc(MediaKind.Audio);
+        var wire = new ConcurrentQueue<WirePacket>();
+        offerer.RtpWireObserverForTest = (rtp, ticks) => Record(rtp, ticks, wire);
+
+        var accessUnits = H264TestStream.ReadAccessUnits(90);
+        long audioFrames = 0;
+        using var pumpStop = new CancellationTokenSource();
+
+        var audioPump = Task.Run(async () =>
+        {
+            var clock = Stopwatch.StartNew();
+            var next = TimeSpan.Zero;
+            try
+            {
+                while (!pumpStop.IsCancellationRequested)
+                {
+                    var frame = Interlocked.Read(ref audioFrames);
+                    offerer.SendAudioFrame(Tone(), unchecked((uint)(frame * AudioSampleIncrement)));
+                    Interlocked.Increment(ref audioFrames);
+                    next += TimeSpan.FromMilliseconds(20);
+                    var wait = next - clock.Elapsed;
+                    if (wait > TimeSpan.Zero)
+                    {
+                        await Task.Delay(wait, pumpStop.Token).ConfigureAwait(false);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // stopped at the end of the measurement
+            }
+        });
+
+        var videoPump = Task.Run(async () =>
+        {
+            var clock = Stopwatch.StartNew();
+            var index = 0;
+            var timestamp = 0u;
+            var next = TimeSpan.Zero;
+            try
+            {
+                while (!pumpStop.IsCancellationRequested)
+                {
+                    offerer.SendVideoFrame(accessUnits[index % accessUnits.Count], timestamp);
+                    index++;
+                    timestamp += 3000;
+                    next += TimeSpan.FromMilliseconds(33);
+                    var wait = next - clock.Elapsed;
+                    if (wait > TimeSpan.Zero)
+                    {
+                        await Task.Delay(wait, pumpStop.Token).ConfigureAwait(false);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // stopped at the end of the measurement
+            }
+        });
+
+        try
+        {
+            (await TestSupport.WaitForAsync(() => wire.Any(p => p.Ssrc == audioSsrc), 10_000))
+                .Should().BeTrue("audio should reach the wire through the pacer");
+
+            await Task.Delay(2000, shutdown.Token);
+
+            var controller = offerer.CongestionController;
+            controller.Should().NotBeNull("congestion control was enabled");
+            var before = controller!.TargetBitrateBitsPerSecond;
+
+            var minimum = new long[] { before };
+            var gate = new object();
+            offerer.TargetBitrateChanged += (_, e) =>
+            {
+                lock (gate)
+                {
+                    minimum[0] = Math.Min(minimum[0], e.TargetBitrateBitsPerSecond);
+                }
+            };
+
+            var paced = offerer.PacedSenderForTest;
+            paced.Should().NotBeNull();
+            paced!.HoldDrainForTest = false;
+
+            for (var round = 0; round < 5; round++)
+            {
+                paced.HoldDrainForTest = true;
+                for (var i = 0; i < 10; i++)
+                {
+                    var frame = Interlocked.Read(ref audioFrames);
+                    offerer.SendAudioFrame(Tone(), unchecked((uint)(frame * AudioSampleIncrement)));
+                    Interlocked.Increment(ref audioFrames);
+                }
+
+                offerer.CutOutboundAudio();
+                paced.HoldDrainForTest = false;
+
+                lock (gate)
+                {
+                    minimum[0] = Math.Min(minimum[0], controller.TargetBitrateBitsPerSecond);
+                }
+
+                await Task.Delay(300, shutdown.Token);
+            }
+
+            await Task.Delay(1500, shutdown.Token);
+
+            var after = controller.TargetBitrateBitsPerSecond;
+            long minDuringCuts;
+            lock (gate)
+            {
+                minDuringCuts = minimum[0];
+            }
+
+            pumpStop.Cancel();
+            await Task.WhenAll(audioPump, videoPump);
+
+            _output.WriteLine(
+                $"congestion target before={before} minDuringCuts={minDuringCuts} after={after}");
+
+            // The extension must actually be negotiated, or the gap assertion below is vacuous.
+            var numbers = wire.Where(p => p.TransportSequenceNumber >= 0)
+                .Select(p => (ushort)p.TransportSequenceNumber)
+                .ToArray();
+            numbers.Should().NotBeEmpty("transport-wide congestion control must be negotiated for this test");
+
+            // A cut discards packets that already drew transport-wide sequence numbers, leaving a real gap.
+            var sawGap = false;
+            for (var i = 1; i < numbers.Length; i++)
+            {
+                var delta = unchecked((int)(short)(numbers[i] - numbers[i - 1]));
+                delta.Should().BeGreaterThan(0, "transport-wide sequence numbers stay monotonic on the wire");
+                sawGap |= delta > 1;
+            }
+
+            sawGap.Should().BeTrue("the cut must leave a transport-wide-cc gap on the wire");
+
+            // Loopback has no congestion, so GCC may only hold or ramp; a cut's TWCC gap must not be
+            // mistaken for loss. (Loosened to 90% only if this proves flaky on a loaded machine.)
+            minDuringCuts.Should().BeGreaterThanOrEqualTo(before,
+                "a transport-wide-cc gap from a cut must not lower the congestion estimate");
+        }
+        finally
+        {
+            pumpStop.Cancel();
+            await Task.WhenAny(Task.WhenAll(audioPump, videoPump), Task.Delay(2000));
+        }
     }
 
     // ---------------------------------------------------------------- helpers
 
     private static async Task<(PeerConnection Offerer, PeerConnection Answerer)> ConnectAsync(
         bool congestionControl,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CongestionControllerOptions? congestionOptions = null)
     {
         var offererConfig = TestSupport.NewConfig();
         offererConfig.EnableCongestionControl = congestionControl;
+        if (congestionOptions is not null)
+        {
+            offererConfig.CongestionControl = congestionOptions;
+        }
         var offerer = new PeerConnection(offererConfig);
         var answerer = new PeerConnection(TestSupport.NewConfig());
         offerer.OnLocalIceCandidate += (_, e) => answerer.AddIceCandidate(e.Candidate, e.SdpMid);
@@ -588,21 +699,6 @@ public sealed class OutboundAudioCutTests
         return buffer[..length];
     }
 
-    private static byte[] OpusPacketWithTransportCc(RtpStreamSender sender, ushort transportSequenceNumber)
-    {
-        // One RFC 8285 one-byte element: id 3, length 2, then the big-endian sequence number, padded
-        // to the four-byte word boundary.
-        Span<byte> extension = stackalloc byte[TransportCcBodyLength];
-        extension[0] = 0x31;
-        BinaryPrimitives.WriteUInt16BigEndian(extension[1..], transportSequenceNumber);
-        extension[3] = 0;
-
-        var buffer = new byte[300];
-        var length = sender.WritePacket(
-            Tone(), marker: false, sender.Timestamp, RtpHeaderExtension.OneByteProfile, extension, buffer);
-        return buffer[..length];
-    }
-
     private static void Record(ReadOnlySpan<byte> rtp, long ticks, ConcurrentQueue<WirePacket> sink)
     {
         var copy = rtp.ToArray();
@@ -629,19 +725,6 @@ public sealed class OutboundAudioCutTests
 
     private static int AudioCount(ConcurrentQueue<WirePacket> wire, uint audioSsrc) =>
         wire.Count(p => p.Ssrc == audioSsrc);
-
-    private static void AssertTransportCcContiguous(ConcurrentQueue<WirePacket> wire)
-    {
-        var numbers = wire.Where(p => p.TransportSequenceNumber >= 0)
-            .Select(p => (ushort)p.TransportSequenceNumber)
-            .ToArray();
-        numbers.Should().NotBeEmpty("the transport-wide-cc extension must actually be negotiated");
-        for (var i = 1; i < numbers.Length; i++)
-        {
-            unchecked((ushort)(numbers[i] - numbers[i - 1])).Should().Be(
-                1, "transport-wide sequence numbers stay gap-free across a cut");
-        }
-    }
 
     private readonly record struct WirePacket(
         uint Ssrc,
