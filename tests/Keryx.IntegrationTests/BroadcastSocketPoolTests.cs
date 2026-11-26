@@ -69,6 +69,9 @@ public sealed class BroadcastSocketPoolTests
                 viewer.ReceivedViewerTags.Should().OnlyContain(tag => tag == viewer.Index,
                     "a viewer must only ever see media addressed to its own session, whichever shard delivered it");
             }
+
+            endpoint.GetShardStatistics().Should().HaveCount(endpoint.SocketPoolSize);
+            endpoint.GetShardStatistics().Sum(s => s.ControlDatagramsSent).Should().BeGreaterThan(0);
         }
         finally
         {

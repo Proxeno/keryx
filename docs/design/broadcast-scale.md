@@ -163,6 +163,15 @@ controller, RTCP state — lives in one `ViewerSession` object owned by **exactl
 (§4). The only cross-viewer shared objects are the socket fds and the demux snapshot. No per-viewer
 lock is needed anywhere on the hot path, because ownership replaces locking (§4.2).
 
+**Status (shipped).** The pool is `BroadcastEndpointOptions.SocketPoolSize` (default 1). On Linux the
+endpoint binds N sockets to one port with `SO_REUSEPORT` (`Keryx.Core.ReusePortSocketOption`); macOS,
+Windows, or a kernel that rejects the option fall back to one socket (a partial pool is kept if a later
+bind fails). Each viewer's egress is pinned to one shard by a mixed hash of its destination, while
+inbound demux stays global across shards. Per-shard counters — sent, dropped, flushes, control sends and
+received datagrams — are on `BroadcastEndpoint.GetShardStatistics()`, and the pool-wide drop total
+remains `DroppedDatagrams`. Shard workers currently flush staged batches produced by one fan-out driver:
+the §4.2 per-shard session ownership is not implemented yet — sessions are still per-connection objects.
+
 ### 2.3 Contrast
 
 | | Per-viewer socket (today) | Shared socket |
