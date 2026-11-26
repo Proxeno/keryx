@@ -13,6 +13,9 @@ Hot per-packet paths at the ~1200-byte target packet size, with `[MemoryDiagnose
 | `PacketizeBenchmarks` | `H264Packetizer.Packetize` for a 720p P-frame (FU-A) and keyframe (STAP-A + FU-A). |
 | `ForwardBenchmarks` | `RtpForwarder.TryForward` — the per-subscriber SFU rewrite primitive. |
 | `ReceivePathBenchmarks` | `ProcessDecryptedRtp` — the full post-SRTP receive path for one ingest source. |
+| `ClockReadBenchmarks` | The per-packet clock reads: `PeerConnection.MonotonicMicroseconds` and `DateTimeOffset.UtcNow` Unix milliseconds. |
+| `SendLockBenchmarks` | `lock (object)` as the send path uses it, uncontended and against a feedback/RTX-send contender thread. |
+| `GetTransceiverBenchmarks` | `PeerConnection.GetTransceiver(mid)` for the last mid (worst-case linear scan) at 2, 8 and 32 transceivers. |
 
 Run:
 
@@ -67,6 +70,9 @@ ramping the viewer count until the box saturates. Three arms, both egress paths,
   flushes the N datagrams in one `sendmmsg(2)` (Linux). N real loopback+SRTP sinks receive and decrypt.
 - **Arm C — fan-out ceiling, shared-key encrypt-once path.** One SRTP encrypt per ingest packet, then
   N byte-identical datagrams through the same batched send — the O(N)→O(1) crypto collapse of §5.
+- **Arm P — socket-pool sweep.** A fixed viewer count on the per-viewer path, sweeping the socket pool
+  over 1/2/4/8 (`SocketPoolSize`, Linux `SO_REUSEPORT`), showing fan-out throughput spread across cores.
+  Prints the effective pool and each shard's sent/dropped split per row.
 
 The rig auto-reports the machine specs, whether native `sendmmsg` is active, and — honestly — what a
 true multi-box rig would still add that a single box cannot show (the NIC wall).
@@ -76,6 +82,9 @@ Run (native `sendmmsg` needs Linux; use the Dockerfile on macOS):
 ```bash
 dotnet run -c Release --project benchmarks/Keryx.BroadcastLoadTest -- --arms A,B,C --duration 5
 # options: --profile 480p  --pc-viewers 100,250,500  --viewers 1000,5000,10000  --workers 16
+
+# Arm P: socket-pool sweep at a fixed viewer count.
+dotnet run -c Release --project benchmarks/Keryx.BroadcastLoadTest -- --arms P --pool-sizes 1,2,4,8 --pool-viewers 2000
 
 docker build -f benchmarks/Keryx.BroadcastLoadTest/loadtest-linux.Dockerfile -t keryx-loadtest .
 docker run --rm --ulimit nofile=1048576:1048576 -v "$PWD":/work -w /work keryx-loadtest \
