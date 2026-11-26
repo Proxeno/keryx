@@ -10,12 +10,8 @@
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
     <IsPackable>false</IsPackable>
     <PackageId>Proxeno.$(MSBuildProjectName)</PackageId>
-    <!-- Default package version. The pack workflow overrides this with the git tag at release time
-         (see .github/workflows/pack.yml). 0.4.0 completes the generic-WebRTC-platform work: signaling
-         state machine + renegotiation + rollback, W3C getStats, codec breadth (VP8/VP9/AV1 +
-         multi-codec send), RED/ULPFEC/FlexFEC, simulcast forward-RTX, ICE restart + true trickle +
-         TCP candidates + host STUN, DTLS server cookie, and an SCTP slow-start throughput fix. All
-         additive on top of 0.3.x. -->
-    <VersionPrefix>0.4.0</VersionPrefix>
+    <!-- Default local version only; the pack workflow (.github/workflows/pack.yml) overrides it
+         from the git tag at release time. -->
+    <VersionPrefix>0.6.0</VersionPrefix>
   </PropertyGroup>
 </Project>
