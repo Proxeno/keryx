@@ -108,9 +108,9 @@ public class FecProtectionControllerTests
             }
         }
 
-        changes.Select(c => c.GroupSize).Should().ContainInOrder(4, 6, 10, 15);
-        changes.Select(c => c.GroupSize).Should().OnlyHaveUniqueItems("a relaxation is one step at a time");
-        changes.First().GroupSize.Should().Be(4, "the ladder starts at 3 and steps upward");
+        changes.Select(c => c.GroupSize).Should().Equal(
+            new[] { 4, 6, 10, 15 },
+            "the ladder is exactly 3, 4, 6, 10, 15 and never skips a step");
 
         for (var i = 1; i < changes.Count; i++)
         {

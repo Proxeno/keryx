@@ -44,11 +44,11 @@ public sealed class FecLossRecoveryTests
         var receiverConfig = TestSupport.NewConfig();
         ApplyScheme(senderConfig, scheme);
         ApplyScheme(receiverConfig, scheme);
-        if (transportCc)
-        {
-            senderConfig.EnableTransportWideCc = true;
-            receiverConfig.EnableTransportWideCc = true;
-        }
+
+        // PeerConnectionConfig defaults this to true, so pin the theory value explicitly: the
+        // transportCc == false cases must run without the extension as well as with it.
+        senderConfig.EnableTransportWideCc = transportCc;
+        receiverConfig.EnableTransportWideCc = transportCc;
 
         uint mediaSsrc = 0;
         var mediaSeen = 0;
