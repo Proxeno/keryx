@@ -69,6 +69,18 @@ public sealed class VoiceSessionInteropTests
         var config = VoiceTestSupport.NewVoiceConfig(
             kind == BrowserKind.Firefox ? IPAddress.Any : null);
         config.EnableReceiveJitterBuffer = true;
+
+        // Optional trace logging, like the other interop lanes: set KERYX_INTEROP_LOG to a file path.
+        var logPath = Environment.GetEnvironmentVariable("KERYX_INTEROP_LOG");
+        using var logWriter = logPath is null
+            ? null
+            : new StreamWriter(logPath, append: true);
+        if (logWriter is not null)
+        {
+            config.Logger = new Keryx.Core.TextWriterLogger(
+                logWriter, Keryx.Core.KeryxLogLevel.Trace, $"voice-{kind}");
+        }
+
         await using var peer = new PeerConnection(config);
 
         // Keryx-side receipts: inbound audio count, the loss the jitter buffer declares, the longest
@@ -282,7 +294,8 @@ public sealed class VoiceSessionInteropTests
                     $"check {check} t={elapsedSeconds}s: keryxInbound={keryxInbound} "
                     + $"browserReceived={report.AudioPacketsReceived} browserLost={report.AudioPacketsLost} "
                     + $"concealed={report.ConcealedSamples}/{report.TotalSamplesReceived} echoes={echoCount} "
-                    + $"pingsSent={ping} source={report.AudioSource}");
+                    + $"pingsSent={ping} pingsSeenByBrowser={report.ControlMessagesReceived} "
+                    + $"source={report.AudioSource}");
 
                 previousKeryxInbound = keryxInbound;
                 previousBrowserReceived = report.AudioPacketsReceived;
@@ -349,7 +362,8 @@ public sealed class VoiceSessionInteropTests
                 + $"concealed={finalReport.ConcealedSamples}/{finalReport.TotalSamplesReceived} "
                 + $"concealmentEvents={finalReport.ConcealmentEvents} outboundAudio={finalReport.OutboundAudioPackets} "
                 + $"lostBeforeSum={finalLostBefore} longestArrivalGapTicks={finalArrivalGap} "
-                + $"echoes={finalEchoes.Count} connected={peer.State}");
+                + $"echoes={finalEchoes.Count} pingsSeenByBrowser={finalReport.ControlMessagesReceived} "
+                + $"connected={peer.State}");
         }
         finally
         {
@@ -397,6 +411,15 @@ public sealed class VoiceSessionInteropTests
                 ? (long)element.GetDouble()
                 : 0;
 
+        long controlMessagesReceived = 0;
+        if (root.TryGetProperty("channels", out var channels)
+            && channels.TryGetProperty("control", out var control)
+            && control.TryGetProperty("received", out var received)
+            && received.ValueKind == JsonValueKind.Number)
+        {
+            controlMessagesReceived = (long)received.GetDouble();
+        }
+
         return new BrowserReport(
             root.TryGetProperty("connectionState", out var state) ? state.GetString() ?? string.Empty : string.Empty,
             Read("audioPacketsReceived"),
@@ -406,6 +429,7 @@ public sealed class VoiceSessionInteropTests
             Read("concealmentEvents"),
             Read("audioJitter"),
             Read("audioPacketsSent"),
+            controlMessagesReceived,
             root.TryGetProperty("audioSource", out var source) ? source.GetString() ?? string.Empty : string.Empty);
     }
 
@@ -419,5 +443,6 @@ public sealed class VoiceSessionInteropTests
         long ConcealmentEvents,
         double Jitter,
         long OutboundAudioPackets,
+        long ControlMessagesReceived,
         string AudioSource);
 }
