@@ -22,9 +22,4 @@
     <!-- Pack the repository README onto every Proxeno.Keryx.* package's nuget.org page. -->
     <None Include="$(MSBuildThisFileDirectory)../README.md" Pack="true" PackagePath="/" Visible="false" />
   </ItemGroup>
-  <ItemGroup>
-    <!-- SourceLink: map PDB sources back to GitHub. Build-only (PrivateAssets=All),
-         version pinned centrally in Directory.Packages.props. -->
-    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
-  </ItemGroup>
 </Project>
