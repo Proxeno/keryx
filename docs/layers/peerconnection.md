@@ -161,6 +161,55 @@ answerer.SendAudioFrame(opusPacket, rtpTimestamp48k);
 The offerer-side tests use a helper, `MakeAudioSendRecv`, that performs the same `Direction` flip
 before building the offer.
 
+## Cutting outbound audio and observing sent packets
+
+For barge-in, `PeerConnection.CutOutboundAudio()` (or `RtpSender.CutOutbound()` on a specific audio
+sender) discards every packet for that sender's media SSRC that is queued or paced but not yet on the
+wire. Packets already sent cannot be retracted. The next packet starts a new generation: it carries the
+marker bit and an RTP timestamp rebased by wall-clock time since the cut, so timestamps never go
+backwards. The sequence space is rewound so what reaches the wire stays contiguous, but the
+transport-wide (TWCC) numbers drawn by the discarded packets are never sent, so a TWCC sequence gap is
+intentional. A video sender throws `NotSupportedException`.
+
+`OutboundCutResult` reports what was dropped:
+
+- `PacketsDiscarded`, `SamplesDiscarded` and `SampleRate`: 48000 for Opus, 8000 for PCMU/PCMA, 16000 for
+  G.722 (samples, not the 8 kHz RTP clock), 0 for an unknown codec.
+- `DurationDiscarded`: the media time, or `null` when unknown.
+- `Generation`: the generation the cut started (0 when no track was streaming).
+- `SamplesDiscarded == OutboundCutResult.UnknownSamples` (-1) only when packets were discarded on a
+  codec that cannot be measured.
+
+`RtpSender.OnRtpPacketSent` fires once per media packet at the wire exit: after pacing, SRTP and any cut
+rebase, in wire order. `RtpPacketSentInfo` carries `SequenceNumber` and `RtpTimestamp` (both exactly as on
+the wire), `SentAtTimestamp` (the configured `TimeProvider`'s `GetTimestamp()`) and `Generation`. RTX and
+FEC repair packets, packets discarded by a cut and failed transport sends are not reported. There is no
+per-packet allocation, and no cost while nothing is subscribed.
+
+The handler runs on the send thread inside the connection's send lock, so keep it short. From inside a
+handler `SendFrame`, `SendAudioFrame`, `SendVideoFrame`, `TryForwardRtp`, `CutOutbound` and
+`CutOutboundAudio` throw `InvalidOperationException` (for any connection on that thread). Close,
+data-channel sends and renegotiation are not guarded and can deadlock, so hand off to another task. An
+exception thrown by a handler is logged and swallowed.
+
+To map wire timestamps to the current utterance, record `(Generation, RtpTimestamp)` and consume it
+elsewhere:
+
+```csharp
+var sent = Channel.CreateUnbounded<(int Generation, uint RtpTimestamp)>();
+var sender = pc.Transceivers.Single(t => t.Kind == MediaKind.Audio).Sender;
+sender.OnRtpPacketSent += (RtpSender _, in RtpPacketSentInfo info) =>
+    sent.Writer.TryWrite((info.Generation, info.RtpTimestamp));
+
+// On barge-in, from outside any handler:
+var cut = pc.CutOutboundAudio();
+Console.WriteLine($"dropped {cut.DurationDiscarded} of audio; new generation {cut.Generation}");
+
+// Elsewhere: packets with Generation < cut.Generation never appear after the cut returns,
+// so everything read with Generation == cut.Generation belongs to the new utterance.
+await foreach (var (generation, timestamp) in sent.Reader.ReadAllAsync(ct)) { /* ... */ }
+```
+
 ## Honest limitations (current)
 
 - No ULPFEC or RED, and no retransmission for audio.
