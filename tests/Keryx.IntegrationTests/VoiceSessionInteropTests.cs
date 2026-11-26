@@ -26,7 +26,7 @@ namespace Keryx.IntegrationTests;
 public sealed class VoiceSessionInteropTests
 {
     private const int ChromeHttpPort = 7992;
-    private const int FirefoxHttpPort = 7993;
+    private const int FirefoxHttpPort = 7991;
 
     private readonly ITestOutputHelper _output;
 
