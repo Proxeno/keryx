@@ -1,0 +1,368 @@
+<!doctype html>
+<!--
+  Barge-in measurement fixture. Keryx offers and the browser answers (the role=answer shape from
+  chrome-client.html), but instead of video this page plays the audio Keryx sends and classifies every
+  AudioWorklet render quantum as 440 Hz ("old" generation) or 880 Hz ("new" generation) with a Goertzel
+  filter. That tells the test exactly which generation the browser is actually playing, and when the
+  last old-generation sample was audible.
+
+  Keryx opens the "control" data channel; the test sends "cut:<serverEpochMs>" on it when it calls
+  CutOutboundAudio(). The page snapshots WebRTC inbound-audio stats at the cut and again shortly after,
+  and POSTs the whole state to /report every 200 ms.
+-->
+<html>
+<head><meta charset="utf-8"><title>keryx barge-in</title></head>
+<body>
+<audio id="a" autoplay muted playsinline></audio>
+<script>
+"use strict";
+
+const CUT_SIGNAL_PREFIX = "cut:";
+const ANALYSIS_WINDOW = 512;     // samples in the Goertzel/RMS window
+const SAMPLE_RATE = 48000;
+
+const state = {
+  phase: "boot",
+  error: null,
+  connected: false,
+  oldSteadyMs: 0,
+  lastOldEpoch: null,
+  firstNewEpoch: null,
+  oldAfterNew: false,
+  serverCutEpoch: null,
+  cutSignalEpoch: null,
+  concealStartEpoch: null,
+  jb: { lifetimeMs: null, recentMs: null },
+  statsAtCut: null,
+  statsAfter: null,
+  newGenConcealedDelta: null,
+};
+
+const workletSource = `
+class BargeInMeter extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ring = new Float32Array(${ANALYSIS_WINDOW});
+    this.write = 0;
+    this.filled = 0;
+    this.coef440 = 2 * Math.cos(2 * Math.PI * 440 / sampleRate);
+    this.coef880 = 2 * Math.cos(2 * Math.PI * 880 / sampleRate);
+  }
+
+  goertzel(coef) {
+    let s1 = 0;
+    let s2 = 0;
+    for (let i = 0; i < this.ring.length; i++) {
+      const s0 = this.ring[i] + coef * s1 - s2;
+      s2 = s1;
+      s1 = s0;
+    }
+    return s1 * s1 + s2 * s2 - coef * s1 * s2;
+  }
+
+  process(inputs) {
+    const input = inputs[0];
+    const channel = input && input.length > 0 ? input[0] : null;
+    if (!channel) {
+      return true;
+    }
+
+    for (let i = 0; i < channel.length; i++) {
+      this.ring[this.write] = channel[i];
+      this.write = (this.write + 1) % this.ring.length;
+      if (this.filled < this.ring.length) {
+        this.filled++;
+      }
+    }
+
+    if (this.filled < this.ring.length) {
+      return true;
+    }
+
+    let energy = 0;
+    for (let i = 0; i < this.ring.length; i++) {
+      energy += this.ring[i] * this.ring[i];
+    }
+
+    this.port.postMessage({
+      frame: currentFrame,
+      rms: Math.sqrt(energy / this.ring.length),
+      p440: this.goertzel(this.coef440),
+      p880: this.goertzel(this.coef880),
+    });
+    return true;
+  }
+}
+
+registerProcessor("bargein-meter", BargeInMeter);
+`;
+
+let audioContext = null;
+let lastQuantumEpoch = null;
+let oldRunStart = null;
+let cutSignalled = false;
+let concealedAt200 = null;
+let concealedAt700 = null;
+let jitterWindow = [];
+
+async function report() {
+  try {
+    await fetch("/report", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(state),
+    });
+  } catch {
+    /* the test host may be shutting down */
+  }
+}
+
+async function audioStats(pc) {
+  const reports = await pc.getStats();
+  let snapshot = null;
+  reports.forEach((r) => {
+    if (r.type === "inbound-rtp" && r.kind === "audio") {
+      snapshot = {
+        jitterBufferDelay: r.jitterBufferDelay ?? 0,
+        jitterBufferEmittedCount: r.jitterBufferEmittedCount ?? 0,
+        packetsReceived: r.packetsReceived ?? 0,
+        packetsLost: r.packetsLost ?? 0,
+        concealedSamples: r.concealedSamples ?? 0,
+        silentConcealedSamples: r.silentConcealedSamples ?? 0,
+        concealmentEvents: r.concealmentEvents ?? 0,
+        totalSamplesReceived: r.totalSamplesReceived ?? 0,
+        lastPacketReceivedTimestamp: r.lastPacketReceivedTimestamp ?? 0,
+      };
+    }
+  });
+  return snapshot;
+}
+
+function classify(frame, epoch, rms, p440, p880) {
+  const audible = rms > 0.01;
+  const gen = !audible
+    ? "silent"
+    : p440 > 4 * p880
+      ? "old"
+      : p880 > 4 * p440
+        ? "new"
+        : "mixed";
+
+  if (!cutSignalled) {
+    if (gen === "old") {
+      if (oldRunStart === null || lastQuantumEpoch === null || epoch - lastQuantumEpoch > 100) {
+        oldRunStart = epoch;
+      }
+      state.oldSteadyMs = Math.round(epoch - oldRunStart);
+    } else if (gen !== "silent") {
+      oldRunStart = null;
+      state.oldSteadyMs = 0;
+    }
+  }
+
+  lastQuantumEpoch = epoch;
+
+  if (gen === "old") {
+    state.lastOldEpoch = epoch;
+    if (state.firstNewEpoch !== null) {
+      state.oldAfterNew = true;
+    }
+  } else if (gen === "new" && state.firstNewEpoch === null) {
+    state.firstNewEpoch = epoch;
+    onFirstNew();
+  }
+
+  if (state.phase !== "failed" && state.oldSteadyMs >= 1000) {
+    state.phase = "playing";
+  }
+}
+
+function onFirstNew() {
+  // Artifact evidence: how many samples the decoder concealed in the 200-700 ms window after the new
+  // generation first became audible.
+  setTimeout(async () => {
+    const pc = window.__pc;
+    const snapshot = await audioStats(pc);
+    if (snapshot) {
+      concealedAt200 = snapshot.concealedSamples;
+    }
+  }, 200);
+  setTimeout(async () => {
+    const pc = window.__pc;
+    const snapshot = await audioStats(pc);
+    if (snapshot) {
+      concealedAt700 = snapshot.concealedSamples;
+      if (concealedAt200 !== null) {
+        state.newGenConcealedDelta = concealedAt700 - concealedAt200;
+      }
+    }
+  }, 700);
+}
+
+async function snapshotAtCut(pc) {
+  const atCut = await audioStats(pc);
+  state.statsAtCut = atCut;
+
+  if (atCut) {
+    const emitted = atCut.jitterBufferEmittedCount;
+    state.jb.lifetimeMs = emitted > 0 ? Math.round(1000 * atCut.jitterBufferDelay / emitted) : null;
+
+    const cutPerf = performance.now();
+    const recent = jitterWindow.filter((e) => cutPerf - e.t <= 1200);
+    if (recent.length >= 2) {
+      const first = recent[0];
+      const dEmitted = atCut.jitterBufferEmittedCount - first.emitted;
+      if (dEmitted >= 10) {
+        state.jb.recentMs = Math.round(
+          1000 * (atCut.jitterBufferDelay - first.delay) / dEmitted);
+      }
+    }
+
+    if (state.jb.recentMs === null) {
+      state.jb.recentMs = state.jb.lifetimeMs;
+    }
+  }
+
+  // 350 ms after the cut signal: the new generation does not start until 400 ms, so this snapshot
+  // contains only old-generation playout plus concealment, never new content.
+  setTimeout(async () => {
+    state.statsAfter = await audioStats(pc);
+  }, 350);
+
+  // During the same window, find when the jitter buffer first ran dry and NetEq started concealing.
+  const pollStart = performance.now();
+  const baseConcealed = atCut ? atCut.concealedSamples : null;
+  if (baseConcealed !== null) {
+    const timer = setInterval(async () => {
+      if (performance.now() - pollStart >= 350) {
+        clearInterval(timer);
+        return;
+      }
+
+      const snapshot = await audioStats(pc);
+      if (snapshot && state.concealStartEpoch === null && snapshot.concealedSamples > baseConcealed) {
+        state.concealStartEpoch = performance.timeOrigin + performance.now();
+        clearInterval(timer);
+      }
+    }, 20);
+  }
+}
+
+async function setupAudio(pc, track) {
+  const element = document.getElementById("a");
+  element.srcObject = new MediaStream([track]);
+  try {
+    await element.play();
+  } catch {
+    /* autoplay is allowed by the launch flags; ignore a race */
+  }
+
+  audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+  await audioContext.resume();
+
+  const blob = new Blob([workletSource], { type: "application/javascript" });
+  const url = URL.createObjectURL(blob);
+  await audioContext.audioWorklet.addModule(url);
+  const source = audioContext.createMediaStreamSource(element.srcObject);
+  const node = new AudioWorkletNode(audioContext, "bargein-meter");
+
+  node.port.onmessage = (event) => {
+    const data = event.data;
+    const output = audioContext.getOutputTimestamp();
+    if (output.performanceTime === undefined || output.contextTime === undefined) {
+      return;
+    }
+
+    // Map the worklet's render quantum to an epoch millisecond.
+    const epoch = performance.timeOrigin + output.performanceTime
+      + (data.frame / SAMPLE_RATE - output.contextTime) * 1000;
+    classify(data.frame, epoch, data.rms, data.p440, data.p880);
+  };
+
+  source.connect(node);
+  node.connect(audioContext.destination);
+}
+
+async function pollJitter(pc) {
+  while (true) {
+    const snapshot = await audioStats(pc);
+    if (snapshot) {
+      jitterWindow.push({
+        t: performance.now(),
+        delay: snapshot.jitterBufferDelay,
+        emitted: snapshot.jitterBufferEmittedCount,
+      });
+      const cutoff = performance.now() - 1500;
+      jitterWindow = jitterWindow.filter((e) => e.t >= cutoff);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+function wireControlChannel(pc, channel) {
+  channel.onmessage = async (event) => {
+    if (typeof event.data !== "string" || !event.data.startsWith(CUT_SIGNAL_PREFIX)) {
+      return;
+    }
+
+    cutSignalled = true;
+    state.serverCutEpoch = Number(event.data.slice(CUT_SIGNAL_PREFIX.length));
+    state.cutSignalEpoch = performance.timeOrigin + performance.now();
+    await snapshotAtCut(pc);
+  };
+}
+
+async function main() {
+  const pc = new RTCPeerConnection();
+  window.__pc = pc;
+
+  pc.onconnectionstatechange = () => {
+    state.connected = pc.connectionState === "connected";
+  };
+  pc.ondatachannel = (event) => wireControlChannel(pc, event.channel);
+  pc.ontrack = (event) => {
+    if (event.track.kind === "audio") {
+      setupAudio(pc, event.track).catch((e) => {
+        state.phase = "failed";
+        state.error = String(e && e.stack || e);
+      });
+    }
+  };
+
+  state.phase = "fetching-offer";
+  const offer = await (await fetch("/offer")).json();
+  await pc.setRemoteDescription(offer);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  state.phase = "gathering";
+  await new Promise((resolve) => {
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        resolve();
+      }
+    };
+    pc.onicegatheringstatechange = check;
+    setTimeout(resolve, 3000);
+    check();
+  });
+
+  state.phase = "posting-answer";
+  await fetch("/answer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ type: "answer", sdp: pc.localDescription.sdp }),
+  });
+  state.phase = "negotiated";
+
+  pollJitter(pc).catch(() => {});
+  setInterval(report, 200);
+}
+
+main().catch((e) => {
+  state.phase = "failed";
+  state.error = String(e && e.stack || e);
+  report();
+});
+</script>
+</body>
+</html>

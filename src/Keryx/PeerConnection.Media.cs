@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using Keryx.Core;
 using Keryx.Dtls;
@@ -165,6 +166,11 @@ public sealed partial class PeerConnection
     // CreateTrackSenders once the transport is up; only mutated from there and CloseAsync.
     private PacedRtpSender? _pacedSender;
 
+    // Scratch state for the barge-in outbound-audio cut (CutOutboundOnSender). Reused across cuts so a
+    // cut on the send path allocates nothing, and touched only under _sendLock (the cut holds it for the
+    // whole removal/retraction sequence).
+    private readonly List<PacedRtpSender.RemovedPacket> _cutScratch = [];
+
     private long _videoFramesDropped;
     private long _audioFramesDropped;
     private long _rtpReceived;
@@ -211,6 +217,80 @@ public sealed partial class PeerConnection
         FirstSender(MediaKind.Audio) is { } sender
             ? sender.SendFrame(opusPacket, rtpTimestamp48k)
             : DropFrame(MediaKind.Audio);
+
+    /// <summary>
+    /// Barge-in cut: immediately discards every outbound audio packet that is queued but not yet on the wire for the
+    /// first audio track (pacer queue; Keryx's broadcast SendBatch path holds nothing across calls), and starts a new
+    /// output generation. Packets already sent cannot be retracted — the browser must stop its own playout of what it
+    /// has buffered.
+    /// </summary>
+    /// <remarks>
+    /// Thread-safe against concurrent SendAudioFrame/SendVideoFrame/data-channel sends; other tracks' queued packets are
+    /// untouched and keep their order. Discarded packets were never SRTP-protected, so the sequence space is rewound to
+    /// the first discarded number: what reaches the wire stays contiguous (no receiver-reported loss). Any send-history
+    /// entry for a discarded sequence number is purged, so a NACK can never resurrect cut audio.
+    /// The next audio packet sent after a cut (implicitly — there is no BeginGeneration call) carries the marker bit and an
+    /// RTP timestamp equal to where the kept audio ended plus the wall-clock time elapsed since the cut; the offset from the
+    /// caller's timestamps persists until the next cut, so timestamps never go backwards or repeat.
+    /// </remarks>
+    /// <returns>What was discarded; default when no audio track is streaming yet.</returns>
+    public OutboundCutResult CutOutboundAudio() =>
+        FirstSender(MediaKind.Audio) is { } sender ? CutOutboundOnSender(sender) : default;
+
+    /// <summary>
+    /// Discards the packets queued for <paramref name="sender"/>'s stream and starts a new output generation.
+    /// The shared implementation behind <see cref="CutOutboundAudio"/> and <see cref="RtpSender.CutOutbound"/>.
+    /// </summary>
+    /// <param name="sender">The audio sender to cut; video is refused.</param>
+    /// <returns>What was discarded; default when the sender has no live track yet.</returns>
+    /// <exception cref="NotSupportedException"><paramref name="sender"/> is not audio.</exception>
+    internal OutboundCutResult CutOutboundOnSender(RtpSender sender)
+    {
+        if (sender.Kind != MediaKind.Audio)
+        {
+            throw new NotSupportedException(
+                "Only audio senders support an outbound cut; a video cut would need a keyframe-aware generation.");
+        }
+
+        var track = sender.Track;
+        if (track is null)
+        {
+            return default;
+        }
+
+        var paced = _pacedSender;
+        if (paced is null)
+        {
+            // Nothing is queued without a pacer, but the new generation still begins: the next packet
+            // after a cut carries the marker and a wall-clock-rebased timestamp.
+            lock (_sendLock)
+            {
+                _cutScratch.Clear();
+                return track.Cut(_cutScratch);
+            }
+        }
+
+        // Lock order is _drainLock → _sendLock → _gate. RunWithDrainsExcluded takes _drainLock, this
+        // body takes _sendLock, and RemoveQueued takes _gate internally, so no other drain can be part
+        // way through a send while the queue is rebuilt.
+        //
+        // The discarded packets already drew transport-wide sequence numbers at enqueue time, so the cut
+        // deliberately leaves a gap in that space rather than rewriting other tracks' queued packets.
+        // That is harmless to our GCC: DelayBasedBandwidthEstimator.ProcessFeedback skips not-received
+        // entries (and send-history misses), while loss comes from the RTCP receiver-report fraction,
+        // which is per media SSRC — and that media sequence space is rewound, so the fraction stays clean.
+        OutboundCutResult result = default;
+        paced.RunWithDrainsExcluded(() =>
+        {
+            lock (_sendLock)
+            {
+                _cutScratch.Clear();
+                paced.RemoveQueued(track.Stream.Ssrc, _cutScratch);
+                result = track.Cut(_cutScratch);
+            }
+        });
+        return result;
+    }
 
     /// <summary>Records a dropped frame for <paramref name="kind"/> and returns 0.</summary>
     private int DropFrame(MediaKind kind)
@@ -468,6 +548,22 @@ public sealed partial class PeerConnection
     /// exercised directly; not part of the public API.
     /// </summary>
     internal RouteTable InboundRoutes => Volatile.Read(ref _routeTable);
+
+    /// <summary>
+    /// Observes every outbound RTP packet as plaintext, immediately before SRTP protects it. Test-only:
+    /// the hot path pays one null check. Exposed to the test assembly via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    internal delegate void RtpWireObserver(ReadOnlySpan<byte> plaintextRtp, long stopwatchTimestamp);
+
+    /// <summary>
+    /// Set only by tests to see exactly what left the send path, per SSRC, before encryption. Null on
+    /// every production path; the observer runs under <c>_sendLock</c>, so it must not call back into the
+    /// connection.
+    /// </summary>
+    internal RtpWireObserver? RtpWireObserverForTest { get; set; }
+
+    /// <summary>The pacer this connection built, or null when congestion control is off. Test-only accessor.</summary>
+    internal PacedRtpSender? PacedSenderForTest => _pacedSender;
 
     /// <summary>
     /// The mids of the inbound video m-sections negotiated as simulcast (RFC 8853), for which per-layer
@@ -2549,6 +2645,88 @@ public sealed partial class PeerConnection
         return sequenceNumber;
     }
 
+    /// <summary>
+    /// Locates the two-byte transport-wide-cc sequence-number value inside an RFC 8285 one-byte-header
+    /// extension, returning the offset of the first value octet.
+    /// </summary>
+    /// <param name="rtp">The complete plaintext RTP packet.</param>
+    /// <param name="extensionId">The negotiated transport-wide-cc extmap id.</param>
+    /// <param name="valueOffset">On success, the byte offset of the element's first value octet.</param>
+    /// <returns>True when a two-byte element with that id was found; false on anything absent or malformed.</returns>
+    /// <remarks>
+    /// Exposed to the test assembly only. The barge-in cut does not rewrite transport-wide sequence
+    /// numbers — it leaves a harmless gap — so this is used solely by tests to read (and prove the
+    /// discontinuity of) the extension on the wire.
+    /// </remarks>
+    internal static bool TryLocateTransportCc(Span<byte> rtp, byte extensionId, out int valueOffset)
+    {
+        valueOffset = 0;
+        if (rtp.Length < RtpHeader.FixedLength)
+        {
+            return false;
+        }
+
+        if ((rtp[0] & 0x10) == 0)
+        {
+            return false;
+        }
+
+        var csrcBytes = (rtp[0] & 0x0F) * 4;
+        var extStart = RtpHeader.FixedLength + csrcBytes;
+        if (extStart + 4 > rtp.Length)
+        {
+            return false;
+        }
+
+        if (BinaryPrimitives.ReadUInt16BigEndian(rtp.Slice(extStart, 2)) != RtpHeaderExtension.OneByteProfile)
+        {
+            return false;
+        }
+
+        var bodyStart = extStart + 4;
+        var bodyLength = BinaryPrimitives.ReadUInt16BigEndian(rtp.Slice(extStart + 2, 2)) * 4;
+        if (bodyStart + bodyLength > rtp.Length)
+        {
+            return false;
+        }
+
+        var end = bodyStart + bodyLength;
+        var pos = bodyStart;
+        while (pos < end)
+        {
+            var header = rtp[pos];
+            if (header == 0)
+            {
+                // Zero is padding between elements (RFC 8285 §4.2).
+                pos++;
+                continue;
+            }
+
+            var id = header >> 4;
+            var elementLength = (header & 0x0F) + 1;
+            if (id == 15)
+            {
+                // Id 15 terminates the element list.
+                break;
+            }
+
+            if (pos + 1 + elementLength > end)
+            {
+                return false;
+            }
+
+            if (id == extensionId && elementLength == 2)
+            {
+                valueOffset = pos + 1;
+                return true;
+            }
+
+            pos += 1 + elementLength;
+        }
+
+        return false;
+    }
+
     private void SendProtectedRtp(byte[] buffer, int length)
     {
         var srtp = _srtp;
@@ -2557,6 +2735,10 @@ public sealed partial class PeerConnection
         {
             return;
         }
+
+        // Test-only hook: capture the plaintext exactly as it will appear on the wire, before the
+        // in-place SRTP protection below. Costs one null check on the production hot path.
+        RtpWireObserverForTest?.Invoke(buffer.AsSpan(0, length), System.Diagnostics.Stopwatch.GetTimestamp());
 
         var protectedLength = srtp.Outbound.ProtectRtp(buffer.AsSpan(0, length), buffer);
         try
@@ -2866,6 +3048,22 @@ public sealed partial class PeerConnection
         private long _bytes;
         private long _frames;
 
+        // Where the next audio packet's media timestamp would land if the caller's clock kept running
+        // (the last emitted timestamp plus that packet's Opus duration). A cut anchors the new
+        // generation here. Touched only under the owner's _sendLock.
+        private uint _nextExpectedTimestamp;
+        private bool _hasEmitted;
+
+        // The implicit output-generation state a barge-in cut arms. The first packet sent after the cut
+        // computes a fixed offset from the wall clock and stamps the marker bit; the offset persists
+        // until the next cut so the caller's continuing timestamps never go backwards.
+        private bool _generationPending;
+        private uint _generationAnchorTimestamp;
+        private long _generationAnchorTicks;
+        private bool _generationOffsetActive;
+        private uint _timestampOffset;
+        private bool _forceMarker;
+
         internal TrackSender(
             PeerConnection owner,
             string mid,
@@ -2943,6 +3141,8 @@ public sealed partial class PeerConnection
                 return false;
             }
 
+            timestamp = ResolveTimestamp(timestamp);
+
             // The forwarder owns the wire format: stamp the subscriber's negotiated payload type and
             // publish the rebased timestamp so this track's sender reports describe what it emitted.
             Stream.PayloadType = payloadType;
@@ -2953,8 +3153,92 @@ public sealed partial class PeerConnection
             return true;
         }
 
+        /// <summary>
+        /// Discards the paced packets removed for this stream and starts a new output generation. Called
+        /// under the owner's <c>_sendLock</c>, after the pacer removal, so nothing can race the sequence
+        /// rewind or the timestamp anchor.
+        /// </summary>
+        /// <param name="removed">The packets the pacer dropped for this stream, in queue (sequence) order.</param>
+        /// <returns>The packets and samples discarded.</returns>
+        internal OutboundCutResult Cut(List<PeerConnection.PacedRtpSender.RemovedPacket> removed)
+        {
+            uint anchorTimestamp;
+            long samples = 0;
+
+            if (removed.Count > 0)
+            {
+                var firstSequenceNumber = removed[0].SequenceNumber;
+                uint payloadOctets = 0;
+                for (var i = 0; i < removed.Count; i++)
+                {
+                    payloadOctets = unchecked(payloadOctets + (uint)removed[i].PayloadLength);
+                    samples += removed[i].PayloadSamples;
+
+                    // PURGE: these sequence numbers are about to be reused, so a NACK must never be able
+                    // to return the cut audio from the retransmission history.
+                    Retransmitter?.History.Remove(removed[i].SequenceNumber);
+                }
+
+                Stream.RetractUnsent(firstSequenceNumber, (uint)removed.Count, payloadOctets);
+                _packets -= removed.Count;
+                _bytes -= payloadOctets;
+
+                // The kept audio ends where the oldest discarded packet began.
+                anchorTimestamp = removed[0].Timestamp;
+                _nextExpectedTimestamp = anchorTimestamp;
+            }
+            else
+            {
+                // Nothing was queued: anchor at where the caller's clock would have continued.
+                anchorTimestamp = _hasEmitted ? _nextExpectedTimestamp : Stream.Timestamp;
+            }
+
+            // A second cut with no send in between keeps the first anchor; in practice it also drops
+            // nothing, so this only pins the wall-clock rebase to the instant of the first cut.
+            if (!_generationPending)
+            {
+                _generationPending = true;
+                _generationAnchorTimestamp = anchorTimestamp;
+                _generationAnchorTicks = _owner._time.GetTimestamp();
+            }
+
+            return new OutboundCutResult(removed.Count, samples);
+        }
+
+        /// <summary>
+        /// Maps the caller's timestamp onto the current output generation. Before any cut it is the
+        /// identity (byte-for-byte the old behaviour). After a cut the first call fixes a constant offset
+        /// so the new packet lands at the anchor plus the wall-clock time elapsed since the cut, and
+        /// flags the marker bit for that first packet of the new talkspurt.
+        /// </summary>
+        /// <param name="appTimestamp">The timestamp the application supplied.</param>
+        /// <returns>The timestamp to stamp on the wire.</returns>
+        private uint ResolveTimestamp(uint appTimestamp)
+        {
+            if (_generationPending)
+            {
+                var elapsed = _owner._time.GetElapsedTime(_generationAnchorTicks);
+                var generationTimestamp = unchecked(
+                    _generationAnchorTimestamp + (uint)Math.Round(elapsed.TotalSeconds * Stream.ClockRate));
+                _timestampOffset = unchecked(generationTimestamp - appTimestamp);
+                _generationOffsetActive = true;
+                _generationPending = false;
+                _forceMarker = true;
+            }
+
+            return _generationOffsetActive ? unchecked(appTimestamp + _timestampOffset) : appTimestamp;
+        }
+
         private void EmitPacket(ReadOnlySpan<byte> payload, bool marker, uint timestamp)
         {
+            // RFC 7587 §4.2: the first packet of a talkspurt carries the marker. A barge-in generation
+            // begins with one, whatever the packetizer's own gap heuristic decided.
+            if (_forceMarker)
+            {
+                marker = true;
+                _forceMarker = false;
+            }
+
             int packetLength;
             ushort transportSequenceNumber = 0;
             var stampedTransportCc = false;
@@ -3013,6 +3297,12 @@ public sealed partial class PeerConnection
                 _owner.OnTransportRtpSent(transportSequenceNumber, packetLength);
             }
 
+            // Read the audio duration from the plaintext now: the direct send path below protects the
+            // packet in place, which would turn the TOC byte into ciphertext.
+            var audioIncrement = Kind == MediaKind.Audio
+                ? (uint)(OpusPacketizer.GetDurationMicroseconds(payload) * OpusPacketizer.OpusClockRate / 1_000_000)
+                : 0;
+
             _owner.SendRtp(_buffer, packetLength);
             _packets++;
             _bytes += payload.Length;
@@ -3022,6 +3312,13 @@ public sealed partial class PeerConnection
             if (fecGroupReady)
             {
                 _fec!.EmitPending(timestamp);
+            }
+
+            if (Kind == MediaKind.Audio)
+            {
+                // Remember where the caller's clock would continue; a later cut anchors here.
+                _nextExpectedTimestamp = unchecked(timestamp + audioIncrement);
+                _hasEmitted = true;
             }
         }
 
@@ -3047,6 +3344,8 @@ public sealed partial class PeerConnection
 
         internal int SendFrame(ReadOnlySpan<byte> frame, uint timestamp)
         {
+            // A cut rebases the caller's clock onto the new generation; with no cut this is the identity.
+            timestamp = ResolveTimestamp(timestamp);
             _timestamp = timestamp;
             Stream.Timestamp = timestamp;
             var packets = _payloadizer.Packetize(frame, timestamp, _maxPayload, this);
@@ -3141,7 +3440,11 @@ public sealed partial class PeerConnection
         private readonly IKeryxLogger _logger;
         private readonly object _gate = new();
         private readonly object _drainLock = new();
-        private readonly Queue<QueuedPacket> _queue = new();
+
+        // The live queue and a reusable spare. A cut rebuilds the live queue into the spare and swaps
+        // them, so filtering one SSRC allocates neither a new queue nor a new packet list.
+        private Queue<QueuedPacket> _queue = new();
+        private Queue<QueuedPacket> _spareQueue = new();
 
         // The packets one drain admits, reused across drains (cleared at the head of each) so a drain
         // never allocates a fresh list. Only ever touched under _drainLock, which serialises whole drains.
@@ -3149,6 +3452,10 @@ public sealed partial class PeerConnection
         private ITimer? _timer;
         private bool _timerArmed;
         private bool _disposed;
+
+        // Test-only hold: while set, a drain re-arms itself and dequeues nothing, so a test can build a
+        // non-empty queue deterministically before calling a cut.
+        private volatile bool _holdDrainForTest;
 
         internal PacedRtpSender(
             PacketPacer pacer,
@@ -3172,6 +3479,113 @@ public sealed partial class PeerConnection
             {
                 _pacer.SetTargetBitrate(targetBitrateBitsPerSecond);
             }
+        }
+
+        /// <summary>One queued packet a cut removed, in the order it was queued.</summary>
+        /// <param name="SequenceNumber">The RTP sequence number the packet carried; it is about to be reused.</param>
+        /// <param name="Timestamp">The RTP timestamp the packet carried.</param>
+        /// <param name="PayloadLength">The RTP payload length in bytes.</param>
+        /// <param name="PayloadSamples">The packet's duration in 48 kHz samples, read from its Opus TOC byte.</param>
+        internal readonly record struct RemovedPacket(
+            ushort SequenceNumber,
+            uint Timestamp,
+            int PayloadLength,
+            long PayloadSamples);
+
+        /// <summary>
+        /// True while a test wants the drain held off; the drain re-arms and dequeues nothing. Test-only.
+        /// </summary>
+        internal bool HoldDrainForTest
+        {
+            get => _holdDrainForTest;
+            set => _holdDrainForTest = value;
+        }
+
+        /// <summary>
+        /// Runs <paramref name="body"/> with no drain in progress: while it runs no drain is in progress,
+        /// so every packet still queued is guaranteed unsent and every packet already dequeued has
+        /// already been handed to <c>_send</c>.
+        /// </summary>
+        /// <param name="body">The work to run under the drain lock.</param>
+        internal void RunWithDrainsExcluded(Action body)
+        {
+            lock (_drainLock)
+            {
+                body();
+            }
+        }
+
+        /// <summary>
+        /// Drops every queued packet for <paramref name="ssrc"/>, leaving the other streams' queued packets
+        /// untouched and in order.
+        /// </summary>
+        /// <param name="ssrc">The stream whose queued packets are discarded.</param>
+        /// <param name="removed">Receives the removed packets, in queue order. The caller clears it.</param>
+        /// <returns>The number of packets removed.</returns>
+        /// <remarks>
+        /// The live queue is rebuilt into a reusable spare and the two are swapped, so a cut on the send
+        /// path allocates nothing. The caller holds <c>_sendLock</c>. The discarded packets' transport-wide
+        /// sequence numbers are left as a gap on purpose: rewriting other tracks' queued packets would
+        /// violate their isolation (and corrupt FEC-protected ones), and GCC tolerates the gap because it
+        /// skips not-received entries and takes loss from the per-media-SSRC receiver report instead.
+        /// </remarks>
+        internal int RemoveQueued(uint ssrc, List<RemovedPacket> removed)
+        {
+            lock (_gate)
+            {
+                var kept = _spareQueue;
+                kept.Clear();
+                while (_queue.Count > 0)
+                {
+                    var queued = _queue.Dequeue();
+                    if (ReadSsrc(queued.Buffer, queued.Length) == ssrc)
+                    {
+                        removed.Add(CreateRemoved(queued.Buffer, queued.Length));
+                        ArrayPool<byte>.Shared.Return(queued.Buffer);
+                    }
+                    else
+                    {
+                        kept.Enqueue(queued);
+                    }
+                }
+
+                // The emptied live queue becomes the spare; the filtered one becomes live.
+                var drained = _queue;
+                _queue = kept;
+                _spareQueue = drained;
+
+                return removed.Count;
+            }
+        }
+
+        private static uint ReadSsrc(byte[] buffer, int length) =>
+            length >= RtpHeader.FixedLength ? BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(8, 4)) : 0;
+
+        private static RemovedPacket CreateRemoved(byte[] buffer, int length)
+        {
+            ushort sequenceNumber;
+            uint timestamp;
+            int payloadLength;
+            long samples;
+            if (RtpPacket.TryParse(buffer.AsSpan(0, length), out var packet))
+            {
+                sequenceNumber = packet.Header.SequenceNumber;
+                timestamp = packet.Header.Timestamp;
+                payloadLength = packet.Payload.Length;
+
+                // Audio only: the duration comes from the Opus TOC byte (RFC 6716 §3.1).
+                samples = OpusPacketizer.GetDurationMicroseconds(packet.Payload) * OpusPacketizer.OpusClockRate / 1_000_000;
+            }
+            else
+            {
+                // Still remove it, but count it from the raw header bytes and give it no duration.
+                sequenceNumber = length >= 4 ? BinaryPrimitives.ReadUInt16BigEndian(buffer.AsSpan(2, 2)) : (ushort)0;
+                timestamp = length >= 8 ? BinaryPrimitives.ReadUInt32BigEndian(buffer.AsSpan(4, 4)) : 0;
+                payloadLength = length;
+                samples = 0;
+            }
+
+            return new RemovedPacket(sequenceNumber, timestamp, payloadLength, samples);
         }
 
         /// <summary>Copies one plaintext RTP packet into the queue and wakes the drain. Called under _sendLock.</summary>
@@ -3240,6 +3654,14 @@ public sealed partial class PeerConnection
                 _timerArmed = false;
                 if (_disposed)
                 {
+                    return;
+                }
+
+                if (_holdDrainForTest)
+                {
+                    // Test-only: keep re-arming without dequeuing so a test can build a non-empty queue.
+                    _timerArmed = true;
+                    _timer?.Change(MinDrainInterval, Timeout.InfiniteTimeSpan);
                     return;
                 }
 

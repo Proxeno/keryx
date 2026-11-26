@@ -32,6 +32,12 @@ internal sealed class InteropSignalingHost : IDisposable
         _output = output;
     }
 
+    /// <summary>
+    /// The fixture file served on <c>/</c>, relative to the test output's <c>assets</c> directory.
+    /// Defaults to the shared <c>chrome-client.html</c>; a lane with its own fixture overrides it.
+    /// </summary>
+    internal string PageAsset { get; init; } = "chrome-client.html";
+
     /// <summary>Supplies Keryx's offer SDP for <c>GET /offer</c> (the keryx-offers flow).</summary>
     internal Func<Task<string>>? OnGetOffer { get; set; }
 
@@ -83,7 +89,7 @@ internal sealed class InteropSignalingHost : IDisposable
         {
             case "/":
                 var html = await File.ReadAllBytesAsync(
-                    Path.Combine(AppContext.BaseDirectory, "assets", "chrome-client.html"));
+                    Path.Combine(AppContext.BaseDirectory, "assets", PageAsset));
                 response.ContentType = "text/html";
                 await response.OutputStream.WriteAsync(html);
                 break;

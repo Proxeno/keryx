@@ -55,6 +55,84 @@ public class GccCongestionControllerTests
         controller.TargetBitrateBitsPerSecond.Should().Be(220_000);
     }
 
+    /// <summary>
+    /// A barge-in cut draws transport-wide sequence numbers for packets that are then discarded, leaving
+    /// a gap in the TWCC space. The delay-based estimator must skip those not-received entries, so the
+    /// estimate holds (and keeps ramping exactly like a cut-free controller), never mistaking the gap
+    /// for loss.
+    /// </summary>
+    [Fact]
+    public void TransportCcGapFromACutDoesNotLowerTheEstimate()
+    {
+        var timeA = new TestTimeProvider();
+        var timeB = new TestTimeProvider();
+        var a = new GccCongestionController(Options(), timeA);
+        var b = new GccCongestionController(Options(), timeB);
+
+        const int packetsPerRound = 30;
+        const int rounds = 14;
+        const int gapRound = 6;
+        const int gapStart = 10;
+        const int gapCount = 10;
+
+        long sendA = 0;
+        long arrivalA = 5_000_000;
+        long sendB = 0;
+        long arrivalB = 5_000_000;
+        ushort seqA = 0;
+        ushort seqB = 0;
+
+        for (var round = 0; round < rounds; round++)
+        {
+            var feedbackA = SyntheticFeedback.Burst(
+                seqA, packetsPerRound, sendA, arrivalA, sendSpacingMs: 5, arrivalSpacingMs: 5, PacketSize,
+                a.OnPacketSent, out sendA, out arrivalA);
+
+            RtcpTransportCcFeedback feedbackB;
+            if (round == gapRound)
+            {
+                // The cut: these ten sequence numbers were drawn by the send path but never reached the
+                // wire, so they are absent from the feedback (the builder marks the hole NotReceived).
+                feedbackB = new RtcpTransportCcFeedback();
+                for (var i = 0; i < packetsPerRound; i++)
+                {
+                    if (i is >= gapStart and < gapStart + gapCount)
+                    {
+                        continue;
+                    }
+
+                    var sequenceNumber = unchecked((ushort)(seqB + i));
+                    b.OnPacketSent(sequenceNumber, sendB + i * 5_000L, PacketSize);
+                    feedbackB.AddPacket(sequenceNumber, arrivalB + i * 5_000L);
+                }
+
+                sendB += packetsPerRound * 5_000L;
+                arrivalB += packetsPerRound * 5_000L;
+            }
+            else
+            {
+                feedbackB = SyntheticFeedback.Burst(
+                    seqB, packetsPerRound, sendB, arrivalB, sendSpacingMs: 5, arrivalSpacingMs: 5, PacketSize,
+                    b.OnPacketSent, out sendB, out arrivalB);
+            }
+
+            timeA.Advance(TimeSpan.FromMilliseconds(200));
+            timeB.Advance(TimeSpan.FromMilliseconds(200));
+            a.OnTransportFeedback(feedbackA);
+            b.OnTransportFeedback(feedbackB);
+
+            seqA = unchecked((ushort)(seqA + packetsPerRound));
+            seqB = unchecked((ushort)(seqB + packetsPerRound));
+
+            b.TargetBitrateBitsPerSecond.Should().BeGreaterThanOrEqualTo(
+                a.TargetBitrateBitsPerSecond,
+                $"round {round}: a TWCC gap must never put the gapped controller below the cut-free one");
+        }
+
+        b.TargetBitrateBitsPerSecond.Should().Be(a.TargetBitrateBitsPerSecond,
+            "the not-received entries are skipped, so the two controllers ramp identically");
+    }
+
     private static void DriveLowDelay(GccCongestionController controller, TestTimeProvider time, int rounds)
     {
         long send = 0;
