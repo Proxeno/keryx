@@ -208,6 +208,18 @@ public sealed class RtpSender : IRtpForwarder
         _owner.SendFrameOnSender(this, frame, rtpTimestamp);
 
     /// <summary>
+    /// Barge-in cut on this sender: discards every outbound packet for it that is queued but not yet on
+    /// the wire and starts a new output generation. See <see cref="PeerConnection.CutOutboundAudio"/>
+    /// for the full semantics — the sequence space is rewound, any history for the discarded numbers is
+    /// purged, and the next packet carries the marker bit with a wall-clock-rebased timestamp.
+    /// </summary>
+    /// <returns>What was discarded; default when no track is streaming on this sender yet.</returns>
+    /// <exception cref="NotSupportedException">
+    /// This sender is not audio; a video cut would need a keyframe-aware generation.
+    /// </exception>
+    public OutboundCutResult CutOutbound() => _owner.CutOutboundOnSender(this);
+
+    /// <summary>
     /// Forwards one already-packetized RTP payload verbatim onto this sender's SSRC and sequence space
     /// — the SFU subscriber-egress path. See <see cref="PeerConnection.TryForwardRtp"/> for the exact
     /// semantics; this never throws and returns false when the sender is not ready.
