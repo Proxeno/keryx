@@ -69,6 +69,24 @@ Audio is deliberately excluded: browsers do not negotiate RTX for Opus, whose in
 isolated loss without a round trip. Keryx's offer and its negotiator both preserve
 `useinbandfec=1`.
 
+## Forward error correction
+
+ULPFEC (RED) and FlexFEC are opt-in for video: `PeerConnectionConfig.EnableUlpfec` /
+`EnableFlexFec`, with the payload types in `UlpfecPayloadType` / `FlexFecPayloadType`. Repair
+packets go through the same send path as media and RTX, so with transport-wide-cc negotiated they
+are stamped from the shared sequence space and reported to the congestion controller.
+
+`PeerConnectionConfig.FecProtection` (`FecProtectionOptions`) sets the protection group size.
+It adapts to the peer's reported media-SSRC loss by default (`AdaptiveGroupSize`, 3 to 15 media
+packets per repair, starting at 10); set `AdaptiveGroupSize` to false for a fixed group.
+`VideoFecGroupSize` and `VideoFecOverheadFraction` read the current state, `FecProtectionChanged`
+fires when the group moves, and `MediaTargetBitrateBitsPerSecond` is the congestion-control target
+minus the nominal repair share, which is the figure an encoder should be tuned to. When FEC is
+negotiated the video payload budget reserves room for the FEC header, the RED byte and the repair's
+own transport-cc extension, so a repair for a full-size packet still fits `Mtu`. The tier table,
+the reserve and the encoder-budget arithmetic are in
+[`docs/design/congestion-control.md`](../design/congestion-control.md#repair-traffic-and-fec-ewi-1386).
+
 ## Sender-side link quality
 
 Reception report blocks naming this endpoint's own SSRCs are folded into
@@ -212,9 +230,10 @@ await foreach (var (generation, timestamp) in sent.Reader.ReadAllAsync(ct)) { /*
 
 ## Honest limitations (current)
 
-- No ULPFEC or RED, and no retransmission for audio.
-- No bandwidth estimation, pacing, REMB generation, or `a=extmap` support (no outbound TWCC
-  sequence numbers).
+- No retransmission for audio, and FEC is video only.
+- Congestion control (GCC, the pacer) and receiver-side REMB are opt-in
+  (`EnableCongestionControl`, `EnableReceiverRemb`); the FEC tier table is reasoned, not measured
+  under load.
 - The answerer can send as well as receive (the audio-only `sendrecv` voice shape); the offerer
   path is still the production shape. Renegotiation and ICE restart are implemented.
 - The receive jitter buffer is opt-in (`EnableReceiveJitterBuffer`); with it off,

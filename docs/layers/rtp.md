@@ -39,14 +39,25 @@ crypto, no threads — and on the per-packet hot path, no allocation.
 - **The packetizer seam (`IRtpPayloadizer`)** is the community-codec extension point: frame in,
   MTU-bounded payloads out, marker on the last payload of the frame. `H264Packetizer`
   (RFC 6184 packetization-mode=1: single NAL / STAP-A aggregation / FU-A fragmentation) and
-  `OpusPacketizer` (RFC 7587) prove it for video and audio. An `H264Depacketizer` reassembles
-  Annex B access units — used by the loopback tests to verify byte-identity of what a receiver
-  would see.
+  `OpusPacketizer` (RFC 7587) prove it for video and audio. `Vp8Packetizer`, `Vp9Packetizer` and
+  `Av1Packetizer` cover the other video codecs. `OctetAudioPacketizer` handles the codecs that carry
+  one octet per RTP tick (G.711 PCMU/PCMA, G.722): the payload is raw samples, so there is no TOC
+  byte to read, and the marker bit is set on the first packet and on the first packet after an
+  RTP-timestamp gap of more than one frame, the same rule the Opus path uses. The composition
+  root picks the audio packetizer from the negotiated codec (`AudioPayloadTiming.CreatePacketizer`).
+  An `H264Depacketizer` reassembles Annex B access units — used by the loopback tests to verify
+  byte-identity of what a receiver would see.
+- **FEC protection is packet logic too.** `UlpFecGenerator` (RFC 5109, carried in RED) and
+  `FlexFecGenerator` (RFC 8627) build repair packets; the matching receivers recover them.
+  `FecProtectionController` maps smoothed fraction-lost to a group size (3 to 15 media packets per
+  repair, bounds and defaults in `FecProtectionOptions`). It counts reports, not time, so it is
+  deterministic and has no clock. How the repair packets are stamped, paced and reported to
+  congestion control is in [`docs/design/congestion-control.md`](../design/congestion-control.md).
 
 ## Testing
 
 RTP header edge-case matrix, round-trips for every RTCP type, NACK bitmap vectors, hand-built
 transport-cc vectors mixing chunk kinds, golden STAP-A byte layouts, FU-A fragment/reassemble
-identity on oversized NALs, marker placement, RFC 4588 §4 packet rules, send-history eviction by
+identity on oversized NALs, marker placement (including per-codec audio markers), adaptive FEC group-size tiers and hysteresis, RFC 4588 §4 packet rules, send-history eviction by
 wrap/age/bytes across the 65535→0 sequence seam, resend rate limiting and the retransmission
 bandwidth budget, and a concurrent store/lookup soak. RFC sections cited per test.

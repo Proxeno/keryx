@@ -94,14 +94,27 @@ raw RTCP parsing in your application:
 - **Sender-side link quality.** The reception-report blocks the browser sends are folded into
   `GetStats()` per track: fraction lost, cumulative loss, interarrival jitter and LSR/DLSR
   round-trip time — the signal a rate controller needs, without parsing RTCP yourself.
-- **A codec-agnostic packetizer seam.** H.264 (packetization-mode=1, STAP-A/FU-A) and Opus ship
-  in-box; other codecs implement one interface (`IRtpPayloadizer`) plus one `SdpCodec` entry.
+- **A codec-agnostic packetizer seam.** H.264 (packetization-mode=1, STAP-A/FU-A), VP8, VP9, AV1
+  and Opus ship in-box; other codecs implement one interface (`IRtpPayloadizer`) plus one `SdpCodec`
+  entry. Outbound audio negotiated as PCMU, PCMA or G.722 (with a caller-supplied `SdpCodec`) is
+  packetized by `OctetAudioPacketizer`, with the marker bit set per RFC 3551.
+- **Loss protection that congestion control can see.** Opt-in ULPFEC (RED) and FlexFEC repair
+  packets draw from the same transport-wide sequence space as media and RTX, and the protection
+  group size adapts to the peer's reported loss (`PeerConnectionConfig.FecProtection`,
+  `FecProtectionChanged`).
+- **Voice-agent and barge-in surface.** `CutOutboundAudio` drops queued outbound audio and reports an
+  `OutboundCutResult`; `RtpSender.OnRtpPacketSent` reports each RTP packet as it leaves for the
+  transport.
+- **Shared-port broadcast.** `Keryx.Broadcast` serves many viewers from one UDP port (an
+  `SO_REUSEPORT` socket pool on Linux, per-shard counters through `GetShardStatistics()`), with
+  per-viewer ICE, DTLS and SRTP keys and batched `sendmmsg` sends.
 
 ## Architecture
 
 ![Keryx architecture — the PeerConnection composition root built on Sdp, Rtp, Srtp, Sctp, Dtls, and Ice (over Stun), all resting on Keryx.Core](https://raw.githubusercontent.com/Proxeno/keryx/main/docs/assets/architecture.png)
 
-At runtime everything multiplexes over one UDP socket (BUNDLE + rtcp-mux): ICE consumes STUN,
+At runtime everything multiplexes over one transport, a UDP socket or a TURN relay over UDP, TCP or
+TLS (BUNDLE + rtcp-mux): ICE consumes STUN,
 DTLS records (first byte 20–63) carry SCTP, and SRTP/SRTCP (128–191) carry media — see
 [docs/architecture.md](docs/architecture.md) for the wire-path diagram and design rules, and
 [docs/layers/](docs/layers) for per-layer design notes.
@@ -111,14 +124,15 @@ DTLS records (first byte 20–63) carry SCTP, and SRTP/SRTCP (128–191) carry m
 | Package | Contents |
 | --- | --- |
 | `Keryx` | Composition root: the `PeerConnection` API. Reference this to get the whole stack. |
-| `Keryx.Core` | Binary readers/writers, the `IDatagramTransport` seam, logging abstraction. |
+| `Keryx.Broadcast` | Shared-socket broadcast fan-out: `BroadcastEndpoint`, `ViewerSession`, `ViewerBroadcastBridge`. |
+| `Keryx.Core` | Binary readers/writers, the `IDatagramTransport` seam, logging abstraction, batched `sendmmsg` sender. |
 | `Keryx.Stun` | STUN (RFC 5389) messages and client. |
 | `Keryx.Sdp` | Lossless SDP model, JSEP offer builder, answer negotiator. |
-| `Keryx.Rtp` | RTP, RTCP with typed feedback, H.264/Opus packetizers, `IRtpPayloadizer`. |
+| `Keryx.Rtp` | RTP, RTCP with typed feedback, H.264/VP8/VP9/AV1/Opus and octet-per-tick audio (PCMU/PCMA/G.722) packetizers, `IRtpPayloadizer`, ULPFEC/FlexFEC, RTX, GCC and pacer. |
 | `Keryx.Dtls` | DTLS 1.2 handshake + record layer, DTLS-SRTP keying export. |
 | `Keryx.Srtp` | SRTP/SRTCP: AES-CM + HMAC-SHA1-80 and AEAD AES-GCM. |
 | `Keryx.Ice` | ICE agent (RFC 8445 subset, dual-stack IPv4/IPv6, aggressive nomination). |
-| `Keryx.Turn` | TURN client: relay allocations, permissions, channel binding (RFC 8656). |
+| `Keryx.Turn` | TURN client over UDP, TCP and TLS: relay allocations, permissions, channel binding (RFC 8656). |
 | `Keryx.Sctp` | SCTP over DTLS, DCEP data channels, partial reliability. |
 
 Packages are published as `Proxeno.Keryx*` on nuget.org; the assemblies and namespaces are
@@ -189,7 +203,7 @@ allocate the document they build or parse and are not on the per-packet path.
 | 6347 / 5246 / 5288 / 7627 / 5705 | DTLS 1.2 records, PRF vectors, AES-GCM, EMS, exporter | `Keryx.Dtls.Tests` |
 | 9260 / 3758 / 8831 / 8832 | SCTP, FORWARD-TSN, data channels, DCEP | `Keryx.Sctp.Tests` |
 | 7983 / 5761 | Demux on the bundled transport | `Keryx.Rtp.Tests`, `Keryx.IntegrationTests` |
-| 8656 | TURN allocations, permissions, channel binding | `Keryx.Turn.Tests` |
+| 8656 | TURN allocations, permissions, channel binding; coturn interop over UDP, TCP and TLS | `Keryx.Turn.Tests` |
 
 ## Scope
 
@@ -205,17 +219,21 @@ buffer declared lost immediately before it (`RtpPacketInfo.LostBefore`, with `Lo
 application can run its decoder's packet-loss concealment and Opus in-band FEC. Keryx does not decode
 Opus itself. The audio-only `sendrecv` Opus plus reliable ordered data-channel voice session shape is
 proven against both Chrome and Firefox.
-Recent additions: `a=extmap` with outbound transport-wide-cc (TWCC) sequence numbers; TURN
-relay-candidate gathering (allocations, permissions, channel binding); and dual-stack IPv6 host /
-server-reflexive gathering with address-family-correct pairing.
+Also in place: `a=extmap` with outbound transport-wide-cc (TWCC) sequence numbers; TURN
+relay-candidate gathering over UDP, TCP and TLS (allocations, permissions, channel binding); and
+dual-stack IPv6 host / server-reflexive gathering with address-family-correct pairing.
 
-**Experimental (compiles and is tested, but not yet a production path):** a send-side GCC
-bandwidth estimator and pacer (in `Keryx.Rtp`, not yet wired into the send loop), and simulcast
+**Opt-in:** the send-side GCC bandwidth estimator and pacer (`EnableCongestionControl`), ULPFEC and
+FlexFEC (`EnableUlpfec`, `EnableFlexFec`) and receiver-side REMB (`EnableReceiverRemb`). The FEC
+tier table and the GCC target under combined loss and bandwidth pressure are reasoned, not yet
+measured under load.
+
+**Experimental (compiles and is tested, but not yet a production path):** simulcast
 transport primitives (RID / `a=simulcast` negotiation and ingest demux are complete; per-subscriber
 forwarding is scaffolded).
 
-**Not implemented (yet, honestly):** ULPFEC and RED, REMB generation, regular (non-aggressive)
-nomination, and IPv6 *relay* allocation. Per-layer simplifications are documented in
+**Not implemented (yet, honestly):** regular (non-aggressive) nomination and IPv6 *relay*
+allocation. Per-layer simplifications are documented in
 [docs/layers/](docs/layers).
 
 ## Security
