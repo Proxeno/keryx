@@ -58,6 +58,16 @@ internal readonly struct AudioPayloadTiming
         return default;
     }
 
+    /// <summary>
+    /// The packetizer for the negotiated codec. Opus (and any unmeasurable codec, as before) uses
+    /// <see cref="OpusPacketizer"/>; G.711 and G.722 use <see cref="OctetAudioPacketizer"/>, because their
+    /// payload bytes are sample data and carry no Opus TOC.
+    /// </summary>
+    /// <returns>A new packetizer with its own talkspurt state.</returns>
+    internal IRtpPayloadizer CreatePacketizer() => _codec is Codec.Pcm or Codec.G722
+        ? new OctetAudioPacketizer(_rtpClockRate)
+        : new OpusPacketizer();
+
     /// <summary>True when the codec is one we can measure (opus, PCMU, PCMA, G722).</summary>
     internal bool IsKnown => _codec != Codec.Unknown;
 

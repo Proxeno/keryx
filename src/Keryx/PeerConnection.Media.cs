@@ -1265,17 +1265,18 @@ public sealed partial class PeerConnection
                 }
                 else if (transceiver.Kind == MediaKind.Audio)
                 {
+                    var audioTiming = AudioPayloadTiming.FromCodec(negotiated.EncodingName, negotiated.ClockRate);
                     sender.Track = new TrackSender(
                         this,
                         negotiated.Mid,
                         MediaKind.Audio,
                         new RtpStreamSender(sender.Ssrc, negotiated.PayloadType, negotiated.ClockRate, logger: _logger),
-                        new OpusPacketizer(),
+                        audioTiming.CreatePacketizer(),
                         maxPayload,
                         profile.RtpOverhead,
                         transportCcId,
                         absSendTimeId,
-                        audioTiming: AudioPayloadTiming.FromCodec(negotiated.EncodingName, negotiated.ClockRate));
+                        audioTiming: audioTiming);
                 }
             }
         }
