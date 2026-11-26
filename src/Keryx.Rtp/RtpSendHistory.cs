@@ -275,6 +275,30 @@ public sealed class RtpSendHistory
         }
     }
 
+    /// <summary>Forgets one retained packet so a later NACK for its sequence number is answered Missing.</summary>
+    /// <param name="sequenceNumber">The sequence number to forget.</param>
+    /// <returns>true when a packet with exactly that sequence number was retained and is now gone.</returns>
+    /// <remarks>
+    /// The ring's oldest/newest walk is left untouched: <see cref="Trim"/> already skips unoccupied
+    /// slots, and the next <see cref="Store"/> of an empty ring resets them.
+    /// </remarks>
+    public bool Remove(ushort sequenceNumber)
+    {
+        lock (_gate)
+        {
+            ref var slot = ref _slots[sequenceNumber & _mask];
+            if (!slot.Occupied || slot.SequenceNumber != sequenceNumber)
+            {
+                return false;
+            }
+
+            _bytes -= slot.Length;
+            _count--;
+            slot.Occupied = false;
+            return true;
+        }
+    }
+
     /// <summary>
     /// Records that a packet copied by <see cref="TryCopy"/> was in fact retransmitted, which starts
     /// its rate-limit interval.
