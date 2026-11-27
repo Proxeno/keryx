@@ -31,10 +31,13 @@ env:
 
 jobs:
   pack-publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - name: Derive version from tag

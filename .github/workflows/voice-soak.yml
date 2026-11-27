@@ -17,11 +17,14 @@ on:
 
 jobs:
   voice-soak-chrome:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: browser-actions/setup-chrome@v1
@@ -39,11 +42,14 @@ jobs:
           KERYX_VOICE_SOAK_SECONDS: ${{ inputs.soak_seconds || '1200' }}
 
   voice-soak-firefox:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: browser-actions/setup-firefox@v1

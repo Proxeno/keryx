@@ -5,10 +5,13 @@ on:
   pull_request:
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       # The TURN interop tests drive a real coturn on 127.0.0.1 - UDP on 7700-7704, and TCP + TLS
@@ -30,10 +33,13 @@ jobs:
   # The voice session soak (VoiceSessionInteropTests) runs here too, at its 60 s default: PR CI keeps
   # each browser under a minute. The full 20-minute soak runs in voice-soak.yml on schedule.
   browser-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: browser-actions/setup-chrome@v1
@@ -63,7 +69,7 @@ jobs:
   # candidates at all. Data channels use classic SCTP DATA (not RFC 8260 I-DATA), which is what Firefox
   # handles — see PeerConnection.StartSctp.
   firefox-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     # Safety bound: the FirefoxInterop tests each carry their own ~90s deadline and run serially, so a
     # healthy run finishes in a few minutes. The voice session soak adds one more roughly 3-minute test
     # (60 s of call plus browser start-up and negotiation), so the ceiling is 15 minutes. This guarantees
@@ -75,6 +81,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: browser-actions/setup-firefox@v1
@@ -107,7 +116,7 @@ jobs:
   # KERYX_REQUIRE_PION=1 turns a missing Go toolchain or unbuildable peer into a failure instead of
   # the graceful skip local dev gets, so an interop regression fails the build rather than passing.
   pion-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     # Safety bound: the PionInterop test carries its own ~75s handshake deadline, so a healthy run
     # finishes in a couple of minutes. This ceiling guarantees a future regression can never again
     # hang the job for the six-hour GitHub default and burn CI minutes.
@@ -115,6 +124,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: actions/setup-go@v5
@@ -156,7 +168,7 @@ jobs:
   # skip local dev gets; KERYX_REQUIRE_PION=1 does the same for a missing Go toolchain or unbuildable
   # peer, so either half of this lane going missing fails the build rather than silently passing.
   turn-relay-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     # Safety bound: the TurnRelayInterop test carries its own ~75s handshake deadline, so a healthy
     # run finishes in a couple of minutes. This ceiling guarantees a future regression can never hang
     # the job for the six-hour GitHub default and burn CI minutes.
@@ -164,6 +176,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - run: sudo apt-get update && sudo apt-get install -y coturn
@@ -189,13 +204,16 @@ jobs:
   # undisturbed. The SharedPort* tests are excluded from build-test above, so this job MUST run them.
   # KERYX_REQUIRE_CHROME=1 turns a missing or unlaunchable browser into a failure instead of a skip.
   shared-port-chrome-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     # Safety bound: each test carries a 90 s hard deadline and the lane has 2 tests, so a healthy run is
     # a few minutes including the build; 8 minutes can never hang for the six-hour GitHub default.
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: browser-actions/setup-chrome@v1
@@ -215,13 +233,16 @@ jobs:
   # path. Setup mirrors firefox-interop (OpenH264 GMP warm-up included).
   # KERYX_REQUIRE_FIREFOX=1 turns a missing or unlaunchable browser into a failure instead of a skip.
   shared-port-firefox-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     # Safety bound: each test carries a 90 s hard deadline and the lane has 2 tests, so a healthy run is
     # a few minutes including the build and the GMP warm-up; 10 minutes leaves room for the warm-up.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: browser-actions/setup-firefox@v1
@@ -243,13 +264,16 @@ jobs:
   # receiving undisturbed. KERYX_REQUIRE_PION=1 turns a missing Go toolchain or unbuildable peer into a
   # failure instead of a skip.
   shared-port-pion-interop:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, docker]
     # Safety bound: the test carries a 75 s hard deadline and the lane has 1 test, so a healthy run is a
     # few minutes including the build.
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
+        env:
+          # Self-hosted runners are not root: install into the runner temp dir.
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
           dotnet-version: 10.0.x
       - uses: actions/setup-go@v5
